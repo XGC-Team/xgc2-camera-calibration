@@ -59,84 +59,6 @@ for path in sorted(root.glob("xgc_camera_*/package.xml")):
 for path in sorted(root.glob("xgc_camera_*/*/*.launch")):
     ET.parse(path)
 
-plugin = json.loads(plugin_path.read_text(encoding="utf-8"))
-assert plugin["apiVersion"] == "xgc.execution.process/v1"
-definitions = plugin["definitions"]
-keys = [(definition["id"], definition["version"]) for definition in definitions]
-ids = {definition["id"] for definition in definitions}
-assert len(keys) == len(set(keys)) == 8
-assert len(ids) == 3
-assert "xgc2-camera-v4l2-ros1" not in ids
-intrinsic_versions = {
-    item["version"]: item for item in definitions
-    if item["id"] == "xgc2-camera-intrinsic-calibrator-ros1"
-}
-assert set(intrinsic_versions) == {"2.0.0", "2.1.0"}
-intrinsic_legacy = intrinsic_versions["2.0.0"]
-intrinsic = intrinsic_versions["2.1.0"]
-extrinsic_versions = {
-    item["version"]: item for item in definitions
-    if item["id"] == "xgc2-camera-extrinsic-calibrator-ros1"
-}
-assert set(extrinsic_versions) == {"2.0.0", "2.0.1", "2.0.2", "2.1.0"}
-extrinsic = extrinsic_versions["2.1.0"]
-tf_versions = {
-    item["version"]: item for item in definitions
-    if item["id"] == "xgc2-camera-extrinsic-tf-ros1"
-}
-assert set(tf_versions) == {"1.0.0", "1.1.0"}
-tf_publisher = tf_versions["1.1.0"]
-assert tf_publisher["parameters"]["properties"]["waitForFile"]["default"] is False
-assert tf_publisher["parameters"]["properties"]["watchFile"]["default"] is False
-assert "_require_file_update:=${requireFileUpdate}" in tf_publisher["command"]["args"]
-assert extrinsic["command"]["executable"] == (
-    "/opt/ros/noetic/lib/xgc_camera_calibration/extrinsic_calibrator_web.py"
-)
-assert extrinsic["parameters"]["properties"]["bindAddress"]["default"] == "127.0.0.1"
-assert extrinsic["parameters"]["properties"]["httpPort"]["default"] == 18082
-assert extrinsic["parameters"]["properties"]["previewImageTopic"]["default"] == (
-    "/usb_cam/image_raw/compressed"
-)
-assert extrinsic["parameters"]["properties"]["freezeImageTimeout"]["default"] == 2.0
-assert "_preview_image_topic:=${previewImageTopic}" in extrinsic["command"]["args"]
-assert "_freeze_image_timeout:=${freezeImageTimeout}" in extrinsic["command"]["args"]
-assert "DISPLAY" not in extrinsic["command"]["env"]
-assert intrinsic_legacy["parameters"]["properties"]["httpPort"]["default"] == 8766
-assert intrinsic_legacy["parameters"]["properties"]["outputFile"]["default"] == (
-    "/var/lib/xgc2/camera/calibrations/usb_cam/intrinsics.yaml"
-)
-assert intrinsic["command"]["executable"] == (
-    "/opt/ros/noetic/lib/xgc_camera_calibration/intrinsic_calibrator_web.py"
-)
-intrinsic_properties = intrinsic["parameters"]["properties"]
-assert intrinsic_properties["httpPort"]["default"] == 18083
-assert intrinsic_properties["outputFile"]["default"] == (
-    "/tmp/xgc2/camera/calibrations/usb_cam/intrinsics.yaml"
-)
-assert intrinsic_properties["referencesDir"]["default"] == (
-    "/tmp/xgc2/camera/calibrations/usb_cam/intrinsic_refs"
-)
-assert intrinsic_properties["rosLogDir"]["default"] == (
-    "/tmp/xgc2/ros/log/camera-calibration"
-)
-assert intrinsic["parameters"]["properties"]["cameraControl"]["default"] is False
-assert "DISPLAY" not in intrinsic["command"]["env"]
-intrinsic_claims = {
-    claim["bindingKey"]: claim for claim in intrinsic["resourceClaims"]
-}
-assert intrinsic_claims["http"]["kind"] == "tcp-listener"
-assert intrinsic_claims["http"]["address"] == "127.0.0.1"
-assert intrinsic_claims["http"]["portParameter"] == "httpPort"
-assert intrinsic_claims["ros-node"]["namespace"] == "ros1-node"
-assert intrinsic_claims["ros-node"]["identityParts"] == [
-    {"parameter": "rosMasterUri"},
-    {"literal": "/xgc_camera_intrinsic_calibrator_web"},
-]
-assert intrinsic["readiness"]["kind"] == "tcp"
-assert intrinsic["readiness"]["address"] == "127.0.0.1:${httpPort}"
-assert intrinsic["readiness"]["successThreshold"] == 1
-assert intrinsic["readiness"]["failureThreshold"] == 30
-
 manifest_paths = list(
     (pathlib.Path(os.environ["MANIFEST_TEST_ROOT"]) / "manifests").glob("*.json")
 )
@@ -162,14 +84,27 @@ assert deb["size"] > 0
 PY
 
 grep -q '^id: xgc2-camera-calibration-ros1$' .xgc2/product.yml
-grep -q '^version: 0.3.0-11$' .xgc2/product.yml
-grep -q '^    focal: 0.3.0-11$' .xgc2/product.yml
+grep -q '^version: 0.3.0-12$' .xgc2/product.yml
+grep -q '^    focal: 0.3.0-12$' .xgc2/product.yml
 if grep -q '^    focal: .*~focal' .xgc2/product.yml; then
   echo "single-distribution ROS1 package version must not retain a focal suffix" >&2
   exit 1
 fi
 grep -q '<exec_depend>gazebo_msgs</exec_depend>' xgc_camera_calibration/package.xml
 grep -q '<exec_depend>tf</exec_depend>' xgc_camera_calibration/package.xml
+grep -q 'catkin_add_nosetests(test/test_media_snapshot.py)' xgc_camera_calibration/CMakeLists.txt
+grep -q 'http://127.0.0.1:18090' \
+  xgc_camera_calibration/scripts/intrinsic_calibrator_web.py \
+  xgc_camera_calibration/launch/intrinsic_calibrator.launch
+grep -q '<arg name="media_source_id" default="usb_cam"' \
+  xgc_camera_calibration/launch/intrinsic_calibrator.launch
+grep -q '<arg name="snapshot_timeout" default="5.0"' \
+  xgc_camera_calibration/launch/intrinsic_calibrator.launch
+if grep -Eq '<arg name="(image_topic|camera_info_topic|intrinsic_rate)"' \
+  xgc_camera_calibration/launch/intrinsic_calibrator.launch; then
+  echo "intrinsic launch retained a retired ROS image polling parameter" >&2
+  exit 1
+fi
 grep -q 'CompressedImage' xgc_camera_calibration/scripts/extrinsic_calibrator_web.py
 grep -q 'wait_for_message' xgc_camera_calibration/scripts/extrinsic_calibrator_web.py
 if grep -q 'Subscriber(.*self.image_topic' \

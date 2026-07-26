@@ -20,7 +20,7 @@ import cv2
 import numpy as np
 
 
-_SOURCE_ID = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+_SOURCE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _MAX_JPEG_BYTES = 32 << 20
 _MAX_RGB_BYTES = 128 << 20
 

@@ -1,9 +1,9 @@
 # XGC2 ROS1 Camera Calibration
 
-Public ROS Noetic calibration tools for cameras that publish
-`sensor_msgs/Image` and `sensor_msgs/CameraInfo`. Camera capture and ROS driver
-adaptation deliberately live in separate products; this repository consumes
-their ROS interfaces without depending on a particular camera driver.
+Public ROS Noetic camera-calibration tools. Camera capture and ROS driver
+adaptation deliberately live in separate products. Intrinsic calibration asks
+a co-located XGC Media Edge for bounded immutable snapshots; fixed-camera
+extrinsic calibration retains its ROS image, camera-info, and pose contracts.
 
 ## Calibration capabilities
 
@@ -17,7 +17,8 @@ in a world frame.
 
 ```bash
 roslaunch xgc_camera_calibration intrinsic_calibrator.launch \
-  image_topic:=/usb_cam/image_raw \
+  media_edge_address:=http://127.0.0.1:18090 \
+  media_source_id:=usb_cam snapshot_timeout:=5.0 \
   board_cols:=7 board_rows:=5 square_size:=0.20 \
   bind_address:=127.0.0.1 http_port:=8766
 ```
@@ -25,6 +26,12 @@ roslaunch xgc_camera_calibration intrinsic_calibrator.launch \
 Open `http://127.0.0.1:8766/`. The optional `camera_control:=true` adapter can
 move a named Gazebo camera through the sample guide, but simulation control is
 not required by the intrinsic algorithm.
+
+The Media Edge must run on the same host and expose the configured source
+before the calibrator starts. Each manual or automatic sample creates one
+immutable snapshot, reads its RGB8 pixels and intrinsic metadata from that same
+capture, then deletes it immediately. Live video remains WebRTC and is never
+polled through this calibration HTTP path.
 
 The product-facing intrinsic service is available under
 `/api/v1/intrinsic/`: `state`, `image.jpg`, `targets`, and `ref/<index>.jpg`
@@ -99,17 +106,18 @@ from both `libxgc2-camera-dev` and `ros-noetic-xgc-camera-driver`.
 
 ## Automation
 
-`/usr/share/xgc2/process-definitions/xgc2-camera-calibration-ros1.json`
-registers three independent process-definition IDs:
+XGC2's separately owned process catalog registers three independent
+process-definition IDs for this product:
 
 - `xgc2-camera-intrinsic-calibrator-ros1`
 - `xgc2-camera-extrinsic-calibrator-ros1`
 - `xgc2-camera-extrinsic-tf-ros1`
 
 Both WebUIs bind to loopback by default and require no desktop session or
-`DISPLAY`. Current managed definitions write runtime calibration assets
-outside the package share directory under `/tmp/xgc2/camera/calibrations`;
-legacy definitions retain their original `/var/lib/xgc2` defaults.
+`DISPLAY`. The intrinsic process also talks only to a loopback Media Edge.
+Managed definitions write runtime calibration assets outside the package share
+directory under `/tmp/xgc2/camera/calibrations`. This product package does not
+ship or own XGC2 process definitions.
 
 ## Build and test
 

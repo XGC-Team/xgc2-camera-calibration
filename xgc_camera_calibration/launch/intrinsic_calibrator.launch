@@ -1,6 +1,7 @@
 <launch>
-  <arg name="image_topic" default="/usb_cam/image_raw" />
-  <arg name="camera_info_topic" default="/usb_cam/camera_info" />
+  <arg name="media_edge_address" default="http://127.0.0.1:18090" />
+  <arg name="media_source_id" default="usb_cam" />
+  <arg name="snapshot_timeout" default="5.0" />
   <arg name="output_file" default="$(env HOME)/.local/state/xgc2/camera/calibrations/usb_cam/intrinsics.yaml" />
   <arg name="references_dir" default="$(env HOME)/.local/state/xgc2/camera/calibrations/usb_cam/intrinsic_refs" />
   <arg name="board_cols" default="7" />
@@ -10,7 +11,6 @@
   <arg name="board_y" default="0.0" />
   <arg name="board_z" default="1.5" />
   <arg name="display_width" default="720" />
-  <arg name="intrinsic_rate" default="6.0" />
   <arg name="jpeg_quality" default="80" />
   <!-- camera_control:=true lights up the guide's fly-to / auto-run / live pose
        when running against a Gazebo simulation; leave false for a real camera. -->
@@ -26,8 +26,9 @@
         type="intrinsic_calibrator_web.py"
         name="xgc_camera_intrinsic_calibrator_web"
         output="screen">
-    <param name="image_topic" value="$(arg image_topic)" />
-    <param name="camera_info_topic" value="$(arg camera_info_topic)" />
+    <param name="media_edge_address" value="$(arg media_edge_address)" />
+    <param name="media_source_id" value="$(arg media_source_id)" />
+    <param name="snapshot_timeout" value="$(arg snapshot_timeout)" />
     <param name="output_file" value="$(arg output_file)" />
     <param name="references_dir" value="$(arg references_dir)" />
     <param name="board_cols" value="$(arg board_cols)" />
@@ -37,7 +38,6 @@
     <param name="board_y" value="$(arg board_y)" />
     <param name="board_z" value="$(arg board_z)" />
     <param name="display_width" value="$(arg display_width)" />
-    <param name="intrinsic_rate" value="$(arg intrinsic_rate)" />
     <param name="jpeg_quality" value="$(arg jpeg_quality)" />
     <param name="camera_control" value="$(arg camera_control)" />
     <param name="camera_model_name" value="$(arg camera_model_name)" />

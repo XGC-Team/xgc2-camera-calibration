@@ -60,7 +60,7 @@ def main():
     rospy.init_node("xgc_camera_intrinsic_calibrator_web")
     try:
         snapshot_client = MediaSnapshotClient(
-            rospy.get_param("~media_edge_address", "http://127.0.0.1:18084"),
+            rospy.get_param("~media_edge_address", "http://127.0.0.1:18090"),
             rospy.get_param("~media_source_id", "usb_cam"),
             float(rospy.get_param("~snapshot_timeout", 5.0)),
         )
