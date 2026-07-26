@@ -84,8 +84,8 @@ assert deb["size"] > 0
 PY
 
 grep -q '^id: xgc2-camera-calibration-ros1$' .xgc2/product.yml
-grep -q '^version: 0.3.0-12$' .xgc2/product.yml
-grep -q '^    focal: 0.3.0-12$' .xgc2/product.yml
+grep -q '^version: 0.3.0-13$' .xgc2/product.yml
+grep -q '^    focal: 0.3.0-13$' .xgc2/product.yml
 if grep -q '^    focal: .*~focal' .xgc2/product.yml; then
   echo "single-distribution ROS1 package version must not retain a focal suffix" >&2
   exit 1
@@ -134,5 +134,20 @@ if grep -R -E -i '(xgc_camera_driver|libxgc2-camera-dev|ros-noetic-xgc-camera-dr
   echo "camera driver dependency leaked into the independent calibration product" >&2
   exit 1
 fi
+
+BUILD_SCRIPT_PATH=.xgc2/scripts/build_debs_in_docker.sh python3 - <<'PY'
+import os
+from pathlib import Path
+
+lines = Path(os.environ["BUILD_SCRIPT_PATH"]).read_text(encoding="utf-8").splitlines()
+source_dir = "      /workspace/work/src/xgc_camera_calibration"
+index = lines.index(source_dir)
+assert not lines[index].rstrip().endswith("\\"), (
+    "the final mkdir argument must not continue into rsync"
+)
+assert lines[index + 1].startswith("    rsync -a --delete "), (
+    "rsync must be its own Docker build command"
+)
+PY
 
 echo "ROS1 camera product compliance passed"

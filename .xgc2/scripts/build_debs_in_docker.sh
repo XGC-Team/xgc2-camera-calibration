@@ -45,7 +45,7 @@ docker run --rm \
       ros-noetic-sensor-msgs ros-noetic-tf ros-noetic-tf2-ros
     rm -rf /workspace/work/src /workspace/work/build /workspace/work/devel /workspace/work/install-root
     mkdir -p \
-      /workspace/work/src/xgc_camera_calibration \
+      /workspace/work/src/xgc_camera_calibration
     rsync -a --delete /workspace/repo/xgc_camera_calibration/ /workspace/work/src/xgc_camera_calibration/
     cd /workspace/work
     source /opt/ros/noetic/setup.bash
