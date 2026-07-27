@@ -23,6 +23,7 @@ from xgc_camera_calibration.web_service import (
     image_message_to_bgr,
     nearest_observation,
 )
+from xgc_camera_calibration.media_snapshot import MediaSnapshotClient, MediaSnapshotError
 
 
 def normalize_topic(value):
@@ -33,8 +34,9 @@ def normalize_topic(value):
 class RosCalibrationSource:
     """Thread-safe latest camera frame and timestamped pose-marker history."""
 
-    def __init__(self):
+    def __init__(self, snapshot_client=None):
         self.lock = threading.RLock()
+        self.snapshot_client = snapshot_client
         self.image_topic = normalize_topic(rospy.get_param("~image_topic", "/usb_cam/image_raw"))
         self.preview_image_topic = normalize_topic(
             rospy.get_param(
@@ -71,16 +73,19 @@ class RosCalibrationSource:
         self.marker_history = {}
         self.marker_subscribers = {}
         self.marker_topics = {}
-        self.preview_subscriber = rospy.Subscriber(
-            self.preview_image_topic,
-            CompressedImage,
-            self._preview_callback,
-            queue_size=1,
-            buff_size=2**20,
-        )
-        self.info_subscriber = rospy.Subscriber(
-            self.camera_info_topic, CameraInfo, self._info_callback, queue_size=1
-        )
+        self.preview_subscriber = None
+        self.info_subscriber = None
+        if self.snapshot_client is None:
+            self.preview_subscriber = rospy.Subscriber(
+                self.preview_image_topic,
+                CompressedImage,
+                self._preview_callback,
+                queue_size=1,
+                buff_size=2**20,
+            )
+            self.info_subscriber = rospy.Subscriber(
+                self.camera_info_topic, CameraInfo, self._info_callback, queue_size=1
+            )
         self.discovery_timer = rospy.Timer(rospy.Duration(1.0), self._refresh_markers)
         self._refresh_markers(None)
 
@@ -179,25 +184,49 @@ class RosCalibrationSource:
 
     def status(self):
         with self.lock:
-            preview_ready = self.preview_jpeg is not None
+            snapshot_ready = self.snapshot_client is not None
+            preview_ready = snapshot_ready or self.preview_jpeg is not None
             info = self.camera_info
             marker_names = sorted(
                 name for name, history in self.marker_history.items() if history
             )
             return {
-                "image_topic": self.image_topic,
+                "image_topic": (
+                    "media:{}".format(self.snapshot_client.source_id)
+                    if snapshot_ready
+                    else self.image_topic
+                ),
                 "preview_image_topic": self.preview_image_topic,
-                "camera_info_topic": self.camera_info_topic,
+                "camera_info_topic": (
+                    "snapshot metadata" if snapshot_ready else self.camera_info_topic
+                ),
                 "pose_prefix": self.pose_prefix,
                 "image_ready": preview_ready,
                 "preview_ready": preview_ready,
-                "camera_info_ready": info is not None,
+                "camera_info_ready": snapshot_ready or info is not None,
                 "marker_count": len(marker_names),
                 "marker_names": marker_names,
                 "latest_image_stamp_sec": self.preview_stamp_sec,
             }
 
     def freeze(self, parent_frame, maximum_marker_age):
+        if self.snapshot_client is not None:
+            try:
+                snapshot = self.snapshot_client.capture()
+            except MediaSnapshotError as error:
+                raise ApiError(
+                    503, "Could not capture a Media Edge camera snapshot: {}".format(error)
+                ) from error
+            stamp_sec = float(snapshot.timestamp_nanoseconds) / 1.0e9
+            return self._frame_snapshot(
+                snapshot.bgr,
+                stamp_sec,
+                snapshot.frame_id,
+                snapshot.camera_matrix,
+                snapshot.distortion,
+                parent_frame,
+                maximum_marker_age,
+            )
         try:
             image_message = rospy.wait_for_message(
                 self.image_topic,
@@ -213,15 +242,44 @@ class RosCalibrationSource:
             ) from error
         with self.lock:
             camera_info = self.camera_info
-            histories = {
-                name: tuple(history) for name, history in self.marker_history.items()
-            }
         if camera_info is None:
             raise ApiError(409, "CameraInfo has not arrived")
         image_stamp = image_message.header.stamp
         if image_stamp.is_zero():
             image_stamp = rospy.Time.now()
         stamp_sec = float(image_stamp.to_sec())
+        image = self._convert_image(image_message)
+        if (
+            camera_info.width
+            and int(camera_info.width) != image.shape[1]
+            or camera_info.height
+            and int(camera_info.height) != image.shape[0]
+        ):
+            raise ApiError(409, "CameraInfo dimensions do not match the image")
+        return self._frame_snapshot(
+            image,
+            stamp_sec,
+            image_message.header.frame_id,
+            np.asarray(camera_info.K, dtype=np.float64).reshape(3, 3),
+            np.asarray(camera_info.D, dtype=np.float64),
+            parent_frame,
+            maximum_marker_age,
+        )
+
+    def _frame_snapshot(
+        self,
+        image,
+        stamp_sec,
+        frame_id,
+        camera_matrix,
+        distortion,
+        parent_frame,
+        maximum_marker_age,
+    ):
+        with self.lock:
+            histories = {
+                name: tuple(history) for name, history in self.marker_history.items()
+            }
         markers = {}
         stale = {}
         wrong_frames = []
@@ -253,20 +311,12 @@ class RosCalibrationSource:
                     parent_frame, ", ".join(sorted(wrong_frames))
                 ),
             )
-        image = self._convert_image(image_message)
-        if (
-            camera_info.width
-            and int(camera_info.width) != image.shape[1]
-            or camera_info.height
-            and int(camera_info.height) != image.shape[0]
-        ):
-            raise ApiError(409, "CameraInfo dimensions do not match the image")
         return FrameSnapshot(
             image=image,
             stamp_sec=stamp_sec,
-            frame_id=image_message.header.frame_id,
-            camera_matrix=np.asarray(camera_info.K, dtype=np.float64).reshape(3, 3),
-            distortion=np.asarray(camera_info.D, dtype=np.float64),
+            frame_id=frame_id,
+            camera_matrix=np.asarray(camera_matrix, dtype=np.float64).reshape(3, 3),
+            distortion=np.asarray(distortion, dtype=np.float64),
             markers=markers,
             stale_markers=stale,
         )
@@ -281,7 +331,16 @@ def split_list_parameter(value):
 def main():
     rospy.init_node("xgc_camera_extrinsic_calibrator_web")
     try:
-        source = RosCalibrationSource()
+        media_edge_address = str(rospy.get_param("~media_edge_address", "")).strip()
+        snapshot_client = None
+        if media_edge_address:
+            snapshot_client = MediaSnapshotClient(
+                media_edge_address,
+                rospy.get_param("~media_source_id", "usb_cam"),
+                float(rospy.get_param("~snapshot_timeout", 5.0)),
+            )
+            snapshot_client.health()
+        source = RosCalibrationSource(snapshot_client=snapshot_client)
         package_root = Path(rospkg.RosPack().get_path("xgc_camera_calibration"))
         web_root = Path(rospy.get_param("~web_root", str(package_root / "web" / "extrinsic")))
         service = CalibrationService(
@@ -333,11 +392,13 @@ def main():
     server_thread.start()
     rospy.loginfo(
         "Camera extrinsic WebUI listening on http://%s:%d "
-        "(raw=%s, preview=%s, poses=%s)",
+        "(capture=%s, preview=%s, poses=%s)",
         bind_address,
         http_port,
-        source.image_topic,
-        source.preview_image_topic,
+        "media:{}".format(snapshot_client.source_id)
+        if snapshot_client is not None
+        else source.image_topic,
+        "WebRTC" if snapshot_client is not None else source.preview_image_topic,
         source.pose_prefix,
     )
     try:

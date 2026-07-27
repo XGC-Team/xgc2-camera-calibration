@@ -1,9 +1,10 @@
 # XGC2 ROS1 Camera Calibration
 
 Public ROS Noetic camera-calibration tools. Camera capture and ROS driver
-adaptation deliberately live in separate products. Intrinsic calibration asks
-a co-located XGC Media Edge for bounded immutable snapshots; fixed-camera
-extrinsic calibration retains its ROS image, camera-info, and pose contracts.
+adaptation deliberately live in separate products. Both calibration modes can
+ask a co-located XGC Media Edge for bounded immutable snapshots. Fixed-camera
+extrinsic calibration also retains its ROS image and camera-info contract for
+physical cameras while marker poses continue to arrive through ROS.
 
 ## Calibration capabilities
 
@@ -34,11 +35,14 @@ capture, then deletes it immediately. Live video remains WebRTC and is never
 polled through this calibration HTTP path.
 
 The product-facing intrinsic service is available under
-`/api/v1/intrinsic/`: `state`, `image.jpg`, `targets`, and `ref/<index>.jpg`
-are read endpoints; `goto`, `reset_pose`, `auto_run`, `calibrate`, and `reset`
-are JSON actions. `auto_run` returns HTTP 202 immediately and exposes its
-authoritative progress in `state.action`. Conflicting mutation requests return
-HTTP 409 until the sweep finishes; the OpenCV solver itself remains unchanged.
+`/api/v1/intrinsic/`: `state`, `targets`, and `ref/<index>.jpg` are read
+endpoints; `capture`, `goto`, `reset_pose`, `auto_run`, `calibrate`, and
+`reset` are JSON actions. `capture` performs one explicit immutable snapshot;
+`auto_run` returns HTTP 202 immediately and exposes its authoritative progress
+in `state.action`. Conflicting mutation requests return HTTP 409 until the
+sweep finishes; the OpenCV solver itself remains unchanged. `image.jpg` remains
+a compatibility view of the most recently processed sample, not a live-video
+transport.
 
 ### Fixed-world-camera extrinsic calibration
 
@@ -60,12 +64,26 @@ those values are an input contract rather than a package dependency. They may
 come from the intrinsic tool above, a vendor calibration, or an existing
 calibration asset.
 
-The live view consumes the canonical JPEG-compressed image transport and
-returns those bytes directly to the browser. The raw image topic is subscribed
-only while handling Freeze, so the synchronized frame used by PnP retains full
-source quality without continuously moving or re-encoding raw frames in the
-WebUI process. A camera must publish both configured topics; there is no raw
-preview fallback.
+For a managed Gazebo world camera, use the snapshot mode instead:
+
+```bash
+roslaunch xgc_camera_calibration extrinsic_calibrator.launch \
+  media_edge_address:=http://127.0.0.1:18090 \
+  media_source_id:=gazebo_world_camera \
+  pose_prefix:=/vrpn_client_node \
+  bind_address:=127.0.0.1 http_port:=8765
+```
+
+The panel's live view remains direct WebRTC. Freeze captures one immutable
+Media Edge frame whose Gazebo timestamp, RGB pixels, frame ID, camera matrix,
+and distortion values come from the same render pass; marker histories are
+then interpolated at that timestamp before robust PnP. No ROS image publisher
+or calibration JPEG polling is required in this mode.
+
+When `media_edge_address` is empty, the compatibility path consumes the
+canonical JPEG-compressed ROS preview and subscribes to the raw image only
+while handling Freeze. A physical camera using that path must publish the raw,
+compressed, and CameraInfo topics.
 
 Publish a solved fixed-camera transform with:
 
@@ -114,7 +132,7 @@ process-definition IDs for this product:
 - `xgc2-camera-extrinsic-tf-ros1`
 
 Both WebUIs bind to loopback by default and require no desktop session or
-`DISPLAY`. The intrinsic process also talks only to a loopback Media Edge.
+`DISPLAY`. Media Edge snapshot mode accepts only a loopback Edge address.
 Managed definitions write runtime calibration assets outside the package share
 directory under `/tmp/xgc2/camera/calibrations`. This product package does not
 ship or own XGC2 process definitions.

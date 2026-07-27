@@ -2,6 +2,9 @@
   <arg name="image_topic" default="/usb_cam/image_raw" />
   <arg name="preview_image_topic" default="/usb_cam/image_raw/compressed" />
   <arg name="camera_info_topic" default="/usb_cam/camera_info" />
+  <arg name="media_edge_address" default="" />
+  <arg name="media_source_id" default="usb_cam" />
+  <arg name="snapshot_timeout" default="5.0" />
   <arg name="pose_prefix" default="/vrpn_client_node" />
   <arg name="output_file" default="$(env HOME)/.local/state/xgc2/camera/calibrations/usb_cam/extrinsics.yaml" />
   <arg name="parent_frame" default="map" />
@@ -24,6 +27,9 @@
     <param name="image_topic" value="$(arg image_topic)" />
     <param name="preview_image_topic" value="$(arg preview_image_topic)" />
     <param name="camera_info_topic" value="$(arg camera_info_topic)" />
+    <param name="media_edge_address" value="$(arg media_edge_address)" />
+    <param name="media_source_id" value="$(arg media_source_id)" />
+    <param name="snapshot_timeout" value="$(arg snapshot_timeout)" />
     <param name="pose_prefix" value="$(arg pose_prefix)" />
     <param name="output_file" value="$(arg output_file)" />
     <param name="parent_frame" value="$(arg parent_frame)" />
