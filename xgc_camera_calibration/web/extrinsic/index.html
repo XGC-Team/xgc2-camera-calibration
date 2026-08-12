@@ -5,83 +5,9 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>XGC2 Camera Extrinsic Calibration</title>
     <link rel="stylesheet" href="styles.css">
+    <script type="module" src="app.js"></script>
   </head>
   <body>
-    <main class="shell">
-      <header class="topbar">
-        <div>
-          <p class="eyebrow">XGC2 / ROS1</p>
-          <h1>Camera extrinsic calibration</h1>
-        </div>
-        <div class="health" aria-live="polite">
-          <span id="mode-chip" class="chip">Connecting</span>
-          <span id="input-chip" class="chip muted">Waiting for ROS</span>
-        </div>
-      </header>
-
-      <section id="error-banner" class="banner error hidden" role="alert"></section>
-      <section id="success-banner" class="banner success hidden" role="status"></section>
-
-      <div class="workspace">
-        <section class="viewer-panel" aria-label="Camera frame">
-          <div class="viewer">
-            <canvas id="camera-canvas"></canvas>
-            <div id="camera-placeholder" class="placeholder">Waiting for camera image…</div>
-          </div>
-          <div class="viewer-meta">
-            <span id="frame-meta">No frame</span>
-            <span id="coordinate-hint">Freeze a synchronized frame before selecting points.</span>
-          </div>
-        </section>
-
-        <aside class="controls">
-          <section class="control-section">
-            <h2>1. Capture</h2>
-            <div class="button-row">
-              <button id="freeze-button" class="primary" type="button">Freeze synchronized frame</button>
-              <button id="live-button" type="button">Live</button>
-            </div>
-          </section>
-
-          <section class="control-section">
-            <h2>2. Match markers</h2>
-            <label for="marker-select">Marker assigned to next click</label>
-            <select id="marker-select" disabled>
-              <option>Freeze a frame first</option>
-            </select>
-            <p class="hint">Select a marker, then click its center in the camera image. Each marker can be used once.</p>
-            <div class="button-row">
-              <button id="remove-button" type="button" disabled>Remove last</button>
-              <button id="clear-button" type="button" disabled>Clear</button>
-            </div>
-            <div class="table-wrap">
-              <table>
-                <thead><tr><th>Marker</th><th>u</th><th>v</th><th>Error</th></tr></thead>
-                <tbody id="points-body">
-                  <tr><td colspan="4" class="empty">No correspondences</td></tr>
-                </tbody>
-              </table>
-            </div>
-          </section>
-
-          <section class="control-section solve-section">
-            <h2>3. Solve</h2>
-            <button id="solve-button" class="primary wide" type="button" disabled>Solve and save</button>
-            <pre id="result-box" class="result">Select at least four markers.</pre>
-          </section>
-
-          <details class="details">
-            <summary>ROS and output details</summary>
-            <dl>
-              <dt>Image</dt><dd id="image-topic">—</dd>
-              <dt>CameraInfo</dt><dd id="info-topic">—</dd>
-              <dt>Pose prefix</dt><dd id="pose-prefix">—</dd>
-              <dt>Output</dt><dd id="output-file">—</dd>
-            </dl>
-          </details>
-        </aside>
-      </div>
-    </main>
-    <script src="app.js" defer></script>
+    <div id="app" data-page-title="Camera extrinsic calibration"></div>
   </body>
 </html>

@@ -143,3 +143,18 @@ CI tests the Python solvers and Web services, builds the standalone Debian
 package for Focal `amd64` and `arm64`, installs it in a clean container, and
 checks its ROS launch files, process definitions, Python imports, and local
 HTTP endpoints without installing or launching a camera driver.
+
+The intrinsic and extrinsic pages are two deterministic builds of one React
+entry. Both consume the immutable `@xgc2/ui-react` `0.11.0` release for their
+shell, single-title topbar, themes, panels, controls, feedback, progress,
+tables, structured details, code results, responsive layout, and scrollbars.
+The imperative camera/ROS transport and canvas interaction stay in small
+page-specific modules behind that shared view.
+
+```bash
+npm --prefix web-src ci
+npm --prefix web-src run build
+```
+
+Generated `app.js` and `styles.css` files remain beside each packaged HTML
+entry. CI and release jobs rebuild them and reject source/generated drift.

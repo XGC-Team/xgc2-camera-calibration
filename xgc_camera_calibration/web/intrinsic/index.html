@@ -5,54 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>XGC2 Camera Intrinsic Calibration</title>
   <link rel="stylesheet" href="styles.css">
+  <script type="module" src="app.js"></script>
 </head>
 <body>
-  <header>
-    <h1>Camera intrinsic calibration</h1>
-    <span id="conn" class="pill pill-off">connecting…</span>
-  </header>
-
-  <main>
-    <section class="video">
-      <div class="frame"><img id="stream" alt="camera stream"></div>
-      <p class="hint">Move the camera so the board is seen near and far, at the image edges and tilted,
-        until all four bars fill; then <b>Calibrate</b>. In simulation, <b>click a sphere</b> in the guide
-        to fly there, or press <b>Auto-run</b> to sweep every pose.</p>
-    </section>
-
-    <aside class="panel">
-      <div class="card">
-        <div class="row"><h2>Coverage</h2><span id="samples" class="count">0 samples</span></div>
-        <div id="bars"></div>
-      </div>
-
-      <div class="card">
-        <h2>Calibration</h2>
-        <div class="actions">
-          <button id="btn-calibrate" disabled>Calibrate and save</button>
-          <button id="btn-reset">Reset</button>
-        </div>
-        <p id="status" class="status"></p>
-        <pre id="result" class="result" hidden></pre>
-      </div>
-
-      <div class="card" id="camera-card">
-        <div class="row"><h2>Sample guide</h2><span class="count">drag = rotate · click a sphere = go there</span></div>
-        <canvas id="scene"></canvas>
-        <div class="next">
-          <div class="next-head">Next: <b id="next-name">—</b><span class="count" id="done-count"></span></div>
-          <img id="ref-img" alt="expected view" hidden>
-          <p id="ref-hint" class="count">Move the camera to fill coverage; spheres green as poses are captured.</p>
-        </div>
-        <div class="actions">
-          <button id="btn-reset-pose" disabled>⌂ Reset pose</button>
-          <button id="btn-auto" disabled>▶ Auto-run</button>
-        </div>
-        <p id="pose" class="pose"></p>
-      </div>
-    </aside>
-  </main>
-
-  <script src="app.js"></script>
+  <div id="app" data-page-title="Camera intrinsic calibration"></div>
 </body>
 </html>

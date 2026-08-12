@@ -57,6 +57,21 @@ jobs:
       version: ${{ steps.contract.outputs.version }}
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web-src/package-lock.json
+      - name: Verify shared React calibration pages
+        run: |
+          npm --prefix web-src ci
+          npm --prefix web-src run typecheck
+          npm --prefix web-src run build
+          git diff --exit-code -- \
+            xgc_camera_calibration/web/intrinsic/app.js \
+            xgc_camera_calibration/web/intrinsic/styles.css \
+            xgc_camera_calibration/web/extrinsic/app.js \
+            xgc_camera_calibration/web/extrinsic/styles.css
       - id: contract
         name: Validate release inputs and product contract
         env:

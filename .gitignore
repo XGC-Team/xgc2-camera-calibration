@@ -10,3 +10,6 @@
 *.py[cod]
 *.egg-info/
 .pytest_cache/
+web-src/node_modules/
+web-src/dist/
+web-src/*.tsbuildinfo
