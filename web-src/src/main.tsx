@@ -14,6 +14,7 @@ import {
   Panel,
   ProductBrand,
   ResourceMeter,
+  ResponsiveSplit,
   ScrollRegion,
   SectionHeader,
   SegmentedControl,
@@ -162,54 +163,60 @@ function IntrinsicPage() {
       className="calibration-shell"
       contentClassName="calibration-content"
       contentPadding="none"
+      mobileBreakpoint="compact"
       mobileLayout="document"
       topbar={<Topbar brand={<ProductBrand product="Camera intrinsic calibration" />} actions={<ThemeControl />} />}
     >
-      <main className="calibration-page calibration-page-intrinsic">
-        <Panel
-          bodyLayout="column"
-          className="calibration-view-panel"
-          fill
-          padding="none"
-          title="Live camera"
-          actions={<LegacyStatus id="conn" initial="connecting…" sourceClassName="pill pill-off" hideValues={['connected']} />}
-        >
-          <div className="calibration-frame"><img id="stream" alt="Camera stream" /></div>
-          <p className="calibration-hint">
-            Move the camera so the board is seen near and far, at the image edges and tilted, until all four bars fill; then <strong>Calibrate</strong>. In simulation, click a sphere in the guide or use Auto-run.
-          </p>
-        </Panel>
+      <div className="calibration-page calibration-page-intrinsic">
+        <ResponsiveSplit
+          primary={(
+            <Panel
+              bodyLayout="column"
+              className="calibration-view-panel"
+              fill
+              padding="none"
+              title="Live camera"
+              actions={<LegacyStatus id="conn" initial="connecting…" sourceClassName="pill pill-off" hideValues={['connected']} />}
+            >
+              <div className="calibration-frame"><img id="stream" alt="Camera stream" /></div>
+              <p className="calibration-hint">
+                Move the camera so the board is seen near and far, at the image edges and tilted, until all four bars fill; then <strong>Calibrate</strong>. In simulation, click a sphere in the guide or use Auto-run.
+              </p>
+            </Panel>
+          )}
+          secondary={(
+            <ScrollRegion className="calibration-side" fill>
+              <Panel title="Coverage" actions={<span id="samples" className="calibration-meta">0 samples</span>}>
+                <LegacyCoverage />
+              </Panel>
 
-        <ScrollRegion className="calibration-side" fill>
-          <Panel title="Coverage" actions={<span id="samples" className="calibration-meta">0 samples</span>}>
-            <LegacyCoverage />
-          </Panel>
+              <Panel title="Calibration">
+                <div className="calibration-actions">
+                  <Button id="btn-calibrate" className="calibration-action" tone="primary" appearance="solid" disabled>Calibrate and save</Button>
+                  <Button id="btn-reset" className="calibration-action">Reset</Button>
+                </div>
+                <LegacyStatus id="status" initial="" hideValues={['']} />
+                <LegacyCodeResult id="result" initiallyHidden />
+              </Panel>
 
-          <Panel title="Calibration">
-            <div className="calibration-actions">
-              <Button id="btn-calibrate" className="calibration-action" tone="primary" appearance="solid" disabled>Calibrate and save</Button>
-              <Button id="btn-reset" className="calibration-action">Reset</Button>
-            </div>
-            <LegacyStatus id="status" initial="" hideValues={['']} />
-            <LegacyCodeResult id="result" initiallyHidden />
-          </Panel>
-
-          <Panel id="camera-card" title="Sample guide">
-            <p className="calibration-hint">Drag to rotate the guide; select a sphere to move the simulated camera.</p>
-            <canvas id="scene" />
-            <div className="calibration-next">
-              <p>Next: <strong id="next-name">—</strong><span id="done-count" className="calibration-meta" /></p>
-              <img id="ref-img" alt="Expected view" hidden />
-              <p id="ref-hint" className="calibration-meta">Move the camera to fill coverage; captured poses are marked in the guide.</p>
-            </div>
-            <div className="calibration-actions">
-              <Button id="btn-reset-pose" className="calibration-action" disabled>Reset pose</Button>
-              <Button id="btn-auto" className="calibration-action" disabled>Auto-run</Button>
-            </div>
-            <p id="pose" className="calibration-meta calibration-pose" />
-          </Panel>
-        </ScrollRegion>
-      </main>
+              <Panel id="camera-card" title="Sample guide">
+                <p className="calibration-hint">Drag to rotate the guide; select a sphere to move the simulated camera.</p>
+                <canvas id="scene" />
+                <div className="calibration-next">
+                  <p>Next: <strong id="next-name">—</strong><span id="done-count" className="calibration-meta" /></p>
+                  <img id="ref-img" alt="Expected view" hidden />
+                  <p id="ref-hint" className="calibration-meta">Move the camera to fill coverage; captured poses are marked in the guide.</p>
+                </div>
+                <div className="calibration-actions">
+                  <Button id="btn-reset-pose" className="calibration-action" disabled>Reset pose</Button>
+                  <Button id="btn-auto" className="calibration-action" disabled>Auto-run</Button>
+                </div>
+                <p id="pose" className="calibration-meta calibration-pose" />
+              </Panel>
+            </ScrollRegion>
+          )}
+        />
+      </div>
     </AppShell>
   )
 }
@@ -220,87 +227,92 @@ function ExtrinsicPage() {
       className="calibration-shell"
       contentClassName="calibration-content"
       contentPadding="none"
+      mobileBreakpoint="compact"
       mobileLayout="document"
       topbar={<Topbar brand={<ProductBrand product="Camera extrinsic calibration" />} actions={<ThemeControl />} />}
     >
-      <main className="calibration-page calibration-page-extrinsic">
+      <div className="calibration-page calibration-page-extrinsic">
         <div className="calibration-notices">
           <LegacyNotice id="error-banner" tone="danger" />
           <LegacyNotice id="success-banner" tone="success" />
         </div>
-        <div className="calibration-workspace">
-          <Panel
-            bodyLayout="column"
-            className="calibration-view-panel"
-            fill
-            padding="none"
-            title="Camera frame"
-            actions={(
-              <div className="calibration-health">
-                <LegacyStatus id="mode-chip" initial="Connecting" sourceClassName="chip" />
-                <LegacyStatus id="input-chip" initial="Waiting for ROS" sourceClassName="chip muted" />
+        <ResponsiveSplit
+          className="calibration-workspace"
+          primary={(
+            <Panel
+              bodyLayout="column"
+              className="calibration-view-panel"
+              fill
+              padding="none"
+              title="Camera frame"
+              actions={(
+                <div className="calibration-health">
+                  <LegacyStatus id="mode-chip" initial="Connecting" sourceClassName="chip" />
+                  <LegacyStatus id="input-chip" initial="Waiting for ROS" sourceClassName="chip muted" />
+                </div>
+              )}
+            >
+              <div className="calibration-viewer">
+                <canvas id="camera-canvas" />
+                <div id="camera-placeholder" className="calibration-placeholder">Waiting for camera image…</div>
               </div>
-            )}
-          >
-            <div className="calibration-viewer">
-              <canvas id="camera-canvas" />
-              <div id="camera-placeholder" className="calibration-placeholder">Waiting for camera image…</div>
-            </div>
-            <div className="calibration-viewer-meta">
-              <span id="frame-meta">No frame</span>
-              <span id="coordinate-hint">Freeze a synchronized frame before selecting points.</span>
-            </div>
-          </Panel>
+              <div className="calibration-viewer-meta">
+                <span id="frame-meta">No frame</span>
+                <span id="coordinate-hint">Freeze a synchronized frame before selecting points.</span>
+              </div>
+            </Panel>
+          )}
+          secondary={(
+            <Panel bodyLayout="column" className="calibration-controls-panel" fill padding="none" title="Calibration steps">
+              <ScrollRegion className="calibration-controls" fill>
+                <section className="calibration-control-section">
+                  <SectionHeader title="1. Capture" />
+                  <div className="calibration-actions">
+                    <Button id="freeze-button" className="calibration-action" tone="primary" appearance="solid">Freeze synchronized frame</Button>
+                    <Button id="live-button" className="calibration-action">Live</Button>
+                  </div>
+                </section>
 
-          <Panel bodyLayout="column" className="calibration-controls-panel" fill padding="none" title="Calibration steps">
-            <ScrollRegion className="calibration-controls" fill>
-              <section className="calibration-control-section">
-                <SectionHeader title="1. Capture" />
-                <div className="calibration-actions">
-                  <Button id="freeze-button" className="calibration-action" tone="primary" appearance="solid">Freeze synchronized frame</Button>
-                  <Button id="live-button" className="calibration-action">Live</Button>
-                </div>
-              </section>
+                <section className="calibration-control-section">
+                  <SectionHeader title="2. Match markers" />
+                  <FormField
+                    label="Marker assigned to next click"
+                    description="Select a marker, then click its center in the image. Each marker can be used once."
+                  >
+                    <Select id="marker-select" disabled><option>Freeze a frame first</option></Select>
+                  </FormField>
+                  <div className="calibration-actions">
+                    <Button id="remove-button" className="calibration-action" disabled>Remove last</Button>
+                    <Button id="clear-button" className="calibration-action" disabled>Clear</Button>
+                  </div>
+                  <DataTable className="calibration-table">
+                    <table>
+                      <thead><tr><th>Marker</th><th>u</th><th>v</th><th>Error</th></tr></thead>
+                      <tbody id="points-body"><tr><td colSpan={4} className="empty">No correspondences</td></tr></tbody>
+                    </table>
+                  </DataTable>
+                </section>
 
-              <section className="calibration-control-section">
-                <SectionHeader title="2. Match markers" />
-                <FormField
-                  label="Marker assigned to next click"
-                  description="Select a marker, then click its center in the image. Each marker can be used once."
-                >
-                  <Select id="marker-select" disabled><option>Freeze a frame first</option></Select>
-                </FormField>
-                <div className="calibration-actions">
-                  <Button id="remove-button" className="calibration-action" disabled>Remove last</Button>
-                  <Button id="clear-button" className="calibration-action" disabled>Clear</Button>
-                </div>
-                <DataTable className="calibration-table">
-                  <table>
-                    <thead><tr><th>Marker</th><th>u</th><th>v</th><th>Error</th></tr></thead>
-                    <tbody id="points-body"><tr><td colSpan={4} className="empty">No correspondences</td></tr></tbody>
-                  </table>
-                </DataTable>
-              </section>
+                <section className="calibration-control-section">
+                  <SectionHeader title="3. Solve" />
+                  <Button id="solve-button" className="calibration-wide" tone="primary" appearance="solid" disabled>Solve and save</Button>
+                  <LegacyCodeResult id="result-box" initial="Select at least four markers." />
+                </section>
 
-              <section className="calibration-control-section">
-                <SectionHeader title="3. Solve" />
-                <Button id="solve-button" className="calibration-wide" tone="primary" appearance="solid" disabled>Solve and save</Button>
-                <LegacyCodeResult id="result-box" initial="Select at least four markers." />
-              </section>
-
-              <details className="calibration-details">
-                <summary>ROS and output details</summary>
-                <DescriptionList className="calibration-description-list">
-                  <DescriptionItem label="Image" value={<span id="image-topic">—</span>} />
-                  <DescriptionItem label="CameraInfo" value={<span id="info-topic">—</span>} />
-                  <DescriptionItem label="Pose prefix" value={<span id="pose-prefix">—</span>} />
-                  <DescriptionItem label="Output" value={<span id="output-file">—</span>} />
-                </DescriptionList>
-              </details>
-            </ScrollRegion>
-          </Panel>
-        </div>
-      </main>
+                <details className="calibration-details">
+                  <summary>ROS and output details</summary>
+                  <DescriptionList className="calibration-description-list">
+                    <DescriptionItem label="Image" value={<span id="image-topic">—</span>} />
+                    <DescriptionItem label="CameraInfo" value={<span id="info-topic">—</span>} />
+                    <DescriptionItem label="Pose prefix" value={<span id="pose-prefix">—</span>} />
+                    <DescriptionItem label="Output" value={<span id="output-file">—</span>} />
+                  </DescriptionList>
+                </details>
+              </ScrollRegion>
+            </Panel>
+          )}
+        />
+      </div>
     </AppShell>
   )
 }

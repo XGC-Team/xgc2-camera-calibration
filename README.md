@@ -145,7 +145,7 @@ checks its ROS launch files, process definitions, Python imports, and local
 HTTP endpoints without installing or launching a camera driver.
 
 The intrinsic and extrinsic pages are two deterministic builds of one React
-entry. Both consume the immutable `@xgc2/ui-react` `0.11.0` release for their
+entry. Both consume the immutable `@xgc2/ui-react` `0.14.0` release for their
 shell, single-title topbar, themes, panels, controls, feedback, progress,
 tables, structured details, code results, responsive layout, and scrollbars.
 The imperative camera/ROS transport and canvas interaction stay in small

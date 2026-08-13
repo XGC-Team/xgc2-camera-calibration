@@ -26,9 +26,7 @@ body,
 }
 
 .calibration-page-intrinsic {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(300px, 360px);
-  gap: var(--space-layout-default);
+  display: block;
 }
 
 .calibration-page-extrinsic {
@@ -47,11 +45,9 @@ body,
 }
 
 .calibration-workspace {
+  height: auto;
   min-height: 0;
   flex: 1 1 auto;
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(320px, 400px);
-  gap: var(--space-layout-default);
 }
 
 .calibration-frame,
@@ -227,25 +223,11 @@ body,
   margin-top: var(--space-layout-default);
 }
 
-@media (max-width: 900px) {
-  .calibration-content {
-    overflow: visible;
-  }
-
+@media (max-width: 820px) {
   .calibration-page,
-  .calibration-page-intrinsic,
   .calibration-workspace {
     height: auto;
     min-height: 0;
-    grid-template-columns: 1fr;
-  }
-
-  .calibration-page-intrinsic {
-    display: grid;
-  }
-
-  .calibration-workspace {
-    display: grid;
   }
 
   .calibration-side,
