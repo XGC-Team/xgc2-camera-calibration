@@ -167,7 +167,9 @@ function IntrinsicPage() {
     >
       <main className="calibration-page calibration-page-intrinsic">
         <Panel
+          bodyLayout="column"
           className="calibration-view-panel"
+          fill
           padding="none"
           title="Live camera"
           actions={<LegacyStatus id="conn" initial="connecting…" sourceClassName="pill pill-off" hideValues={['connected']} />}
@@ -185,8 +187,8 @@ function IntrinsicPage() {
 
           <Panel title="Calibration">
             <div className="calibration-actions">
-              <Button id="btn-calibrate" tone="primary" appearance="solid" disabled>Calibrate and save</Button>
-              <Button id="btn-reset">Reset</Button>
+              <Button id="btn-calibrate" className="calibration-action" tone="primary" appearance="solid" disabled>Calibrate and save</Button>
+              <Button id="btn-reset" className="calibration-action">Reset</Button>
             </div>
             <LegacyStatus id="status" initial="" hideValues={['']} />
             <LegacyCodeResult id="result" initiallyHidden />
@@ -201,8 +203,8 @@ function IntrinsicPage() {
               <p id="ref-hint" className="calibration-meta">Move the camera to fill coverage; captured poses are marked in the guide.</p>
             </div>
             <div className="calibration-actions">
-              <Button id="btn-reset-pose" disabled>Reset pose</Button>
-              <Button id="btn-auto" disabled>Auto-run</Button>
+              <Button id="btn-reset-pose" className="calibration-action" disabled>Reset pose</Button>
+              <Button id="btn-auto" className="calibration-action" disabled>Auto-run</Button>
             </div>
             <p id="pose" className="calibration-meta calibration-pose" />
           </Panel>
@@ -228,7 +230,9 @@ function ExtrinsicPage() {
         </div>
         <div className="calibration-workspace">
           <Panel
+            bodyLayout="column"
             className="calibration-view-panel"
+            fill
             padding="none"
             title="Camera frame"
             actions={(
@@ -248,13 +252,13 @@ function ExtrinsicPage() {
             </div>
           </Panel>
 
-          <Panel className="calibration-controls-panel" padding="none" title="Calibration steps">
+          <Panel bodyLayout="column" className="calibration-controls-panel" fill padding="none" title="Calibration steps">
             <ScrollRegion className="calibration-controls" fill>
               <section className="calibration-control-section">
                 <SectionHeader title="1. Capture" />
                 <div className="calibration-actions">
-                  <Button id="freeze-button" tone="primary" appearance="solid">Freeze synchronized frame</Button>
-                  <Button id="live-button">Live</Button>
+                  <Button id="freeze-button" className="calibration-action" tone="primary" appearance="solid">Freeze synchronized frame</Button>
+                  <Button id="live-button" className="calibration-action">Live</Button>
                 </div>
               </section>
 
@@ -267,8 +271,8 @@ function ExtrinsicPage() {
                   <Select id="marker-select" disabled><option>Freeze a frame first</option></Select>
                 </FormField>
                 <div className="calibration-actions">
-                  <Button id="remove-button" disabled>Remove last</Button>
-                  <Button id="clear-button" disabled>Clear</Button>
+                  <Button id="remove-button" className="calibration-action" disabled>Remove last</Button>
+                  <Button id="clear-button" className="calibration-action" disabled>Clear</Button>
                 </div>
                 <DataTable className="calibration-table">
                   <table>
@@ -286,7 +290,7 @@ function ExtrinsicPage() {
 
               <details className="calibration-details">
                 <summary>ROS and output details</summary>
-                <DescriptionList>
+                <DescriptionList className="calibration-description-list">
                   <DescriptionItem label="Image" value={<span id="image-topic">—</span>} />
                   <DescriptionItem label="CameraInfo" value={<span id="info-topic">—</span>} />
                   <DescriptionItem label="Pose prefix" value={<span id="pose-prefix">—</span>} />

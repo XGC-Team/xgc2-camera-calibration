@@ -55,21 +55,6 @@ body,
   gap: var(--space-layout-default);
 }
 
-.calibration-view-panel,
-.calibration-controls-panel {
-  min-height: 0;
-  display: flex;
-  flex-direction: column;
-}
-
-.calibration-view-panel > .xgc-panel-body,
-.calibration-controls-panel > .xgc-panel-body {
-  min-height: 0;
-  flex: 1 1 auto;
-  display: flex;
-  flex-direction: column;
-}
-
 .calibration-frame,
 .calibration-viewer {
   position: relative;
@@ -123,7 +108,7 @@ body,
   gap: var(--space-control-gap);
 }
 
-.calibration-actions > .xgc-button {
+.calibration-actions > .calibration-action {
   flex: 1 1 auto;
 }
 
@@ -239,7 +224,7 @@ body,
   cursor: pointer;
 }
 
-.calibration-details .xgc-description-list {
+.calibration-details .calibration-description-list {
   margin-top: var(--space-layout-default);
 }
 
