@@ -9,6 +9,7 @@ import {
   DescriptionItem,
   DescriptionList,
   FormField,
+  initializeSkin,
   Notice,
   Panel,
   ProductBrand,
@@ -19,12 +20,15 @@ import {
   Select,
   StatusText,
   Topbar,
+  useSkin,
 } from '@xgc2/ui-react'
 import '@xgc2/ui-react/styles.css'
 import './styles.css'
 
-type Skin = 'light' | 'dark'
 type StatusTone = 'neutral' | 'info' | 'success' | 'warning' | 'danger'
+
+const SKIN_STORAGE_KEY = 'xgc2-camera-calibration.skin'
+initializeSkin({ defaultSkin: 'dark', storageKey: SKIN_STORAGE_KEY })
 
 function useLegacyMutation(ref: RefObject<HTMLElement | null>, sync: () => void) {
   useEffect(() => {
@@ -141,17 +145,13 @@ function LegacyCoverage() {
 }
 
 function ThemeControl() {
-  const [skin, setSkin] = useState<Skin>(readSkin)
-  useEffect(() => {
-    document.documentElement.dataset.skin = skin
-    try { localStorage.setItem('xgc2-camera-calibration.skin', skin) } catch { /* storage may be unavailable */ }
-  }, [skin])
+  const [skin, setSkin] = useSkin({ defaultSkin: 'dark', storageKey: SKIN_STORAGE_KEY })
   return (
     <SegmentedControl
       ariaLabel="Appearance"
       value={skin}
       options={[{ label: 'Light', value: 'light' }, { label: 'Dark', value: 'dark' }]}
-      onValueChange={(value) => setSkin(value as Skin)}
+      onValueChange={(value) => setSkin(value === 'light' ? 'light' : 'dark')}
     />
   )
 }
@@ -303,10 +303,6 @@ function ExtrinsicPage() {
       </main>
     </AppShell>
   )
-}
-
-function readSkin(): Skin {
-  try { return localStorage.getItem('xgc2-camera-calibration.skin') === 'light' ? 'light' : 'dark' } catch { return 'dark' }
 }
 
 const root = document.getElementById('app')
