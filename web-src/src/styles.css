@@ -22,19 +22,19 @@ body,
   width: 100%;
   height: 100%;
   min-height: 0;
-  padding: var(--space-12);
+  padding: var(--space-page-padding);
 }
 
 .calibration-page-intrinsic {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(300px, 360px);
-  gap: var(--space-12);
+  gap: var(--space-layout-default);
 }
 
 .calibration-page-extrinsic {
   display: flex;
   flex-direction: column;
-  gap: var(--space-10);
+  gap: var(--space-layout-default);
 }
 
 .calibration-notices:empty {
@@ -43,7 +43,7 @@ body,
 
 .calibration-notices {
   display: grid;
-  gap: var(--space-8);
+  gap: var(--space-layout-compact);
 }
 
 .calibration-workspace {
@@ -51,7 +51,7 @@ body,
   flex: 1 1 auto;
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(320px, 400px);
-  gap: var(--space-12);
+  gap: var(--space-layout-default);
 }
 
 .calibration-view-panel,
@@ -89,7 +89,7 @@ body,
 
 .calibration-hint {
   margin: 0;
-  padding: var(--space-8) var(--space-10);
+  padding: var(--space-md) var(--space-lg);
   color: var(--color-text-muted);
   font-size: var(--font-sm);
   line-height: 1.45;
@@ -99,7 +99,7 @@ body,
   min-height: 0;
   display: flex;
   flex-direction: column;
-  gap: var(--space-10);
+  gap: var(--space-layout-default);
 }
 
 .calibration-meta,
@@ -119,7 +119,7 @@ body,
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: var(--space-8);
+  gap: var(--space-control-gap);
 }
 
 .calibration-actions > .xgc-button {
@@ -131,12 +131,12 @@ body,
 }
 
 .calibration-result {
-  margin-top: var(--space-10);
+  margin-top: var(--space-layout-default);
 }
 
 .calibration-meters {
   display: grid;
-  gap: var(--space-8);
+  gap: var(--space-layout-compact);
 }
 
 #scene {
@@ -156,8 +156,8 @@ body,
 
 .calibration-next {
   display: grid;
-  gap: var(--space-6);
-  margin-block: var(--space-8);
+  gap: var(--space-layout-tight);
+  margin-block: var(--space-layout-compact);
 }
 
 .calibration-next p {
@@ -181,7 +181,7 @@ body,
 }
 
 .calibration-pose {
-  margin: var(--space-8) 0 0;
+  margin: var(--space-layout-compact) 0 0;
   font-family: var(--font-mono);
 }
 
@@ -200,8 +200,8 @@ body,
 .calibration-viewer-meta {
   display: flex;
   justify-content: space-between;
-  gap: var(--space-12);
-  padding: var(--space-8) var(--space-10);
+  gap: var(--space-layout-default);
+  padding: var(--space-md) var(--space-lg);
   border-top: var(--stroke-thin) solid var(--color-border);
 }
 
@@ -211,24 +211,24 @@ body,
 
 .calibration-control-section {
   display: grid;
-  gap: var(--space-10);
-  padding: var(--space-12);
+  gap: var(--space-layout-default);
+  padding: var(--space-panel-padding);
   border-bottom: var(--stroke-thin) solid var(--color-border);
 }
 
 .calibration-table {
   max-height: 230px;
-  margin-top: var(--space-4);
+  margin-top: var(--space-xs);
 }
 
 .calibration-table td.empty {
-  padding: var(--space-16);
+  padding: var(--space-xl);
   color: var(--color-text-muted);
   text-align: center;
 }
 
 .calibration-details {
-  padding: var(--space-12);
+  padding: var(--space-panel-padding);
   color: var(--color-text-muted);
   font-size: var(--font-sm);
 }
@@ -239,7 +239,7 @@ body,
 }
 
 .calibration-details .xgc-description-list {
-  margin-top: var(--space-10);
+  margin-top: var(--space-layout-default);
 }
 
 @media (max-width: 900px) {
@@ -274,6 +274,6 @@ body,
 
   .calibration-viewer-meta {
     flex-direction: column;
-    gap: var(--space-4);
+    gap: var(--space-xs);
   }
 }
