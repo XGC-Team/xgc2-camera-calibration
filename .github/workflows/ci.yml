@@ -25,6 +25,7 @@ jobs:
       - name: Verify shared React calibration pages
         run: |
           npm --prefix web-src ci
+          npm --prefix web-src run check:ui-policy
           npm --prefix web-src run typecheck
           npm --prefix web-src run build
           git diff --exit-code -- \
