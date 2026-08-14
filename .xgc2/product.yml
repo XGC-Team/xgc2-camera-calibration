@@ -61,7 +61,7 @@ ownership:
   - /opt/ros/noetic/lib/xgc_camera_calibration
   - /opt/ros/noetic/lib/python3/dist-packages/xgc_camera_calibration
 release:
-  repository: lxk36/xgc2-camera-calibration-ros1
+  repository: XGC-Team/xgc2-camera-calibration
   ref: main
   workflow: release.yml
   ci_workflow: ci.yml
