@@ -120,7 +120,7 @@ intrinsic asset exists, but an existing valid intrinsic asset lets the
 extrinsic workflow start directly.
 
 This repository releases `ros-noetic-xgc2-camera-calibration` independently
-from both `libxgc2-camera-dev` and `ros-noetic-xgc-camera-driver`.
+from both `libxgc2-camera-dev` and `ros-noetic-xgc2-camera-driver`.
 
 ## Automation
 
