@@ -29,16 +29,14 @@ jobs:
             xgc_camera_calibration/web/intrinsic/styles.css \
             xgc_camera_calibration/web/extrinsic/app.js \
             xgc_camera_calibration/web/extrinsic/styles.css
-
   compliance:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Validate product contracts
         run: .xgc2/scripts/check_package_compliance.sh
-
   build-debs:
-    needs: [frontend, compliance]
+    needs: frontend
     strategy:
       fail-fast: false
       matrix:
@@ -70,3 +68,6 @@ jobs:
             .ci/build-manifests/*.json
           include-hidden-files: true
           retention-days: 14
+
+
+

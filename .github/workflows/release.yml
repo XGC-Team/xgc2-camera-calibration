@@ -27,16 +27,6 @@ on:
         required: false
         default: ""
         type: string
-      run_cpp_quality:
-        description: Run the source compliance gate
-        required: true
-        default: false
-        type: boolean
-      run_source_tests:
-        description: Run source tests (also always run in package build)
-        required: true
-        default: false
-        type: boolean
 
 permissions:
   actions: read
@@ -84,7 +74,6 @@ jobs:
           test "$(git rev-parse HEAD)" = "${{ inputs.expected_source_sha }}"
           echo "version=$version" >>"$GITHUB_OUTPUT"
           .xgc2/scripts/check_package_compliance.sh
-
   build:
     needs: validate
     strategy:
@@ -121,3 +110,5 @@ jobs:
             .ci/build-manifests/*.json
           include-hidden-files: true
           retention-days: 14
+
+
