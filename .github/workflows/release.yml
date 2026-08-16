@@ -53,7 +53,7 @@ jobs:
           npm --prefix web-src ci
           npm --prefix web-src run typecheck
           npm --prefix web-src run build
-          git -C "$GITHUB_WORKSPACE" diff --exit-code -- \
+          git --git-dir="$PWD/.git" --work-tree="$PWD" diff --exit-code -- \
             xgc_camera_calibration/web/intrinsic/app.js \
             xgc_camera_calibration/web/intrinsic/styles.css \
             xgc_camera_calibration/web/extrinsic/app.js \
@@ -110,4 +110,3 @@ jobs:
             .ci/build-manifests/*.json
           include-hidden-files: true
           retention-days: 14
-
