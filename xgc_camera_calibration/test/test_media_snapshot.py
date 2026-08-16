@@ -178,6 +178,26 @@ class MediaSnapshotClientTest(unittest.TestCase):
         self.assertEqual(edge.deleted, ["snapshot-1"])
         self.assertEqual(edge.requests[-1][:2], ("DELETE", "/api/v1/snapshots/snapshot-1"))
 
+    def test_capture_accepts_simulation_epoch_timestamp_zero(self):
+        with FakeMediaEdge() as edge:
+            edge.metadata["timestampNanoseconds"] = 0
+            client = MediaSnapshotClient(edge.address, "usb_cam", 1.0)
+
+            snapshot = client.capture()
+
+        self.assertEqual(snapshot.timestamp_nanoseconds, 0)
+        self.assertEqual(edge.deleted, ["snapshot-1"])
+
+    def test_capture_rejects_a_non_rgb_snapshot_contract(self):
+        with FakeMediaEdge() as edge:
+            edge.metadata["pixelFormat"] = "bgr8"
+            client = MediaSnapshotClient(edge.address, "usb_cam", 1.0)
+
+            with self.assertRaisesRegex(MediaSnapshotError, "pixel format"):
+                client.capture()
+
+        self.assertEqual(edge.deleted, ["snapshot-1"])
+
     def test_health_requires_the_configured_source(self):
         with FakeMediaEdge() as edge:
             edge.sources = [{"id": "rear"}]

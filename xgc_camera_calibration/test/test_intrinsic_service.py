@@ -14,7 +14,10 @@ from unittest.mock import patch
 import cv2
 import numpy as np
 
-from xgc_camera_calibration.intrinsic_service import IntrinsicCalibrationService
+from xgc_camera_calibration.intrinsic_service import (
+    IntrinsicCalibrationService,
+    recommended_views,
+)
 from xgc_camera_calibration.web_service import ApiError, CalibrationHttpServer
 
 
@@ -64,6 +67,11 @@ class FakeCameraControl:
 
 
 class IntrinsicServiceTest(unittest.TestCase):
+    def test_110_degree_simulation_near_view_fills_size_coverage(self):
+        views = recommended_views((2.0, 0.0, 1.5))
+        near = next(view for view in views if view["name"] == "near (big)")
+        self.assertEqual(near["position"], [1.1, 0.0, 1.5])
+
     def test_web_assets_use_proxy_safe_relative_urls(self):
         index = (WEB_ROOT / "index.html").read_text(encoding="utf-8")
         app = (WEB_ROOT / "app.js").read_text(encoding="utf-8")

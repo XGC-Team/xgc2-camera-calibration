@@ -93,9 +93,9 @@ class MediaSnapshotClient:
             "/api/v1/sources/{}/snapshots".format(quote(self.source_id, safe="")),
             b"{}",
         )
-        parsed = self._metadata(metadata)
-        snapshot_id = parsed["id"]
+        snapshot_id = self._snapshot_id(metadata)
         try:
+            parsed = self._metadata(metadata)
             jpeg = self._bytes("GET", "/api/v1/snapshots/{}/jpeg".format(quote(snapshot_id, safe="")), _MAX_JPEG_BYTES)
             raw, headers = self._bytes_with_headers(
                 "GET", "/api/v1/snapshots/{}/raw".format(quote(snapshot_id, safe="")), _MAX_RGB_BYTES
@@ -126,10 +126,18 @@ class MediaSnapshotClient:
             except MediaSnapshotError:
                 pass
 
-    def _metadata(self, value: Any) -> Dict[str, Any]:
+    def _snapshot_id(self, value: Any) -> str:
         if not isinstance(value, dict):
             raise MediaSnapshotError("media snapshot response is invalid")
         snapshot_id = value.get("snapshotId")
+        if not _SOURCE_ID.fullmatch(snapshot_id if isinstance(snapshot_id, str) else ""):
+            raise MediaSnapshotError("media snapshot ID is invalid")
+        return snapshot_id
+
+    def _metadata(self, value: Any) -> Dict[str, Any]:
+        if not isinstance(value, dict):
+            raise MediaSnapshotError("media snapshot response is invalid")
+        snapshot_id = self._snapshot_id(value)
         source_id = value.get("sourceId")
         frame_id = value.get("frameId")
         width = value.get("width")
@@ -138,14 +146,18 @@ class MediaSnapshotClient:
         pixel_format = value.get("pixelFormat")
         matrix = value.get("cameraMatrix")
         distortion = value.get("distortion")
-        if not _SOURCE_ID.fullmatch(snapshot_id if isinstance(snapshot_id, str) else ""):
-            raise MediaSnapshotError("media snapshot ID is invalid")
         if source_id != self.source_id or not isinstance(frame_id, str) or not frame_id:
             raise MediaSnapshotError("media snapshot source metadata is invalid")
         if not isinstance(width, int) or not isinstance(height, int) or not (16 <= width <= 8192 and 16 <= height <= 8192):
             raise MediaSnapshotError("media snapshot dimensions are invalid")
-        if not isinstance(timestamp, int) or timestamp <= 0 or pixel_format != "rgb8":
-            raise MediaSnapshotError("media snapshot clock or pixel format is invalid")
+        # Simulation time begins at exactly zero. The Gazebo source and Media
+        # Edge contract both preserve that valid first-frame timestamp; treating
+        # it as missing made automatic calibration fail nondeterministically
+        # whenever an on-demand camera was activated at the simulation epoch.
+        if not isinstance(timestamp, int) or timestamp < 0:
+            raise MediaSnapshotError("media snapshot clock is invalid")
+        if pixel_format != "rgb8":
+            raise MediaSnapshotError("media snapshot pixel format is invalid")
         if not _finite_vector(matrix, 9) or not _finite_vector(distortion, 4):
             raise MediaSnapshotError("media snapshot camera metadata is invalid")
         return {

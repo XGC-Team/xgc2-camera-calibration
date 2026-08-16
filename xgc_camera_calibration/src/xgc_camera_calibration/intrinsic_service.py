@@ -44,7 +44,10 @@ def recommended_views(board_center: Sequence[float]) -> List[Dict[str, Any]]:
     tx, ty, tz = float(board_center[0]), float(board_center[1]), float(board_center[2])
     specs = [
         ("far (small)", (tx - 6.0, ty, tz), 0.0, 0.0),
-        ("near (big)", (tx - 1.8, ty, tz), 0.0, 0.0),
+        # The intrinsic simulation uses the real camera's 110-degree lens.
+        # At 0.9 m the complete 8x6 board remains inside the 16:9 frame while
+        # its interior corners fill the calibration Size range.
+        ("near (big)", (tx - 0.9, ty, tz), 0.0, 0.0),
         ("left", (tx - 7.0, ty + 0.3, tz), 0.55, 0.0),
         ("right", (tx - 7.0, ty - 0.3, tz), -0.55, 0.0),
         ("top", (tx - 4.0, ty, tz + 0.8), 0.0, 0.25),
