@@ -62,7 +62,7 @@ def main():
         )
 
     payload = {
-        "schema": "xgc2.build-artifact.v2",
+        "schema": "xgc2.build-artifact.v1",
         "product": arguments.product,
         "source_sha": arguments.source_sha,
         "version": arguments.product_version,
