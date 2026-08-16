@@ -80,6 +80,74 @@ class IntrinsicSolverTest(unittest.TestCase):
         self.assertAlmostEqual(document["camera_matrix_array"][0, 0], result.camera_matrix[0, 0], places=6)
         self.assertEqual(document["metadata"]["web_calibrator"], True)
 
+    def test_aprilgrid_tag_geometry_matches_printed_board(self):
+        # Station plate: 6x6 tag36h11, 88 mm tags, 26.4 mm gaps, ids 0..35.
+        obj = solver.aprilgrid_tag_object_points((6, 6), 0.088, 0.0264, 0, 7)
+        self.assertIsNotNone(obj)
+        # id 7 is column 1, row 1. Pitch = 0.1144 m.
+        self.assertAlmostEqual(float(obj[0, 0]), 0.1144, places=6)
+        self.assertAlmostEqual(float(obj[0, 1]), 0.1144, places=6)
+        self.assertAlmostEqual(float(obj[1, 0]), 0.2024, places=6)
+        self.assertIsNone(solver.aprilgrid_tag_object_points((6, 6), 0.088, 0.0264, 0, 36))
+
+    def test_detects_synthetic_aprilgrid_and_recovers_intrinsics(self):
+        if not hasattr(cv2, "aruco") or not hasattr(cv2.aruco, "DICT_APRILTAG_36h11"):
+            self.skipTest("OpenCV AprilTag 36h11 dictionary is unavailable")
+        gray = _render_aprilgrid((3, 3), tag_pixels=80, gap_pixels=24)
+        detection = solver.detect_aprilgrid(
+            gray, (3, 3), square=0.088, tag_spacing=0.0264, min_tags=6, maximum_width=960
+        )
+        self.assertIsNotNone(detection)
+        self.assertGreaterEqual(len(detection.image_points), 24)
+        image_points = []
+        object_points = []
+        obj = np.concatenate(
+            [
+                solver.aprilgrid_tag_object_points((3, 3), 0.088, 0.0264, 0, tag_id)
+                for tag_id in range(9)
+            ],
+            axis=0,
+        )
+        poses = [
+            (0, 0, 0, 0.0, 0.0, 3.5),
+            (0.25, 0, 0, -0.4, 0.0, 3.2),
+            (-0.2, 0.15, 0, 0.3, -0.2, 2.8),
+        ]
+        for rx, ry, rz, tx, ty, tz in poses:
+            projected, _ = cv2.projectPoints(
+                obj,
+                np.array([rx, ry, rz], dtype=np.float64),
+                np.array([tx, ty, tz], dtype=np.float64),
+                TRUTH_K,
+                np.zeros(5),
+            )
+            image_points.append(projected.reshape(-1, 1, 2).astype(np.float32))
+            object_points.append(obj)
+        result = solver.calibrate_intrinsic(
+            image_points, (3, 3), 0.088, (WIDTH, HEIGHT), object_points=object_points
+        )
+        self.assertAlmostEqual(result.camera_matrix[0, 0], 2288.17, delta=2.0)
+        self.assertLess(result.rms_reprojection_error_px, 0.5)
+
+
+def _render_aprilgrid(board_size, tag_pixels=80, gap_pixels=24, border=40):
+    dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
+    cols, rows = board_size
+    pitch = tag_pixels + gap_pixels
+    width = border * 2 + cols * tag_pixels + (cols - 1) * gap_pixels
+    height = border * 2 + rows * tag_pixels + (rows - 1) * gap_pixels
+    image = np.full((height, width), 255, np.uint8)
+    for row in range(rows):
+        for col in range(cols):
+            if hasattr(cv2.aruco, "generateImageMarker"):
+                tag = cv2.aruco.generateImageMarker(dictionary, row * cols + col, tag_pixels)
+            else:
+                tag = cv2.aruco.drawMarker(dictionary, row * cols + col, tag_pixels)
+            y0 = border + row * pitch
+            x0 = border + col * pitch
+            image[y0:y0 + tag_pixels, x0:x0 + tag_pixels] = tag
+    return image
+
 
 if __name__ == "__main__":
     unittest.main()

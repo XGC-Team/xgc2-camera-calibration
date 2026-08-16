@@ -73,7 +73,9 @@ def main():
             float(rospy.get_param("~board_y", 0.0)),
             float(rospy.get_param("~board_z", 1.5)),
         )
-        # Interior corners for the shared checkerboard_8x6 model (8x6 squares).
+        # Simulation uses the shared checkerboard_8x6 model (7x5 interior
+        # corners). Physical uses the station AprilGrid printed on the plate:
+        # 6x6 tag36h11, 88 mm tags, 26.4 mm gaps, ids 0..35.
         service = IntrinsicCalibrationService(
             board_size=(
                 int(rospy.get_param("~board_cols", 7)),
@@ -90,6 +92,11 @@ def main():
             references_dir=str(
                 rospy.get_param("~references_dir", str(calibrations / "intrinsic_refs"))
             ),
+            board_type=str(rospy.get_param("~board_type", "checkerboard")),
+            tag_spacing=float(rospy.get_param("~tag_spacing", 0.0)),
+            tag_family=str(rospy.get_param("~tag_family", "tag36h11")),
+            tag_start_id=int(rospy.get_param("~tag_start_id", 0)),
+            min_tags=int(rospy.get_param("~min_tags", 6)),
         )
         camera = maybe_camera_control(board_center)
         if camera is not None:

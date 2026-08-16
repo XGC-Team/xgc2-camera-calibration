@@ -82,15 +82,30 @@ class IntrinsicCalibrationService:
         references_dir: str = "",
         align_threshold: float = 1.8,
         media_source: str = "",
+        board_type: str = "checkerboard",
+        tag_spacing: float = 0.0,
+        tag_family: str = "tag36h11",
+        tag_start_id: int = 0,
+        min_tags: int = 6,
     ):
         if not output_file:
             raise ValueError("output_file must not be empty")
         if int(board_size[0]) < 2 or int(board_size[1]) < 2:
-            raise ValueError("board_size must be at least 2x2 interior corners")
+            raise ValueError("board_size must be at least 2x2")
         if float(square) <= 0.0:
             raise ValueError("square size must be positive")
         if not 1 <= int(jpeg_quality) <= 100:
             raise ValueError("jpeg_quality must be between 1 and 100")
+        kind = str(board_type or "checkerboard").strip().lower()
+        if kind not in ("checkerboard", "chessboard", "aprilgrid"):
+            raise ValueError("unsupported calibration board type: {}".format(board_type))
+        if kind == "aprilgrid" and float(tag_spacing) < 0.0:
+            raise ValueError("AprilGrid tag spacing must be non-negative")
+        self.board_type = "aprilgrid" if kind == "aprilgrid" else "checkerboard"
+        self.tag_spacing = float(tag_spacing)
+        self.tag_family = str(tag_family or "tag36h11").strip().lower()
+        self.tag_start_id = int(tag_start_id)
+        self.min_tags = int(min_tags)
         self.board_size = (int(board_size[0]), int(board_size[1]))
         self.square = float(square)
         self.output_file = str(Path(output_file).expanduser())
@@ -104,17 +119,25 @@ class IntrinsicCalibrationService:
         self.lock = threading.RLock()
         self.samples: List[Tuple[float, float, float, float]] = []
         self.image_points: List[np.ndarray] = []
+        self.object_points: List[np.ndarray] = []
         self.image_size: Optional[Tuple[int, int]] = None
         self._display: Optional[np.ndarray] = None
         self.result: Optional[intrinsic_solver.IntrinsicResult] = None
         self.result_payload: Optional[Dict[str, Any]] = None
 
-        # Sample guide: a full board spans (interior corners + 1) squares.
+        # Sample guide: chessboard uses interior corners + 1 squares; AprilGrid
+        # uses the printed tag grid including the gaps between tags.
         self.board_center = tuple(float(value) for value in board_center)
+        if self.board_type == "aprilgrid":
+            board_width = self.board_size[0] * self.square + (self.board_size[0] - 1) * self.tag_spacing
+            board_height = self.board_size[1] * self.square + (self.board_size[1] - 1) * self.tag_spacing
+        else:
+            board_width = (self.board_size[0] + 1) * self.square
+            board_height = (self.board_size[1] + 1) * self.square
         self.board_geometry = {
             "center": list(self.board_center),
-            "width": (self.board_size[0] + 1) * self.square,
-            "height": (self.board_size[1] + 1) * self.square,
+            "width": board_width,
+            "height": board_height,
         }
         self.views: List[Dict[str, Any]] = recommended_views(self.board_center)
         self.target_done: List[bool] = [False] * len(self.views)
@@ -218,7 +241,17 @@ class IntrinsicCalibrationService:
             return
         height, width = bgr.shape[:2]
         gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-        detection = intrinsic_solver.detect_board(gray, self.board_size, self.maximum_detect_width)
+        detection = intrinsic_solver.detect_board(
+            gray,
+            self.board_size,
+            self.maximum_detect_width,
+            board_type=self.board_type,
+            square=self.square,
+            tag_spacing=self.tag_spacing,
+            tag_family=self.tag_family,
+            start_id=self.tag_start_id,
+            min_tags=self.min_tags,
+        )
 
         scale = 1.0
         if width > self.display_width:
@@ -230,15 +263,22 @@ class IntrinsicCalibrationService:
         with self.lock:
             self.image_size = (width, height)
             if detection is not None:
-                corners, params = detection
-                cv2.drawChessboardCorners(
-                    display, self.board_size, (corners * scale).astype(np.float32), True
-                )
+                corners = detection.image_points
+                params = detection.coverage
+                scaled = (corners * scale).astype(np.float32)
+                if self.board_type == "aprilgrid":
+                    for point in scaled.reshape(-1, 2):
+                        cv2.circle(
+                            display, (int(round(point[0])), int(round(point[1]))), 4, (0, 255, 0), -1
+                        )
+                else:
+                    cv2.drawChessboardCorners(display, self.board_size, scaled, True)
                 if self.result is None and intrinsic_solver.is_new_sample(
                     params, self.samples, self.sample_distance
                 ):
                     self.samples.append(params)
                     self.image_points.append(corners)
+                    self.object_points.append(detection.object_points)
                 self._mark_aligned(display)
             self._display = display
 
@@ -248,6 +288,24 @@ class IntrinsicCalibrationService:
         if display is None:
             raise ApiError(HTTPStatus.SERVICE_UNAVAILABLE, "No camera image has arrived")
         return self._encode_jpeg(display)
+
+    def _board_document(self) -> Dict[str, Any]:
+        document: Dict[str, Any] = {
+            "type": self.board_type,
+            "size": list(self.board_size),
+            "square_size_m": self.square,
+        }
+        if self.board_type == "aprilgrid":
+            last_id = self.tag_start_id + self.board_size[0] * self.board_size[1] - 1
+            document.update(
+                {
+                    "tag_family": self.tag_family,
+                    "tag_spacing_m": self.tag_spacing,
+                    "start_id": self.tag_start_id,
+                    "end_id": last_id,
+                }
+            )
+        return document
 
     def targets_document(self) -> Dict[str, Any]:
         """Static guide geometry for the 3D scene: board + recommended views."""
@@ -282,7 +340,7 @@ class IntrinsicCalibrationService:
                 "output_file": self.output_file,
                 "image_ready": self._display is not None,
                 "media_source": self.media_source or self.image_topic,
-                "board": {"size": list(self.board_size), "square_size_m": self.square},
+                "board": self._board_document(),
                 "targets": targets,
                 "next": next_index,
                 "pose": pose,
@@ -308,6 +366,7 @@ class IntrinsicCalibrationService:
     def _clear_session_locked(self) -> None:
         self.samples = []
         self.image_points = []
+        self.object_points = []
         self.result = None
         self.result_payload = None
         self.target_done = [False] * len(self.views)
@@ -335,7 +394,7 @@ class IntrinsicCalibrationService:
             return {"ok": True, "samples": len(self.samples)}
 
     def capture(self) -> Dict[str, Any]:
-        """Explicitly collect one checkerboard sample from Media Edge."""
+        """Explicitly collect one calibration-board sample from Media Edge."""
         with self.lock:
             self._require_idle_locked()
         return self._capture_frame()
@@ -476,10 +535,14 @@ class IntrinsicCalibrationService:
             if self.result is not None:
                 return self.result_payload  # type: ignore[return-value]
             if not self.image_points or self.image_size is None:
-                raise ApiError(HTTPStatus.CONFLICT, "No chessboard samples collected yet")
+                raise ApiError(HTTPStatus.CONFLICT, "No calibration-board samples collected yet")
             try:
                 result = intrinsic_solver.calibrate_intrinsic(
-                    self.image_points, self.board_size, self.square, self.image_size
+                    self.image_points,
+                    self.board_size,
+                    self.square,
+                    self.image_size,
+                    object_points=self.object_points or None,
                 )
             except (CalibrationError, cv2.error) as error:
                 raise ApiError(HTTPStatus.UNPROCESSABLE_ENTITY, str(error)) from error
@@ -490,6 +553,7 @@ class IntrinsicCalibrationService:
                     board_size=self.board_size,
                     square=self.square,
                     metadata={"media_source": self.media_source or self.image_topic, "web_calibrator": True},
+                    board=self._board_document(),
                 )
             except OSError as error:
                 raise ApiError(
