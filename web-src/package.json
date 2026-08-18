@@ -9,12 +9,12 @@
     "typecheck": "tsc --noEmit --pretty false"
   },
   "dependencies": {
-    "@xgc2/ui-react": "https://github.com/XGC-Team/xgc2-ui/releases/download/v0.15.4/xgc2-ui-react-0.15.4.tgz",
+    "@xgc2/ui-react": "https://github.com/XGC-Team/xgc2-ui/releases/download/v0.15.6/xgc2-ui-react-0.15.6.tgz",
     "react": "19.2.1",
     "react-dom": "19.2.1"
   },
   "devDependencies": {
-    "@xgc2/ui-policy": "https://github.com/XGC-Team/xgc2-ui/releases/download/policy-v0.15.4/xgc2-ui-policy-0.15.4.tgz",
+    "@xgc2/ui-policy": "https://github.com/XGC-Team/xgc2-ui/releases/download/policy-v0.15.6/xgc2-ui-policy-0.15.6.tgz",
     "@types/node": "22.20.1",
     "@types/react": "19.2.7",
     "@types/react-dom": "19.2.3",
