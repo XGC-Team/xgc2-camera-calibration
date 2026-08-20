@@ -42,25 +42,27 @@ def recommended_views(board_center: Sequence[float]) -> List[Dict[str, Any]]:
     distinct, clickable marker in the 3D guide.
     """
     tx, ty, tz = float(board_center[0]), float(board_center[1]), float(board_center[2])
-    # This is the proven coverage sequence used by the standalone simulation
-    # driver. Consecutive poses deliberately change one coverage dimension at
-    # a time so the service's duplicate-sample filter keeps the useful frame.
+    # Measured against the product's 1280x720, 110-degree Gazebo camera. Every
+    # pose keeps the board detectable while the set spans both image edges,
+    # near/far scale and perspective skew. The lowest camera is only 0.8 m
+    # below the board centre (1.4 m at the default 2.2 m board height), so the
+    # automatic path never grazes the ground.
     specs = [
-        ("far center", (tx - 6.0, ty, tz), 0.0, 0.0),
-        ("far left", (tx - 6.0, ty, tz), 0.48, 0.0),
-        ("far right", (tx - 6.0, ty, tz), -0.48, 0.0),
-        ("far top", (tx - 6.0, ty, tz), 0.0, 0.22),
-        ("far bottom", (tx - 6.0, ty, tz), 0.0, -0.30),
-        ("far upper left", (tx - 6.0, ty, tz), 0.40, 0.22),
-        ("far lower right", (tx - 6.0, ty, tz), -0.40, -0.22),
-        ("medium center", (tx - 4.0, ty, tz), 0.0, 0.0),
-        ("near center", (tx - 1.8, ty, tz), 0.0, 0.0),
-        ("near left oblique", (tx - 2.5, ty + 2.2, tz), 0.0, 0.0),
-        ("near right oblique", (tx - 2.5, ty - 2.2, tz), 0.0, 0.0),
-        ("near high oblique", (tx - 2.5, ty, tz + 1.6), 0.0, 0.0),
-        ("near low oblique", (tx - 2.5, ty, tz - 1.4), 0.0, 0.0),
-        ("diagonal oblique A", (tx - 2.5, ty + 2.6, tz + 1.7), 0.0, 0.0),
-        ("diagonal oblique B", (tx - 2.5, ty - 2.6, tz - 1.7), 0.0, 0.0),
+        ("far lower left", (tx - 6.0, ty + 0.3, tz + 0.1), -0.76, -0.24),
+        ("far lower right", (tx - 6.0, ty - 0.3, tz + 0.1), 0.76, -0.24),
+        ("far bottom", (tx - 6.0, ty, tz - 0.1), 0.0, -0.48),
+        ("far lower center", (tx - 6.0, ty, tz), 0.0, -0.24),
+        ("upper perspective", (tx - 2.5, ty - 1.2, tz - 0.8), 0.0, 0.44),
+        ("upper oblique", (tx - 3.5, ty + 2.0, tz + 1.0), 0.0, 0.44),
+        ("center oblique left", (tx - 2.5, ty + 1.2, tz - 0.8), 0.0, 0.0),
+        ("center oblique right", (tx - 2.5, ty - 1.2, tz + 0.8), 0.0, 0.0),
+        ("medium center", (tx - 4.0, ty, tz), 0.0, -0.08),
+        ("near center", (tx - 2.0, ty, tz), 0.0, -0.08),
+        ("near large", (tx - 1.4, ty, tz), 0.0, -0.08),
+        ("near maximum", (tx - 1.2, ty, tz), 0.0, -0.08),
+        ("diagonal high", (tx - 2.5, ty + 2.6, tz + 1.7), 0.0, 0.0),
+        ("lower right perspective", (tx - 4.0, ty - 1.0, tz - 0.8), 0.0, 0.20),
+        ("upper left perspective", (tx - 2.5, ty + 1.2, tz + 0.8), 0.0, 0.28),
     ]
     return [{
         "name": name,
@@ -86,7 +88,7 @@ class IntrinsicCalibrationService:
         sample_distance: float = intrinsic_solver.SAMPLE_DISTANCE,
         maximum_detect_width: int = 960,
         display_width: int = 960,
-        board_center: Sequence[float] = (2.0, 0.0, 1.5),
+        board_center: Sequence[float] = (2.0, 0.0, 2.2),
         references_dir: str = "",
         align_threshold: float = 1.8,
         media_source: str = "",
@@ -132,6 +134,21 @@ class IntrinsicCalibrationService:
         self._display: Optional[np.ndarray] = None
         self.result: Optional[intrinsic_solver.IntrinsicResult] = None
         self.result_payload: Optional[Dict[str, Any]] = None
+        self._frame_sequence = 0
+        expected_corners = self.board_size[0] * self.board_size[1]
+        if self.board_type == "aprilgrid":
+            expected_corners *= 4
+        self.latest_detection: Dict[str, Any] = {
+            "status": "waiting",
+            "corner_count": 0,
+            "expected_corner_count": expected_corners,
+            "frame_width": 0,
+            "frame_height": 0,
+            "sequence": 0,
+            "metrics": [],
+            "accepted": False,
+            "duplicate": False,
+        }
 
         # Sample guide: chessboard uses interior corners + 1 squares; AprilGrid
         # uses the printed tag grid including the gaps between tags.
@@ -280,6 +297,9 @@ class IntrinsicCalibrationService:
 
         with self.lock:
             self.image_size = (width, height)
+            self._frame_sequence += 1
+            accepted = False
+            duplicate = False
             if detection is not None:
                 corners = detection.image_points
                 params = detection.coverage
@@ -291,13 +311,42 @@ class IntrinsicCalibrationService:
                         )
                 else:
                     cv2.drawChessboardCorners(display, self.board_size, scaled, True)
-                if self.result is None and intrinsic_solver.is_new_sample(
-                    params, self.samples, self.sample_distance
-                ):
-                    self.samples.append(params)
-                    self.image_points.append(corners)
-                    self.object_points.append(detection.object_points)
+                if self.result is None:
+                    accepted = intrinsic_solver.is_new_sample(
+                        params, self.samples, self.sample_distance
+                    )
+                    duplicate = not accepted
+                    if accepted:
+                        self.samples.append(params)
+                        self.image_points.append(corners)
+                        self.object_points.append(detection.object_points)
                 self._mark_aligned(display)
+                self.latest_detection = {
+                    "status": "detected",
+                    "corner_count": int(len(corners)),
+                    "expected_corner_count": self.latest_detection["expected_corner_count"],
+                    "frame_width": width,
+                    "frame_height": height,
+                    "sequence": self._frame_sequence,
+                    "metrics": [
+                        {"label": label, "value": float(value)}
+                        for label, value in zip(intrinsic_solver.PARAM_NAMES, params)
+                    ],
+                    "accepted": accepted,
+                    "duplicate": duplicate,
+                }
+            else:
+                self.latest_detection = {
+                    "status": "not_detected",
+                    "corner_count": 0,
+                    "expected_corner_count": self.latest_detection["expected_corner_count"],
+                    "frame_width": width,
+                    "frame_height": height,
+                    "sequence": self._frame_sequence,
+                    "metrics": [],
+                    "accepted": False,
+                    "duplicate": False,
+                }
             self._display = display
 
     def image_jpeg(self) -> bytes:
@@ -364,6 +413,10 @@ class IntrinsicCalibrationService:
                 "pose": pose,
                 "camera_control": self.camera is not None,
                 "action": dict(self.action) if self.action is not None else None,
+                "detection": {
+                    **self.latest_detection,
+                    "metrics": [dict(metric) for metric in self.latest_detection["metrics"]],
+                },
             }
 
     # -- sim camera guidance actions -----------------------------------------

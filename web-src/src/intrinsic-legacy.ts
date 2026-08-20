@@ -66,6 +66,40 @@ function renderPose(pose) {
     : "";
 }
 
+function renderDetection(detection, board) {
+  const kind = board && board.type === "aprilgrid" ? "AprilGrid" : "Checkerboard";
+  const status = el("detection-status");
+  const corners = el("detection-corners");
+  const frame = el("detection-frame");
+  const metrics = el("detection-metrics");
+  const sample = el("detection-sample");
+  if (!detection || detection.status === "waiting") {
+    status.textContent = "waiting";
+    status.className = "legacy-state-source pill pill-off";
+    corners.textContent = "No detection result yet";
+    frame.textContent = "No captured frame";
+    metrics.textContent = "";
+    sample.textContent = "Capture a frame to run board detection.";
+    return;
+  }
+  const detected = detection.status === "detected";
+  status.textContent = detected ? `${kind} detected` : `${kind} not detected`;
+  status.className = `legacy-state-source pill ${detected ? "pill-on" : "pill-off"}`;
+  corners.textContent = `${detection.corner_count} / ${detection.expected_corner_count} corners`;
+  frame.textContent = detection.frame_width && detection.frame_height
+    ? `${detection.frame_width}×${detection.frame_height} · frame ${detection.sequence}`
+    : `frame ${detection.sequence}`;
+  metrics.textContent = (detection.metrics || [])
+    .map((metric) => `${metric.label} ${Number(metric.value).toFixed(3)}`).join(" · ");
+  sample.textContent = !detected
+    ? `${kind} is not fully visible in this frame.`
+    : detection.accepted
+      ? "Accepted as a geometrically distinct sample."
+      : detection.duplicate
+        ? "Detected, but too similar to an existing sample."
+        : "Detected and ready for inspection.";
+}
+
 function applyState(s) {
   const wasAutoRunning = autoRunning;
   const action = s.action || null;
@@ -84,6 +118,7 @@ function applyState(s) {
   el("btn-reset").disabled = autoRunning;
   renderResult(s.result);
   renderPose(s.pose);
+  renderDetection(s.detection, s.board);
 
   scene.control = !!s.camera_control;
   el("btn-reset-pose").disabled = !scene.control || autoRunning;

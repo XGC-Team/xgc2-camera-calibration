@@ -71,7 +71,7 @@ def main():
         board_center = (
             float(rospy.get_param("~board_x", 2.0)),
             float(rospy.get_param("~board_y", 0.0)),
-            float(rospy.get_param("~board_z", 1.5)),
+            float(rospy.get_param("~board_z", 2.2)),
         )
         # Simulation uses the shared checkerboard_8x6 model (7x5 interior
         # corners). Physical uses the station AprilGrid printed on the plate:

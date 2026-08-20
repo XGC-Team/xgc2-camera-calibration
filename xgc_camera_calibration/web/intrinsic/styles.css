@@ -121,6 +121,29 @@ body,
   gap: var(--space-layout-compact);
 }
 
+.calibration-detection-summary {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-layout-compact);
+}
+
+.calibration-detection-summary strong {
+  color: var(--color-text-heading);
+  font-family: var(--font-mono);
+}
+
+.calibration-detection-metrics {
+  min-height: 1.4em;
+  margin-top: var(--space-layout-compact);
+  color: var(--color-text);
+  font: var(--font-sm)/1.4 var(--font-mono);
+}
+
+#detection-sample {
+  margin: var(--space-layout-compact) 0 0;
+}
+
 #scene {
   width: 100%;
   aspect-ratio: 16 / 10;

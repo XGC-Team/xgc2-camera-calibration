@@ -9,7 +9,7 @@
   <arg name="square_size" default="0.20" />
   <arg name="board_x" default="2.0" />
   <arg name="board_y" default="0.0" />
-  <arg name="board_z" default="1.5" />
+  <arg name="board_z" default="2.2" />
   <arg name="display_width" default="720" />
   <arg name="jpeg_quality" default="80" />
   <!-- camera_control:=true lights up the guide's fly-to / auto-run / live pose

@@ -190,6 +190,15 @@ function IntrinsicPage() {
                 <LegacyCoverage />
               </Panel>
 
+              <Panel title="Board detection" actions={<LegacyStatus id="detection-status" initial="waiting" sourceClassName="pill pill-off" />}>
+                <div className="calibration-detection-summary">
+                  <strong id="detection-corners">No detection result yet</strong>
+                  <span id="detection-frame" className="calibration-meta">No captured frame</span>
+                </div>
+                <div id="detection-metrics" className="calibration-detection-metrics" />
+                <p id="detection-sample" className="calibration-meta">Capture a frame to run board detection.</p>
+              </Panel>
+
               <Panel title="Calibration">
                 <div className="calibration-actions">
                   <Button id="btn-calibrate" className="calibration-action" tone="primary" appearance="solid" disabled>Calibrate and save</Button>

@@ -68,9 +68,11 @@ class FakeCameraControl:
 
 class IntrinsicServiceTest(unittest.TestCase):
     def test_110_degree_simulation_near_view_fills_size_coverage(self):
-        views = recommended_views((2.0, 0.0, 1.5))
-        near = next(view for view in views if view["name"] == "near center")
-        self.assertEqual(near["position"], [0.2, 0.0, 1.5])
+        views = recommended_views((2.0, 0.0, 2.2))
+        near = next(view for view in views if view["name"] == "near maximum")
+        self.assertEqual(near["position"], [0.8, 0.0, 2.2])
+        self.assertEqual(len({tuple(view["position"]) for view in views}), len(views))
+        self.assertGreaterEqual(min(view["position"][2] for view in views), 1.4)
 
     def test_web_assets_use_proxy_safe_relative_urls(self):
         index = (WEB_ROOT / "index.html").read_text(encoding="utf-8")
@@ -82,6 +84,8 @@ class IntrinsicServiceTest(unittest.TestCase):
         self.assertNotIn('"/api/v1/intrinsic/', app)
         self.assertIn("api/v1/intrinsic/state", app)
         self.assertIn("xgc-app-shell", app)
+        self.assertIn("Board detection", app)
+        self.assertIn("detection-status", app)
         self.assertIn(".xgc-topbar", styles)
 
     def test_process_frame_collects_a_board_sample(self):
@@ -92,13 +96,37 @@ class IntrinsicServiceTest(unittest.TestCase):
             self.assertEqual(state["mode"], "intrinsic")
             self.assertEqual(state["samples"], 1)
             self.assertEqual([bar["label"] for bar in state["coverage"]], ["X", "Y", "Size", "Skew"])
+            self.assertEqual(state["detection"]["status"], "detected")
+            self.assertEqual(state["detection"]["corner_count"], 35)
+            self.assertEqual(state["detection"]["expected_corner_count"], 35)
+            self.assertTrue(state["detection"]["accepted"])
+            self.assertFalse(state["detection"]["duplicate"])
+            self.assertEqual([metric["label"] for metric in state["detection"]["metrics"]], ["X", "Y", "Size", "Skew"])
             self.assertTrue(service.image_jpeg().startswith(b"\xff\xd8"))
+
+    def test_repeated_board_frame_reports_geometric_duplicate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = make_service(Path(directory) / "intrinsics.yaml")
+            frame = render_board()
+            service.process_frame(frame)
+            service.process_frame(frame)
+            state = service.state()
+            self.assertEqual(state["samples"], 1)
+            self.assertEqual(state["detection"]["status"], "detected")
+            self.assertFalse(state["detection"]["accepted"])
+            self.assertTrue(state["detection"]["duplicate"])
 
     def test_non_board_frame_adds_no_sample(self):
         with tempfile.TemporaryDirectory() as directory:
             service = make_service(Path(directory) / "intrinsics.yaml")
             service.process_frame(np.full((200, 320, 3), 127, np.uint8))
-            self.assertEqual(service.state()["samples"], 0)
+            state = service.state()
+            self.assertEqual(state["samples"], 0)
+            self.assertEqual(state["detection"], {
+                "status": "not_detected", "corner_count": 0, "expected_corner_count": 35,
+                "frame_width": 320, "frame_height": 200, "sequence": 1, "metrics": [],
+                "accepted": False, "duplicate": False,
+            })
 
     def test_calibrate_without_samples_conflicts(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -127,6 +155,7 @@ class IntrinsicServiceTest(unittest.TestCase):
             self.assertIsNone(state["action"])
             self.assertEqual(state["next"], 0)
             self.assertFalse(state["targets"][0]["done"])
+            self.assertEqual(state["detection"]["status"], "waiting")
 
     def test_camera_actions_require_control(self):
         with tempfile.TemporaryDirectory() as directory:
