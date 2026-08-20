@@ -69,8 +69,8 @@ class FakeCameraControl:
 class IntrinsicServiceTest(unittest.TestCase):
     def test_110_degree_simulation_near_view_fills_size_coverage(self):
         views = recommended_views((2.0, 0.0, 1.5))
-        near = next(view for view in views if view["name"] == "near (big)")
-        self.assertEqual(near["position"], [1.1, 0.0, 1.5])
+        near = next(view for view in views if view["name"] == "near center")
+        self.assertEqual(near["position"], [0.2, 0.0, 1.5])
 
     def test_web_assets_use_proxy_safe_relative_urls(self):
         index = (WEB_ROOT / "index.html").read_text(encoding="utf-8")
@@ -118,10 +118,10 @@ class IntrinsicServiceTest(unittest.TestCase):
             service = make_service(Path(directory) / "intrinsics.yaml")
             document = service.targets_document()
             self.assertIn("center", document["board"])
-            self.assertEqual(len(document["views"]), 10)
+            self.assertEqual(len(document["views"]), 15)
             self.assertFalse(document["camera_control"])
             state = service.state()
-            self.assertEqual(len(state["targets"]), 10)
+            self.assertEqual(len(state["targets"]), 15)
             self.assertIsNone(state["pose"])
             self.assertFalse(state["camera_control"])
             self.assertIsNone(state["action"])
@@ -142,29 +142,37 @@ class IntrinsicServiceTest(unittest.TestCase):
             camera = FakeCameraControl()
             service.attach_camera_control(camera)
 
-            started = monotonic()
-            accepted = service.auto_run(settle=0.01)
-            self.assertLess(monotonic() - started, 0.1)
-            self.assertTrue(accepted["accepted"])
-            self.assertEqual(accepted["action"]["status"], "running")
-            for mutation in (
-                service.reset,
-                service.reset_pose,
-                service.calibrate,
-                lambda: service.goto(0),
-                lambda: service.auto_run(settle=0.01),
+            bars = [{"label": label, "progress": 1.0} for label in ("X", "Y", "Size", "Skew")]
+            with patch(
+                "xgc_camera_calibration.intrinsic_service.intrinsic_solver.coverage",
+                return_value=(bars, True),
+            ), patch.object(service, "_capture_frame", return_value={"ok": True, "samples": 15}), patch.object(
+                service, "_calibrate_locked", return_value={"output_file": str(Path(directory) / "intrinsics.yaml")}
             ):
-                with self.assertRaises(ApiError) as caught:
-                    mutation()
-                self.assertEqual(caught.exception.status, int(HTTPStatus.CONFLICT))
-                self.assertIn("already running", caught.exception.message)
+                started = monotonic()
+                accepted = service.auto_run(settle=0.01)
+                self.assertLess(monotonic() - started, 0.1)
+                self.assertTrue(accepted["accepted"])
+                self.assertEqual(accepted["action"]["status"], "running")
+                for mutation in (
+                    service.reset,
+                    service.reset_pose,
+                    service.calibrate,
+                    lambda: service.goto(0),
+                    lambda: service.auto_run(settle=0.01),
+                ):
+                    with self.assertRaises(ApiError) as caught:
+                        mutation()
+                    self.assertEqual(caught.exception.status, int(HTTPStatus.CONFLICT))
+                    self.assertIn("already running", caught.exception.message)
 
-            deadline = monotonic() + 2.0
-            while service.state()["action"] is not None and monotonic() < deadline:
-                sleep(0.01)
-            self.assertIsNone(service.state()["action"])
-            self.assertEqual(len(camera.positions), 10)
+                deadline = monotonic() + 2.0
+                while service.state()["action"]["status"] == "running" and monotonic() < deadline:
+                    sleep(0.01)
+            self.assertEqual(service.state()["action"]["status"], "succeeded")
+            self.assertEqual(len(camera.positions), 15)
             self.assertEqual(service.reset()["samples"], 0)
+            self.assertIsNone(service.state()["action"])
 
     def test_auto_run_camera_failure_is_reported_and_recoverable(self):
         class FailingCameraControl(FakeCameraControl):

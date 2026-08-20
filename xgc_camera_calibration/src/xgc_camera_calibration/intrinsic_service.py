@@ -42,20 +42,25 @@ def recommended_views(board_center: Sequence[float]) -> List[Dict[str, Any]]:
     distinct, clickable marker in the 3D guide.
     """
     tx, ty, tz = float(board_center[0]), float(board_center[1]), float(board_center[2])
+    # This is the proven coverage sequence used by the standalone simulation
+    # driver. Consecutive poses deliberately change one coverage dimension at
+    # a time so the service's duplicate-sample filter keeps the useful frame.
     specs = [
-        ("far (small)", (tx - 6.0, ty, tz), 0.0, 0.0),
-        # The intrinsic simulation uses the real camera's 110-degree lens.
-        # At 0.9 m the complete 8x6 board remains inside the 16:9 frame while
-        # its interior corners fill the calibration Size range.
-        ("near (big)", (tx - 0.9, ty, tz), 0.0, 0.0),
-        ("left", (tx - 7.0, ty + 0.3, tz), 0.55, 0.0),
-        ("right", (tx - 7.0, ty - 0.3, tz), -0.55, 0.0),
-        ("top", (tx - 4.0, ty, tz + 0.8), 0.0, 0.25),
-        ("bottom", (tx - 4.0, ty, tz - 0.8), 0.0, -0.30),
-        ("oblique UL", (tx - 2.5, ty + 2.2, tz + 1.9), 0.0, 0.0),
-        ("oblique UR", (tx - 2.5, ty - 2.2, tz + 1.9), 0.0, 0.0),
-        ("oblique LL", (tx - 2.5, ty + 2.2, tz - 1.0), 0.0, 0.0),
-        ("oblique LR", (tx - 2.5, ty - 2.2, tz - 1.0), 0.0, 0.0),
+        ("far center", (tx - 6.0, ty, tz), 0.0, 0.0),
+        ("far left", (tx - 6.0, ty, tz), 0.48, 0.0),
+        ("far right", (tx - 6.0, ty, tz), -0.48, 0.0),
+        ("far top", (tx - 6.0, ty, tz), 0.0, 0.22),
+        ("far bottom", (tx - 6.0, ty, tz), 0.0, -0.30),
+        ("far upper left", (tx - 6.0, ty, tz), 0.40, 0.22),
+        ("far lower right", (tx - 6.0, ty, tz), -0.40, -0.22),
+        ("medium center", (tx - 4.0, ty, tz), 0.0, 0.0),
+        ("near center", (tx - 1.8, ty, tz), 0.0, 0.0),
+        ("near left oblique", (tx - 2.5, ty + 2.2, tz), 0.0, 0.0),
+        ("near right oblique", (tx - 2.5, ty - 2.2, tz), 0.0, 0.0),
+        ("near high oblique", (tx - 2.5, ty, tz + 1.6), 0.0, 0.0),
+        ("near low oblique", (tx - 2.5, ty, tz - 1.4), 0.0, 0.0),
+        ("diagonal oblique A", (tx - 2.5, ty + 2.6, tz + 1.7), 0.0, 0.0),
+        ("diagonal oblique B", (tx - 2.5, ty - 2.6, tz - 1.7), 0.0, 0.0),
     ]
     return [{
         "name": name,
@@ -222,8 +227,18 @@ class IntrinsicCalibrationService:
         position = self.camera.current_position()
         if position is None:
             return
-        index, distance = self._nearest_target(position)
-        if index is None or distance > self.align_threshold or self.target_done[index]:
+        index = None
+        if self.action is not None and self.action.get("status") == "running":
+            candidate = self.action.get("target_index")
+            if isinstance(candidate, int) and 0 <= candidate < len(self.views):
+                index = candidate
+        if index is None:
+            index, _ = self._nearest_target(position)
+        if index is None or self.target_done[index]:
+            return
+        target = self.views[index]["position"]
+        distance = sum((position[axis] - target[axis]) ** 2 for axis in range(3)) ** 0.5
+        if distance > self.align_threshold:
             return
         self.target_done[index] = True
         ok, encoded = cv2.imencode(
@@ -363,7 +378,7 @@ class IntrinsicCalibrationService:
             )
         # A failed background action remains visible until the operator makes
         # the next deliberate mutation, which also acknowledges the failure.
-        if self.action is not None and self.action.get("status") == "failed":
+        if self.action is not None and self.action.get("status") in ("failed", "succeeded"):
             self.action = None
 
     def _clear_session_locked(self) -> None:
@@ -482,8 +497,8 @@ class IntrinsicCalibrationService:
                 )
                 time.sleep(settle)
                 # One bounded snapshot after the pose settles replaces the old
-                # perpetual ROS/JPEG feeder. A missing capture adapter keeps
-                # the guide usable in camera-agnostic test/manual modes.
+                # perpetual ROS/JPEG feeder. Automatic calibration is accepted
+                # only when this transaction reaches full coverage and solves.
                 with self.lock:
                     capture = self.frame_capture
                 if capture is not None:
@@ -499,9 +514,34 @@ class IntrinsicCalibrationService:
                 }
                 self._auto_run_thread = None
             return
-        with self.lock:
-            self.action = None
-            self._auto_run_thread = None
+        try:
+            with self.lock:
+                _bars, goodenough = intrinsic_solver.coverage(self.samples)
+                if not goodenough:
+                    raise CalibrationError(
+                        "automatic sweep did not reach full X/Y/Size/Skew coverage "
+                        "({} distinct samples)".format(len(self.samples))
+                    )
+                result = self._calibrate_locked()
+                self.action = {
+                    "name": "auto_run",
+                    "status": "succeeded",
+                    "target_index": len(self.views) - 1,
+                    "target_name": self.views[-1]["name"],
+                    "error": None,
+                    "result": dict(result),
+                }
+                self._auto_run_thread = None
+        except Exception as error:
+            with self.lock:
+                self.action = {
+                    "name": "auto_run",
+                    "status": "failed",
+                    "target_index": self.action.get("target_index") if self.action else None,
+                    "target_name": self.action.get("target_name") if self.action else None,
+                    "error": str(error) or error.__class__.__name__,
+                }
+                self._auto_run_thread = None
 
     def record_references(self, settle: float = 1.3) -> Dict[str, Any]:
         """One-off: fly to every view, snapshot the annotated frame as its
@@ -535,50 +575,54 @@ class IntrinsicCalibrationService:
     def calibrate(self) -> Dict[str, Any]:
         with self.lock:
             self._require_idle_locked()
-            if self.result is not None:
-                return self.result_payload  # type: ignore[return-value]
-            if not self.image_points or self.image_size is None:
-                raise ApiError(HTTPStatus.CONFLICT, "No calibration-board samples collected yet")
-            try:
-                result = intrinsic_solver.calibrate_intrinsic(
-                    self.image_points,
-                    self.board_size,
-                    self.square,
-                    self.image_size,
-                    object_points=self.object_points or None,
-                )
-            except (CalibrationError, cv2.error) as error:
-                raise ApiError(HTTPStatus.UNPROCESSABLE_ENTITY, str(error)) from error
-            try:
-                intrinsic_solver.save_intrinsic(
-                    self.output_file,
-                    result,
-                    board_size=self.board_size,
-                    square=self.square,
-                    metadata={"media_source": self.media_source or self.image_topic, "web_calibrator": True},
-                    board=self._board_document(),
-                )
-            except OSError as error:
-                raise ApiError(
-                    HTTPStatus.INTERNAL_SERVER_ERROR,
-                    "Could not save calibration result: {}".format(error),
-                ) from error
-            matrix = result.camera_matrix
-            self.result = result
-            self.result_payload = {
-                "camera_matrix": [float(v) for v in matrix.reshape(-1)],
-                "distortion": [float(v) for v in result.distortion],
-                "fx": float(matrix[0, 0]),
-                "fy": float(matrix[1, 1]),
-                "cx": float(matrix[0, 2]),
-                "cy": float(matrix[1, 2]),
-                "image_width": result.image_size[0],
-                "image_height": result.image_size[1],
-                "rms_reprojection_error_px": result.rms_reprojection_error_px,
-                "sample_count": result.sample_count,
-                "output_file": self.output_file,
-            }
-            return self.result_payload
+            return self._calibrate_locked()
+
+    def _calibrate_locked(self) -> Dict[str, Any]:
+        """Solve and atomically save while the caller owns ``self.lock``."""
+        if self.result is not None:
+            return self.result_payload  # type: ignore[return-value]
+        if not self.image_points or self.image_size is None:
+            raise ApiError(HTTPStatus.CONFLICT, "No calibration-board samples collected yet")
+        try:
+            result = intrinsic_solver.calibrate_intrinsic(
+                self.image_points,
+                self.board_size,
+                self.square,
+                self.image_size,
+                object_points=self.object_points or None,
+            )
+        except (CalibrationError, cv2.error) as error:
+            raise ApiError(HTTPStatus.UNPROCESSABLE_ENTITY, str(error)) from error
+        try:
+            intrinsic_solver.save_intrinsic(
+                self.output_file,
+                result,
+                board_size=self.board_size,
+                square=self.square,
+                metadata={"media_source": self.media_source or self.image_topic, "web_calibrator": True},
+                board=self._board_document(),
+            )
+        except OSError as error:
+            raise ApiError(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                "Could not save calibration result: {}".format(error),
+            ) from error
+        matrix = result.camera_matrix
+        self.result = result
+        self.result_payload = {
+            "camera_matrix": [float(v) for v in matrix.reshape(-1)],
+            "distortion": [float(v) for v in result.distortion],
+            "fx": float(matrix[0, 0]),
+            "fy": float(matrix[1, 1]),
+            "cx": float(matrix[0, 2]),
+            "cy": float(matrix[1, 2]),
+            "image_width": result.image_size[0],
+            "image_height": result.image_size[1],
+            "rms_reprojection_error_px": result.rms_reprojection_error_px,
+            "sample_count": result.sample_count,
+            "output_file": self.output_file,
+        }
+        return self.result_payload
 
     def reset(self) -> Dict[str, Any]:
         with self.lock:
