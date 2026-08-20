@@ -155,10 +155,55 @@ class IntrinsicServiceTest(unittest.TestCase):
             self.assertEqual(len(state["targets"]), 15)
             self.assertIsNone(state["pose"])
             self.assertFalse(state["camera_control"])
+            self.assertEqual(state["auto_capture"], {
+                "enabled": False,
+                "interval_seconds": 0.5,
+                "last_error": None,
+                "coverage_complete": False,
+            })
             self.assertIsNone(state["action"])
             self.assertEqual(state["next"], 0)
             self.assertFalse(state["targets"][0]["done"])
             self.assertEqual(state["detection"]["status"], "waiting")
+
+    def test_physical_auto_capture_collects_without_manual_click_and_stops_when_ready(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = make_service(Path(directory) / "intrinsics.yaml")
+            service.attach_frame_capture(lambda: render_board())
+            bars = [
+                {"label": label, "progress": 1.0}
+                for label in ("X", "Y", "Size", "Skew")
+            ]
+            with patch(
+                "xgc_camera_calibration.intrinsic_service.intrinsic_solver.coverage",
+                return_value=(bars, True),
+            ):
+                started = service.start_auto_capture(interval=0.1)
+                self.assertTrue(started["auto_capture"]["enabled"])
+                deadline = monotonic() + 2.0
+                while service.state()["auto_capture"]["enabled"] and monotonic() < deadline:
+                    sleep(0.01)
+            state = service.state()
+            self.assertEqual(state["samples"], 1)
+            self.assertTrue(state["auto_capture"]["coverage_complete"])
+            self.assertFalse(state["auto_capture"]["enabled"])
+
+    def test_physical_auto_capture_does_not_retain_invalid_frames(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = make_service(Path(directory) / "intrinsics.yaml")
+            service.attach_frame_capture(
+                lambda: np.full((200, 320, 3), 127, np.uint8)
+            )
+            service.start_auto_capture(interval=0.1)
+            deadline = monotonic() + 1.0
+            while service.state()["detection"]["sequence"] < 3 and monotonic() < deadline:
+                sleep(0.01)
+            stopped = service.stop_auto_capture()
+            self.assertFalse(stopped["auto_capture"]["enabled"])
+            self.assertEqual(service.state()["samples"], 0)
+            self.assertEqual(service.image_points, [])
+            self.assertEqual(service.object_points, [])
+            self.assertFalse((Path(directory) / "intrinsics.yaml").exists())
 
     def test_camera_actions_require_control(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -286,6 +331,20 @@ class IntrinsicServiceTest(unittest.TestCase):
                 )
                 with urllib.request.urlopen(request) as response:
                     self.assertEqual(json.loads(response.read())["samples"], 0)
+
+                service.attach_frame_capture(lambda: render_board())
+                request = urllib.request.Request(
+                    base + "/api/v1/intrinsic/auto_capture/start", data=b"{}",
+                    headers={"Content-Type": "application/json"}, method="POST",
+                )
+                with urllib.request.urlopen(request) as response:
+                    self.assertTrue(json.loads(response.read())["auto_capture"]["enabled"])
+                request = urllib.request.Request(
+                    base + "/api/v1/intrinsic/auto_capture/stop", data=b"{}",
+                    headers={"Content-Type": "application/json"}, method="POST",
+                )
+                with urllib.request.urlopen(request) as response:
+                    self.assertFalse(json.loads(response.read())["auto_capture"]["enabled"])
 
                 service.attach_camera_control(FakeCameraControl())
                 service.auto_run = lambda: {
