@@ -73,9 +73,9 @@ def main():
             float(rospy.get_param("~board_y", 0.0)),
             float(rospy.get_param("~board_z", 2.2)),
         )
-        # Simulation uses the shared checkerboard_8x6 model (7x5 interior
-        # corners). Physical uses the station AprilGrid printed on the plate:
-        # 6x6 tag36h11, 88 mm tags, 26.4 mm gaps, ids 0..35.
+        # Simulation and physical use the same station AprilGrid contract:
+        # 6x6 tag36h11, 88 mm tags, 26.4 mm gaps, ids 0..35. Gazebo renders an
+        # official Kalibr export at those physical dimensions.
         service = IntrinsicCalibrationService(
             board_size=(
                 int(rospy.get_param("~board_cols", 7)),

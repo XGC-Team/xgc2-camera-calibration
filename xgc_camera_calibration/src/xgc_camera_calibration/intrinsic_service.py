@@ -33,7 +33,9 @@ from xgc_camera_calibration.solver import CalibrationError
 from xgc_camera_calibration.web_service import ApiError
 
 
-def recommended_views(board_center: Sequence[float]) -> List[Dict[str, Any]]:
+def recommended_views(
+    board_center: Sequence[float], board_extent: float = 1.6
+) -> List[Dict[str, Any]]:
     """Spatially-distinct sample poses that together fill X / Y / Size / Skew.
 
     Filling X and Y needs the board off-centre in the image, so those poses carry
@@ -44,27 +46,42 @@ def recommended_views(board_center: Sequence[float]) -> List[Dict[str, Any]]:
     distinct, clickable marker in the 3D guide.
     """
     tx, ty, tz = float(board_center[0]), float(board_center[1]), float(board_center[2])
+    # The original sweep was authored for a 1.6 m-wide board. Scale all
+    # translations with the actual target extent so an 88 mm AprilGrid tag has
+    # the same projected size and edge coverage instead of becoming tiny at
+    # the old six-metre viewpoints. Angular aim offsets remain unchanged.
+    extent = float(board_extent)
+    if extent <= 0.0:
+        raise ValueError("board extent must be positive")
+    view_scale = extent / 1.6
+
+    def position(dx: float, dy: float, dz: float) -> Tuple[float, float, float]:
+        return (
+            tx + dx * view_scale,
+            ty + dy * view_scale,
+            tz + dz * view_scale,
+        )
     # Measured against the product's 1280x720, 110-degree Gazebo camera. Every
     # pose keeps the board detectable while the set spans both image edges,
     # near/far scale and perspective skew. The lowest camera is only 0.8 m
     # below the board centre (1.4 m at the default 2.2 m board height), so the
     # automatic path never grazes the ground.
     specs = [
-        ("far lower left", (tx - 6.0, ty + 0.3, tz + 0.1), -0.76, -0.24),
-        ("far lower right", (tx - 6.0, ty - 0.3, tz + 0.1), 0.76, -0.24),
-        ("far bottom", (tx - 6.0, ty, tz - 0.1), 0.0, -0.48),
-        ("far lower center", (tx - 6.0, ty, tz), 0.0, -0.24),
-        ("upper perspective", (tx - 2.5, ty - 1.2, tz - 0.8), 0.0, 0.44),
-        ("upper oblique", (tx - 3.5, ty + 2.0, tz + 1.0), 0.0, 0.44),
-        ("center oblique left", (tx - 2.5, ty + 1.2, tz - 0.8), 0.0, 0.0),
-        ("center oblique right", (tx - 2.5, ty - 1.2, tz + 0.8), 0.0, 0.0),
-        ("medium center", (tx - 4.0, ty, tz), 0.0, -0.08),
-        ("near center", (tx - 2.0, ty, tz), 0.0, -0.08),
-        ("near large", (tx - 1.4, ty, tz), 0.0, -0.08),
-        ("near maximum", (tx - 1.2, ty, tz), 0.0, -0.08),
-        ("diagonal high", (tx - 3.8, ty + 2.4, tz + 1.2), 0.0, 0.0),
-        ("lower right perspective", (tx - 4.0, ty - 1.0, tz - 0.8), 0.0, 0.20),
-        ("upper left perspective", (tx - 2.5, ty + 1.2, tz + 0.8), 0.0, 0.28),
+        ("far lower left", position(-6.0, 0.3, 0.1), -0.76, -0.24),
+        ("far lower right", position(-6.0, -0.3, 0.1), 0.76, -0.24),
+        ("far bottom", position(-6.0, 0.0, -0.1), 0.0, -0.48),
+        ("far lower center", position(-6.0, 0.0, 0.0), 0.0, -0.24),
+        ("upper perspective", position(-2.5, -1.2, -0.8), 0.0, 0.44),
+        ("upper oblique", position(-3.5, 2.0, 1.0), 0.0, 0.44),
+        ("center oblique left", position(-2.5, 1.2, -0.8), 0.0, 0.0),
+        ("center oblique right", position(-2.5, -1.2, 0.8), 0.0, 0.0),
+        ("medium center", position(-4.0, 0.0, 0.0), 0.0, -0.08),
+        ("near center", position(-2.0, 0.0, 0.0), 0.0, -0.08),
+        ("near large", position(-1.4, 0.0, 0.0), 0.0, -0.08),
+        ("near maximum", position(-1.2, 0.0, 0.0), 0.0, -0.08),
+        ("diagonal high", position(-3.8, 2.4, 1.2), 0.0, 0.0),
+        ("lower right perspective", position(-4.0, -1.0, -0.8), 0.0, 0.20),
+        ("upper left perspective", position(-2.5, 1.2, 0.8), 0.0, 0.28),
     ]
     return [{
         "name": name,
@@ -171,7 +188,9 @@ class IntrinsicCalibrationService:
             "width": board_width,
             "height": board_height,
         }
-        self.views: List[Dict[str, Any]] = recommended_views(self.board_center)
+        self.views: List[Dict[str, Any]] = recommended_views(
+            self.board_center, max(board_width, board_height)
+        )
         self.target_done: List[bool] = [False] * len(self.views)
         self.references_dir = str(Path(references_dir).expanduser()) if references_dir else ""
         self.refs: Dict[int, bytes] = {}

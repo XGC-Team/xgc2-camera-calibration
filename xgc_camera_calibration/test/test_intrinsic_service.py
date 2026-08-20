@@ -78,6 +78,15 @@ class IntrinsicServiceTest(unittest.TestCase):
         self.assertGreaterEqual(min(view["position"][2] for view in views), 1.4)
         self.assertLessEqual(max(view["position"][2] for view in views), 3.4)
 
+    def test_field_aprilgrid_scales_simulation_views_to_target_extent(self):
+        views = recommended_views((2.0, 0.0, 2.2), 0.66)
+        far = next(view for view in views if view["name"] == "far lower left")
+        near = next(view for view in views if view["name"] == "near maximum")
+        self.assertEqual(far["position"], [-0.47, 0.12, 2.24])
+        self.assertEqual(near["position"], [1.51, 0.0, 2.2])
+        self.assertGreaterEqual(min(view["position"][2] for view in views), 1.87)
+        self.assertEqual(len({tuple(view["position"]) for view in views}), len(views))
+
     def test_web_assets_use_proxy_safe_relative_urls(self):
         index = (WEB_ROOT / "index.html").read_text(encoding="utf-8")
         app = (WEB_ROOT / "app.js").read_text(encoding="utf-8")
