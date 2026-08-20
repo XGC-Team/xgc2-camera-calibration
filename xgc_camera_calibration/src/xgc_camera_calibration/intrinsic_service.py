@@ -60,7 +60,7 @@ def recommended_views(board_center: Sequence[float]) -> List[Dict[str, Any]]:
         ("near center", (tx - 2.0, ty, tz), 0.0, -0.08),
         ("near large", (tx - 1.4, ty, tz), 0.0, -0.08),
         ("near maximum", (tx - 1.2, ty, tz), 0.0, -0.08),
-        ("diagonal high", (tx - 2.5, ty + 2.6, tz + 1.7), 0.0, 0.0),
+        ("diagonal high", (tx - 3.8, ty + 2.4, tz + 1.2), 0.0, 0.0),
         ("lower right perspective", (tx - 4.0, ty - 1.0, tz - 0.8), 0.0, 0.20),
         ("upper left perspective", (tx - 2.5, ty + 1.2, tz + 0.8), 0.0, 0.28),
     ]
@@ -549,13 +549,27 @@ class IntrinsicCalibrationService:
                     view["position"], view["yaw_offset"], view["pitch_offset"], view["roll"]
                 )
                 time.sleep(settle)
-                # One bounded snapshot after the pose settles replaces the old
-                # perpetual ROS/JPEG feeder. Automatic calibration is accepted
-                # only when this transaction reaches full coverage and solves.
+                # Media Edge can still hold the frame from the previous pose
+                # immediately after Gazebo reports the model-state update. Use
+                # a small bounded retry window so every authored guide point is
+                # proven by a detected-board reference, rather than allowing a
+                # lucky subset of the sweep to satisfy only the coverage bars.
                 with self.lock:
                     capture = self.frame_capture
                 if capture is not None:
-                    self._capture_frame()
+                    for attempt in range(4):
+                        self._capture_frame()
+                        with self.lock:
+                            detected_at_target = self.target_done[index]
+                        if detected_at_target:
+                            break
+                        if attempt < 3:
+                            time.sleep(0.35)
+                    if not detected_at_target:
+                        raise CalibrationError(
+                            "automatic sweep could not detect the calibration board "
+                            "at target '{}'".format(view["name"])
+                        )
         except Exception as error:  # Camera-control failures are reported through state.
             with self.lock:
                 self.action = {
