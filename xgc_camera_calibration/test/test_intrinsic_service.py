@@ -68,23 +68,24 @@ class FakeCameraControl:
 
 
 class IntrinsicServiceTest(unittest.TestCase):
-    def test_110_degree_simulation_near_view_fills_size_coverage(self):
+    def test_90_degree_simulation_sweep_stays_high_and_near(self):
         views = recommended_views((2.0, 0.0, 2.2))
         near = next(view for view in views if view["name"] == "near maximum")
-        diagonal_high = next(view for view in views if view["name"] == "diagonal high")
-        self.assertEqual(near["position"], [0.8, 0.0, 2.2])
-        self.assertEqual(diagonal_high["position"], [-1.8, 2.4, 3.4])
+        oblique_high = next(view for view in views if view["name"] == "oblique high")
+        self.assertEqual(near["position"], [0.9, 0.0, 2.2])
+        self.assertEqual(oblique_high["position"], [0.55, 0.45, 2.65])
         self.assertEqual(len({tuple(view["position"]) for view in views}), len(views))
-        self.assertGreaterEqual(min(view["position"][2] for view in views), 1.4)
-        self.assertLessEqual(max(view["position"][2] for view in views), 3.4)
+        self.assertGreaterEqual(min(view["position"][2] for view in views), 1.75)
+        self.assertLessEqual(max(view["position"][2] for view in views), 2.65)
+        self.assertGreaterEqual(max(abs(view["roll"]) for view in views), 0.46)
 
     def test_field_aprilgrid_scales_simulation_views_to_target_extent(self):
         views = recommended_views((2.0, 0.0, 2.2), 0.66)
-        far = next(view for view in views if view["name"] == "far lower left")
+        left = next(view for view in views if view["name"] == "left edge")
         near = next(view for view in views if view["name"] == "near maximum")
-        self.assertEqual(far["position"], [-0.47, 0.12, 2.24])
-        self.assertEqual(near["position"], [1.51, 0.0, 2.2])
-        self.assertGreaterEqual(min(view["position"][2] for view in views), 1.87)
+        self.assertEqual(left["position"], [0.8, 0.02, 2.2])
+        self.assertEqual(near["position"], [1.55, 0.0, 2.2])
+        self.assertGreaterEqual(min(view["position"][2] for view in views), 2.01)
         self.assertEqual(len({tuple(view["position"]) for view in views}), len(views))
 
     def test_web_assets_use_proxy_safe_relative_urls(self):
@@ -324,7 +325,7 @@ class IntrinsicServiceTest(unittest.TestCase):
                     sleep(0.01)
             action = service.state()["action"]
             self.assertEqual(action["status"], "failed")
-            self.assertIn("far lower left", action["error"])
+            self.assertIn("left edge", action["error"])
             self.assertIn("could not detect", action["error"])
 
     def test_auto_run_camera_failure_is_reported_and_recoverable(self):

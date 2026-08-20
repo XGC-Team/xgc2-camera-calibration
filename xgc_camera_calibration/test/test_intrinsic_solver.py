@@ -119,6 +119,16 @@ class IntrinsicSolverTest(unittest.TestCase):
         )
         self.assertIsNotNone(detection)
         self.assertGreaterEqual(len(detection.image_points), 24)
+        self.assertIsNotNone(detection.calibration_image_points)
+        self.assertIsNotNone(detection.calibration_object_points)
+        self.assertEqual(
+            len(detection.calibration_image_points), len(detection.image_points) // 4
+        )
+        np.testing.assert_allclose(
+            detection.calibration_image_points.reshape(-1, 2),
+            detection.image_points.reshape(-1, 4, 2).mean(axis=1),
+            atol=1e-5,
+        )
         image_points = []
         object_points = []
         obj = np.concatenate(

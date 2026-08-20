@@ -46,10 +46,11 @@ def recommended_views(
     distinct, clickable marker in the 3D guide.
     """
     tx, ty, tz = float(board_center[0]), float(board_center[1]), float(board_center[2])
-    # The original sweep was authored for a 1.6 m-wide board. Scale all
-    # translations with the actual target extent so an 88 mm AprilGrid tag has
-    # the same projected size and edge coverage instead of becoming tiny at
-    # the old six-metre viewpoints. Angular aim offsets remain unchanged.
+    # Scale translations with the actual target extent so every board keeps the
+    # same projected tag size.  OpenCV 4.2 (the Noetic runtime) only decodes the
+    # official AprilGrid reliably once an 88 mm tag is roughly 80 px across;
+    # therefore X/Y coverage comes from bounded aim offsets while the camera
+    # stays near the plate, rather than from unusable multi-metre viewpoints.
     extent = float(board_extent)
     if extent <= 0.0:
         raise ValueError("board extent must be positive")
@@ -61,35 +62,39 @@ def recommended_views(
             ty + dy * view_scale,
             tz + dz * view_scale,
         )
-    # Measured against the product's 1280x720, 110-degree Gazebo camera. Every
-    # pose keeps the board detectable while the set spans both image edges,
-    # near/far scale and perspective skew. The lowest camera is only 0.8 m
-    # below the board centre (1.4 m at the default 2.2 m board height), so the
-    # automatic path never grazes the ground.
+    # Measured against the product's 1280x720, 90-degree field-calibration
+    # profile.  Near views make the official tags decodable; yaw/pitch offsets
+    # move the visible subset to all image edges, roll fills skew, and oblique
+    # positions add real perspective.  Even at the legacy 1.6 m extent the
+    # lowest camera remains 1.75 m high for the default 2.2 m board centre.
     specs = [
-        ("far lower left", position(-6.0, 0.3, 0.1), -0.76, -0.24),
-        ("far lower right", position(-6.0, -0.3, 0.1), 0.76, -0.24),
-        ("far bottom", position(-6.0, 0.0, -0.1), 0.0, -0.48),
-        ("far lower center", position(-6.0, 0.0, 0.0), 0.0, -0.24),
-        ("upper perspective", position(-2.5, -1.2, -0.8), 0.0, 0.44),
-        ("upper oblique", position(-3.5, 2.0, 1.0), 0.0, 0.44),
-        ("center oblique left", position(-2.5, 1.2, -0.8), 0.0, 0.0),
-        ("center oblique right", position(-2.5, -1.2, 0.8), 0.0, 0.0),
-        ("medium center", position(-4.0, 0.0, 0.0), 0.0, -0.08),
-        ("near center", position(-2.0, 0.0, 0.0), 0.0, -0.08),
-        ("near large", position(-1.4, 0.0, 0.0), 0.0, -0.08),
-        ("near maximum", position(-1.2, 0.0, 0.0), 0.0, -0.08),
-        ("diagonal high", position(-3.8, 2.4, 1.2), 0.0, 0.0),
-        ("lower right perspective", position(-4.0, -1.0, -0.8), 0.0, 0.20),
-        ("upper left perspective", position(-2.5, 1.2, 0.8), 0.0, 0.28),
+        # The lateral extremes are deliberately farther from the plate than
+        # the size views.  At the 0.66 m field target this keeps at least six
+        # complete tags inside the frame while their mean centres still land
+        # at x~=0.15 and x~=0.85, satisfying the ROS 0.70 X-range gate.
+        ("left edge", position(-2.91, 0.05, 0.00), -0.78, 0.00, 0.12),
+        ("right edge", position(-2.91, -0.05, 0.00), 0.76, 0.00, 0.00),
+        ("lower edge", position(-2.42, 0.00, 0.00), 0.00, -0.57, 0.00),
+        ("upper edge", position(-2.40, 0.03, 0.00), 0.00, 0.60, 0.00),
+        ("left edge tilted", position(-1.50, 0.10, -0.10), -0.70, 0.00, 0.12),
+        ("right edge tilted", position(-1.50, -0.10, -0.08), 0.70, 0.00, -0.12),
+        ("lower edge tilted", position(-2.35, 0.05, 0.02), 0.00, -0.50, 0.00),
+        ("upper edge tilted", position(-2.35, -0.05, -0.02), 0.00, 0.50, 0.00),
+        ("center face", position(-1.65, 0.00, 0.00), 0.00, 0.00, 0.00),
+        ("near large", position(-1.30, 0.00, 0.00), 0.00, 0.00, 0.00),
+        ("near maximum", position(-1.10, 0.00, 0.00), 0.00, 0.00, 0.00),
+        ("clockwise skew", position(-1.45, 0.04, 0.04), 0.00, 0.00, 0.46),
+        ("counter-clockwise skew", position(-1.45, -0.04, -0.04), 0.00, 0.00, -0.46),
+        ("oblique high", position(-1.45, 0.45, 0.45), 0.00, 0.00, 0.28),
+        ("oblique low", position(-1.45, -0.45, -0.45), 0.00, 0.00, -0.28),
     ]
     return [{
         "name": name,
         "position": [round(value, 2) for value in position],
         "yaw_offset": yaw_offset,
         "pitch_offset": pitch_offset,
-        "roll": 0.0,
-    } for (name, position, yaw_offset, pitch_offset) in specs]
+        "roll": roll,
+    } for (name, position, yaw_offset, pitch_offset, roll) in specs]
 
 
 class IntrinsicCalibrationService:
@@ -599,6 +604,16 @@ class IntrinsicCalibrationService:
             if detection is not None:
                 corners = detection.image_points
                 params = detection.coverage
+                calibration_corners = (
+                    detection.calibration_image_points
+                    if detection.calibration_image_points is not None
+                    else corners
+                )
+                calibration_objects = (
+                    detection.calibration_object_points
+                    if detection.calibration_object_points is not None
+                    else detection.object_points
+                )
                 scaled = (corners * scale).astype(np.float32)
                 if self.board_type == "aprilgrid":
                     for point in scaled.reshape(-1, 2):
@@ -614,8 +629,8 @@ class IntrinsicCalibrationService:
                     duplicate = not accepted
                     if accepted:
                         self.samples.append(params)
-                        self.image_points.append(corners)
-                        self.object_points.append(detection.object_points)
+                        self.image_points.append(calibration_corners)
+                        self.object_points.append(calibration_objects)
                         try:
                             self._save_checkpoint_locked()
                         except Exception as error:

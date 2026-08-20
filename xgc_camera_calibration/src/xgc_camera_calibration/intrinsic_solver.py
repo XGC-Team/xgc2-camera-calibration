@@ -35,7 +35,7 @@ _APRILTAG_DICTIONARIES = {
     "apriltag_36h11": "DICT_APRILTAG_36h11",
     "36h11": "DICT_APRILTAG_36h11",
 }
-_APRILGRID_RETRY_MAX_WIDTH = 1920
+_APRILGRID_RETRY_MAX_WIDTH = 2880
 _APRILGRID_FALLBACK_MIN_SHARPNESS = 160.0
 _APRILGRID_FALLBACK_MARKER_PIXELS = 80
 _APRILGRID_FALLBACK_MAX_PAYLOAD_ERRORS = 5
@@ -47,6 +47,12 @@ class BoardDetection:
     image_points: np.ndarray
     object_points: np.ndarray
     coverage: Tuple[float, float, float, float]
+    # AprilGrid renderers/detectors do not always agree on whether a tag has
+    # one or two black border cells. The decoded centre is invariant to that
+    # convention, while the reported outer corners are not. Keep every corner
+    # for annotation and coverage, but allow calibration to use tag centres.
+    calibration_image_points: Optional[np.ndarray] = None
+    calibration_object_points: Optional[np.ndarray] = None
 
 
 @dataclass(frozen=True)
@@ -535,26 +541,43 @@ def detect_aprilgrid(
         last = first + int(board_size[0]) * int(board_size[1])
         return sum(first <= int(marker_id) < last for marker_id in marker_ids.reshape(-1))
 
-    # The station plate is physically large, but a full-board view makes each
-    # 88 mm tag small in the 1280x720 calibration stream. Downscaling that
-    # stream to the normal 960 px search width can leave too few decoded tags.
-    # Retry once at a bounded higher search resolution, then map the detected
-    # corners back through the combined scale so pixel/object correspondences
-    # remain in the original camera frame.
+    # OpenCV 4.2's AprilTag decoder has a narrow useful marker-pixel band: the
+    # official plate can return only rejected quads when tags are either below
+    # that band or very large.  Probe a bounded deterministic scale pyramid
+    # only when the normal search did not reach min_tags.  This keeps common
+    # physical captures cheap while recovering the 90-degree Gazebo views used
+    # to fill the image edges.  Every winning scale is mapped back to original
+    # image coordinates below.
     total_tags = int(board_size[0]) * int(board_size[1])
     best_count = in_board_count(ids)
-    if best_count < total_tags and search.shape[1] < _APRILGRID_RETRY_MAX_WIDTH:
-        retry_scale = min(
-            2.0, float(_APRILGRID_RETRY_MAX_WIDTH) / float(search.shape[1])
-        )
-        if retry_scale > 1.0:
+    base_scale = scale
+    retry_specs = (
+        (0.67, cv2.INTER_AREA, False),
+        (0.80, cv2.INTER_AREA, False),
+        (1.25, cv2.INTER_CUBIC, True),
+        (1.50, cv2.INTER_CUBIC, True),
+        (2.00, cv2.INTER_CUBIC, False),
+        (2.00, cv2.INTER_CUBIC, True),
+        (2.50, cv2.INTER_AREA, False),
+        (3.00, cv2.INTER_AREA, False),
+        (3.00, cv2.INTER_AREA, True),
+        (3.00, cv2.INTER_NEAREST, False),
+    )
+    if best_count < int(min_tags):
+        for retry_scale, interpolation, sharpen in retry_specs:
+            retry_width = int(round(float(search.shape[1]) * retry_scale))
+            if retry_width > _APRILGRID_RETRY_MAX_WIDTH:
+                continue
             retry = cv2.resize(
                 search,
                 None,
                 fx=retry_scale,
                 fy=retry_scale,
-                interpolation=cv2.INTER_CUBIC,
+                interpolation=interpolation,
             )
+            if sharpen:
+                blurred = cv2.GaussianBlur(retry, (0, 0), 1.2)
+                retry = cv2.addWeighted(retry, 2.0, blurred, -1.0, 0.0)
             retry_corners, retry_ids, retry_rejected = _detect_aruco_markers(
                 retry, dictionary
             )
@@ -562,26 +585,9 @@ def detect_aprilgrid(
             if retry_count > best_count:
                 corners, ids, _rejected = retry_corners, retry_ids, retry_rejected
                 best_count = retry_count
-                scale = scale * retry_scale
-
-            # A mild unsharp pass recovers more of the station plate when the
-            # full board is visible but its printed tag cells occupy only a
-            # few dozen source pixels. AprilTag error correction and the
-            # explicit board-id range remain the acceptance fence.
-            blurred = cv2.GaussianBlur(retry, (0, 0), 2.0)
-            sharpened = cv2.addWeighted(retry, 2.0, blurred, -1.0, 0.0)
-            sharp_corners, sharp_ids, sharp_rejected = _detect_aruco_markers(
-                sharpened, dictionary
-            )
-            sharp_count = in_board_count(sharp_ids)
-            if sharp_count > best_count:
-                corners, ids, _rejected = sharp_corners, sharp_ids, sharp_rejected
-                best_count = sharp_count
-                scale = (
-                    float(maximum_width) / float(width)
-                    if width > maximum_width
-                    else 1.0
-                ) * retry_scale
+                scale = base_scale * retry_scale
+            if best_count >= total_tags:
+                break
     image_points: List[np.ndarray] = []
     object_points: List[np.ndarray] = []
     if ids is not None:
@@ -612,7 +618,9 @@ def detect_aprilgrid(
     image_points = _align_aprilgrid_corners_to_lattice(
         image_points, object_points
     )
-    pixels = np.asarray(image_points, dtype=np.float32).reshape(-1, 1, 2)
+    tag_image_points = np.asarray(image_points, dtype=np.float32).reshape(-1, 4, 2)
+    tag_object_points = np.asarray(object_points, dtype=np.float32).reshape(-1, 4, 3)
+    pixels = tag_image_points.reshape(-1, 1, 2)
     refined = pixels.copy()
     flat = pixels.reshape(-1, 2)
     valid = (
@@ -626,11 +634,17 @@ def detect_aprilgrid(
             gray, pixels[valid].copy(), (3, 3), (-1, -1), _SUBPIX_CRITERIA
         )
     pixels = refined
-    objects = np.asarray(object_points, dtype=np.float32).reshape(-1, 3)
+    objects = tag_object_points.reshape(-1, 3)
     return BoardDetection(
         image_points=pixels,
         object_points=objects,
         coverage=_coverage_params_from_points(pixels, width, height),
+        calibration_image_points=np.mean(pixels.reshape(-1, 4, 2), axis=1)
+        .reshape(-1, 1, 2)
+        .astype(np.float32),
+        calibration_object_points=np.mean(tag_object_points, axis=1)
+        .reshape(-1, 3)
+        .astype(np.float32),
     )
 
 
