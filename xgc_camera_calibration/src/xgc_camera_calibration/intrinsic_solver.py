@@ -711,6 +711,54 @@ def coverage(
     return bars, goodenough
 
 
+def next_view_guidance(
+    samples: Sequence[Sequence[float]], ranges: Sequence[float] = PARAM_RANGES
+) -> Dict[str, Any]:
+    """Describe the single view that expands the weakest coverage axis most.
+
+    X and Y need samples on both sides of the image, while Size and Skew are
+    rewarded by their largest observed value.  Returning a small semantic
+    document keeps presentation/localization in the WebUI and gives a physical
+    operator a stable direction based on the whole sample history rather than
+    whichever frame happened to arrive last.
+    """
+    bars, _goodenough = coverage(samples, ranges)
+    complete = bool(samples) and all(bar["progress"] >= 1.0 for bar in bars)
+    if complete:
+        return {
+            "complete": True,
+            "dimension": None,
+            "direction": "complete",
+            "progress": 1.0,
+        }
+    if not samples:
+        return {
+            "complete": False,
+            "dimension": None,
+            "direction": "center",
+            "progress": 0.0,
+        }
+
+    index = min(range(len(bars)), key=lambda candidate: bars[candidate]["progress"])
+    minimum = min(float(sample[index]) for sample in samples)
+    maximum = max(float(sample[index]) for sample in samples)
+    dimension = PARAM_NAMES[index]
+    if dimension == "X":
+        direction = "left" if minimum >= 1.0 - maximum else "right"
+    elif dimension == "Y":
+        direction = "top" if minimum >= 1.0 - maximum else "bottom"
+    elif dimension == "Size":
+        direction = "closer"
+    else:
+        direction = "tilt"
+    return {
+        "complete": False,
+        "dimension": dimension,
+        "direction": direction,
+        "progress": float(bars[index]["progress"]),
+    }
+
+
 def calibrate_intrinsic(
     image_points: Sequence[np.ndarray],
     board_size: Sequence[int],

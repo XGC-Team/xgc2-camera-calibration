@@ -16,7 +16,9 @@ camera through the catalogue (goto / auto-run / reset).
 
 from __future__ import annotations
 
+import json
 import os
+import tempfile
 import threading
 import time
 from http import HTTPStatus
@@ -119,6 +121,7 @@ class IntrinsicCalibrationService:
         self.board_size = (int(board_size[0]), int(board_size[1]))
         self.square = float(square)
         self.output_file = str(Path(output_file).expanduser())
+        self.checkpoint_file = self.output_file + ".session.npz"
         self.image_topic = str(image_topic)
         self.camera_info_topic = str(camera_info_topic)
         self.media_source = str(media_source).strip()
@@ -135,6 +138,9 @@ class IntrinsicCalibrationService:
         self._display: Optional[np.ndarray] = None
         self.result: Optional[intrinsic_solver.IntrinsicResult] = None
         self.result_payload: Optional[Dict[str, Any]] = None
+        self.result_restored = False
+        self.restored_coverage: List[Dict[str, Any]] = []
+        self._recovery_error: Optional[str] = None
         self._frame_sequence = 0
         expected_corners = self.board_size[0] * self.board_size[1]
         if self.board_type == "aprilgrid":
@@ -181,6 +187,7 @@ class IntrinsicCalibrationService:
         self._auto_capture_error: Optional[str] = None
         self._auto_capture_completed = False
         self._load_refs()
+        self._load_recovery()
 
     # -- guide wiring ---------------------------------------------------------
     def attach_camera_control(self, camera: Any) -> None:
@@ -226,6 +233,8 @@ class IntrinsicCalibrationService:
                     HTTPStatus.CONFLICT,
                     "Continuous auto capture is for a physical camera; use the simulation auto sweep",
                 )
+            if self.result is not None:
+                return {"ok": True, "auto_capture": self._auto_capture_document_locked()}
             if self.frame_capture is None:
                 raise ApiError(
                     HTTPStatus.SERVICE_UNAVAILABLE,
@@ -268,9 +277,9 @@ class IntrinsicCalibrationService:
                 else:
                     with self.lock:
                         self._auto_capture_error = None
-                        _bars, goodenough = intrinsic_solver.coverage(self.samples)
-                        if goodenough:
-                            self._auto_capture_completed = True
+                        guidance = intrinsic_solver.next_view_guidance(self.samples)
+                        if self.result is not None or guidance["complete"]:
+                            self._auto_capture_completed = bool(guidance["complete"])
                             self._auto_capture_stop.set()
                 if self._auto_capture_stop.wait(self._auto_capture_interval):
                     break
@@ -301,6 +310,176 @@ class IntrinsicCalibrationService:
                         self.refs[index] = handle.read()
                 except OSError:
                     pass
+
+    def _recovery_fingerprint(self) -> Dict[str, Any]:
+        return {
+            "schema": 1,
+            "board_type": self.board_type,
+            "board_size": list(self.board_size),
+            "square": self.square,
+            "tag_spacing": self.tag_spacing,
+            "tag_family": self.tag_family,
+            "tag_start_id": self.tag_start_id,
+            "media_source": self.media_source or self.image_topic,
+        }
+
+    def _saved_board_matches(self, document: Dict[str, Any]) -> bool:
+        board = document.get("board")
+        if not isinstance(board, dict):
+            return False
+        try:
+            size = tuple(int(value) for value in board.get("size", ()))
+            square = float(board.get("square_size_m"))
+        except (TypeError, ValueError):
+            return False
+        if size != self.board_size or abs(square - self.square) > 1e-9:
+            return False
+        saved_type = str(board.get("type", "checkerboard")).strip().lower()
+        if saved_type != self.board_type:
+            return False
+        if self.board_type != "aprilgrid":
+            return True
+        try:
+            spacing = float(board.get("tag_spacing_m"))
+            start_id = int(board.get("start_id"))
+        except (TypeError, ValueError):
+            return False
+        return (
+            abs(spacing - self.tag_spacing) <= 1e-9
+            and str(board.get("tag_family", "")).strip().lower() == self.tag_family
+            and start_id == self.tag_start_id
+        )
+
+    def _result_document(self, result: intrinsic_solver.IntrinsicResult) -> Dict[str, Any]:
+        matrix = result.camera_matrix
+        return {
+            "camera_matrix": [float(value) for value in matrix.reshape(-1)],
+            "distortion": [float(value) for value in result.distortion],
+            "fx": float(matrix[0, 0]),
+            "fy": float(matrix[1, 1]),
+            "cx": float(matrix[0, 2]),
+            "cy": float(matrix[1, 2]),
+            "image_width": result.image_size[0],
+            "image_height": result.image_size[1],
+            "rms_reprojection_error_px": result.rms_reprojection_error_px,
+            "sample_count": result.sample_count,
+            "output_file": self.output_file,
+        }
+
+    def _load_saved_result(self) -> bool:
+        path = Path(self.output_file)
+        if not path.is_file():
+            return False
+        document = intrinsic_solver.load_intrinsic(path)
+        if not self._saved_board_matches(document):
+            return False
+        distortion = document.get("distortion_coefficients", {})
+        distortion_values = distortion.get("data") if isinstance(distortion, dict) else None
+        image_size = (int(document["image_width"]), int(document["image_height"]))
+        if (
+            not isinstance(distortion_values, list)
+            or not distortion_values
+            or image_size[0] <= 0
+            or image_size[1] <= 0
+        ):
+            raise CalibrationError("saved intrinsic result is incomplete")
+        result = intrinsic_solver.IntrinsicResult(
+            camera_matrix=document["camera_matrix_array"],
+            distortion=np.asarray(distortion_values, dtype=np.float64),
+            image_size=image_size,
+            rms_reprojection_error_px=float(document["rms_reprojection_error_px"]),
+            sample_count=int(document["sample_count"]),
+        )
+        self.result = result
+        self.result_payload = self._result_document(result)
+        self.result_restored = True
+        self.image_size = image_size
+        metadata = document.get("metadata")
+        coverage = metadata.get("coverage") if isinstance(metadata, dict) else None
+        if isinstance(coverage, list):
+            self.restored_coverage = [
+                {"label": str(item["label"]), "progress": float(item["progress"])}
+                for item in coverage
+                if isinstance(item, dict) and "label" in item and "progress" in item
+            ]
+        return True
+
+    def _load_checkpoint(self) -> bool:
+        path = Path(self.checkpoint_file)
+        if not path.is_file():
+            return False
+        with np.load(str(path), allow_pickle=False) as archive:
+            fingerprint = json.loads(str(archive["fingerprint"].item()))
+            if fingerprint != self._recovery_fingerprint():
+                return False
+            samples = np.asarray(archive["samples"], dtype=np.float64)
+            image_size_values = np.asarray(archive["image_size"], dtype=np.int64).reshape(-1)
+            if samples.ndim != 2 or samples.shape[1] != 4 or len(image_size_values) != 2:
+                raise CalibrationError("calibration checkpoint shape is invalid")
+            image_points: List[np.ndarray] = []
+            object_points: List[np.ndarray] = []
+            for index in range(len(samples)):
+                image = np.asarray(archive["image_points_{:03d}".format(index)], dtype=np.float32)
+                objects = np.asarray(archive["object_points_{:03d}".format(index)], dtype=np.float32)
+                if image.reshape(-1, 2).shape[0] != objects.reshape(-1, 3).shape[0]:
+                    raise CalibrationError("calibration checkpoint correspondences do not match")
+                image_points.append(image.reshape(-1, 1, 2))
+                object_points.append(objects.reshape(-1, 3))
+        self.samples = [tuple(float(value) for value in row) for row in samples]
+        self.image_points = image_points
+        self.object_points = object_points
+        self.image_size = (int(image_size_values[0]), int(image_size_values[1]))
+        return bool(self.samples)
+
+    def _load_recovery(self) -> None:
+        try:
+            if self._load_saved_result():
+                return
+            self._load_checkpoint()
+        # A damaged or stale recovery artifact must never prevent the camera
+        # service from starting a fresh stage; expose the problem through state.
+        except Exception as error:
+            self._recovery_error = str(error) or error.__class__.__name__
+
+    def _save_checkpoint_locked(self) -> None:
+        if not self.samples or self.image_size is None or self.result is not None:
+            return
+        destination = Path(self.checkpoint_file)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        payload: Dict[str, Any] = {
+            "fingerprint": np.asarray(json.dumps(self._recovery_fingerprint(), sort_keys=True)),
+            "samples": np.asarray(self.samples, dtype=np.float64),
+            "image_size": np.asarray(self.image_size, dtype=np.int64),
+        }
+        for index, (image, objects) in enumerate(zip(self.image_points, self.object_points)):
+            payload["image_points_{:03d}".format(index)] = np.asarray(image, dtype=np.float32)
+            payload["object_points_{:03d}".format(index)] = np.asarray(objects, dtype=np.float32)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix="." + destination.name + ".", suffix=".tmp", dir=str(destination.parent)
+        )
+        try:
+            with os.fdopen(descriptor, "wb") as stream:
+                np.savez_compressed(stream, **payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.chmod(temporary_name, 0o644)
+            os.replace(temporary_name, str(destination))
+            self._recovery_error = None
+        except Exception:
+            try:
+                os.unlink(temporary_name)
+            except FileNotFoundError:
+                pass
+            raise
+
+    def _remove_recovery_files_locked(self) -> None:
+        for raw_path in (self.output_file, self.checkpoint_file):
+            try:
+                Path(raw_path).unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as error:
+                self._recovery_error = str(error) or error.__class__.__name__
 
     def _save_ref(self, index: int, jpeg: bytes) -> None:
         self.refs[index] = jpeg
@@ -418,6 +597,10 @@ class IntrinsicCalibrationService:
                         self.samples.append(params)
                         self.image_points.append(corners)
                         self.object_points.append(detection.object_points)
+                        try:
+                            self._save_checkpoint_locked()
+                        except Exception as error:
+                            self._recovery_error = str(error) or error.__class__.__name__
                 self._mark_aligned(display)
                 self.latest_detection = {
                     "status": "detected",
@@ -486,7 +669,11 @@ class IntrinsicCalibrationService:
 
     def state(self) -> Dict[str, Any]:
         with self.lock:
-            bars, goodenough = intrinsic_solver.coverage(self.samples)
+            bars, sample_goodenough = intrinsic_solver.coverage(self.samples)
+            if not self.samples and self.restored_coverage:
+                bars = [dict(item) for item in self.restored_coverage]
+            goodenough = self.result is not None or sample_goodenough
+            guidance = intrinsic_solver.next_view_guidance(self.samples)
             targets = [{
                 "name": view["name"],
                 "position": view["position"],
@@ -497,10 +684,14 @@ class IntrinsicCalibrationService:
             pose = self.camera.current() if self.camera is not None else None
             return {
                 "mode": "intrinsic",
-                "samples": len(self.samples),
+                "samples": len(self.samples) if self.samples else (
+                    self.result.sample_count if self.result is not None else 0
+                ),
                 "coverage": bars,
+                "guidance": guidance,
                 "goodenough": bool(goodenough),
                 "calibrated": self.result is not None,
+                "result_restored": self.result_restored,
                 "result": self.result_payload,
                 "output_file": self.output_file,
                 "image_ready": self._display is not None,
@@ -511,6 +702,12 @@ class IntrinsicCalibrationService:
                 "pose": pose,
                 "camera_control": self.camera is not None,
                 "auto_capture": self._auto_capture_document_locked(),
+                "recovery": {
+                    "checkpoint_file": self.checkpoint_file,
+                    "checkpoint_available": Path(self.checkpoint_file).is_file(),
+                    "result_restored": self.result_restored,
+                    "last_error": self._recovery_error,
+                },
                 "action": dict(self.action) if self.action is not None else None,
                 "detection": {
                     **self.latest_detection,
@@ -534,11 +731,14 @@ class IntrinsicCalibrationService:
             self.action = None
 
     def _clear_session_locked(self) -> None:
+        self._remove_recovery_files_locked()
         self.samples = []
         self.image_points = []
         self.object_points = []
         self.result = None
         self.result_payload = None
+        self.result_restored = False
+        self.restored_coverage = []
         self.target_done = [False] * len(self.views)
         self._auto_capture_completed = False
 
@@ -776,7 +976,11 @@ class IntrinsicCalibrationService:
                 result,
                 board_size=self.board_size,
                 square=self.square,
-                metadata={"media_source": self.media_source or self.image_topic, "web_calibrator": True},
+                metadata={
+                    "media_source": self.media_source or self.image_topic,
+                    "web_calibrator": True,
+                    "coverage": intrinsic_solver.coverage(self.samples)[0],
+                },
                 board=self._board_document(),
             )
         except OSError as error:
@@ -784,21 +988,15 @@ class IntrinsicCalibrationService:
                 HTTPStatus.INTERNAL_SERVER_ERROR,
                 "Could not save calibration result: {}".format(error),
             ) from error
-        matrix = result.camera_matrix
         self.result = result
-        self.result_payload = {
-            "camera_matrix": [float(v) for v in matrix.reshape(-1)],
-            "distortion": [float(v) for v in result.distortion],
-            "fx": float(matrix[0, 0]),
-            "fy": float(matrix[1, 1]),
-            "cx": float(matrix[0, 2]),
-            "cy": float(matrix[1, 2]),
-            "image_width": result.image_size[0],
-            "image_height": result.image_size[1],
-            "rms_reprojection_error_px": result.rms_reprojection_error_px,
-            "sample_count": result.sample_count,
-            "output_file": self.output_file,
-        }
+        self.result_restored = False
+        self.result_payload = self._result_document(result)
+        try:
+            Path(self.checkpoint_file).unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            self._recovery_error = str(error) or error.__class__.__name__
         return self.result_payload
 
     def reset(self) -> Dict[str, Any]:

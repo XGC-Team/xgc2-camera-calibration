@@ -65,6 +65,25 @@ class IntrinsicSolverTest(unittest.TestCase):
         self.assertTrue(solver.is_new_sample((0.9, 0.1, 0.35, 0.2), params))
         self.assertFalse(solver.is_new_sample(params[0], params))
 
+    def test_next_view_guidance_uses_history_to_name_the_missing_direction(self):
+        self.assertEqual(solver.next_view_guidance([]), {
+            "complete": False, "dimension": None, "direction": "center", "progress": 0.0,
+        })
+        guidance = solver.next_view_guidance([
+            (0.40, 0.10, 0.45, 0.55),
+            (0.82, 0.78, 0.45, 0.55),
+        ])
+        self.assertEqual(guidance["dimension"], "X")
+        self.assertEqual(guidance["direction"], "left")
+        self.assertAlmostEqual(guidance["progress"], 0.6)
+
+        complete = solver.next_view_guidance([
+            (0.05, 0.05, 0.45, 0.55),
+            (0.85, 0.85, 0.45, 0.55),
+        ])
+        self.assertTrue(complete["complete"])
+        self.assertEqual(complete["direction"], "complete")
+
     def test_rejects_too_few_samples(self):
         with self.assertRaises(CalibrationError):
             solver.calibrate_intrinsic([np.zeros((35, 1, 2), np.float32)], BOARD, SQUARE, (WIDTH, HEIGHT))

@@ -14,6 +14,7 @@ from unittest.mock import patch
 import cv2
 import numpy as np
 
+from xgc_camera_calibration import intrinsic_solver
 from xgc_camera_calibration.intrinsic_service import (
     IntrinsicCalibrationService,
     recommended_views,
@@ -165,6 +166,46 @@ class IntrinsicServiceTest(unittest.TestCase):
             self.assertEqual(state["next"], 0)
             self.assertFalse(state["targets"][0]["done"])
             self.assertEqual(state["detection"]["status"], "waiting")
+            self.assertEqual(state["guidance"]["direction"], "center")
+            self.assertFalse(state["recovery"]["checkpoint_available"])
+
+    def test_accepted_corner_checkpoint_restores_an_interrupted_stage(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "intrinsics.yaml"
+            service = make_service(output)
+            service.process_frame(render_board())
+            checkpoint = Path(str(output) + ".session.npz")
+            self.assertTrue(checkpoint.is_file())
+
+            restored = make_service(output)
+            state = restored.state()
+            self.assertEqual(state["samples"], 1)
+            self.assertEqual(len(restored.image_points), 1)
+            self.assertEqual(len(restored.object_points), 1)
+            self.assertTrue(state["recovery"]["checkpoint_available"])
+            self.assertFalse(state["result_restored"])
+
+    def test_saved_result_restores_without_recollecting_samples(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "intrinsics.yaml"
+            result = intrinsic_solver.IntrinsicResult(
+                camera_matrix=np.array([[638.0, 0.0, 600.0], [0.0, 637.0, 390.0], [0.0, 0.0, 1.0]]),
+                distortion=np.array([0.01, -0.02, 0.0, 0.0, 0.0]),
+                image_size=(1280, 720), rms_reprojection_error_px=0.9, sample_count=40,
+            )
+            intrinsic_solver.save_intrinsic(output, result, board_size=(7, 5), square=0.20)
+
+            restored = make_service(output)
+            restored.attach_frame_capture(lambda: render_board())
+            state = restored.state()
+            self.assertTrue(state["calibrated"])
+            self.assertTrue(state["result_restored"])
+            self.assertEqual(state["samples"], 40)
+            self.assertAlmostEqual(state["result"]["fx"], 638.0)
+            self.assertFalse(restored.start_auto_capture(interval=0.1)["auto_capture"]["enabled"])
+
+            restored.reset()
+            self.assertFalse(output.exists())
 
     def test_physical_auto_capture_collects_without_manual_click_and_stops_when_ready(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -204,6 +245,7 @@ class IntrinsicServiceTest(unittest.TestCase):
             self.assertEqual(service.image_points, [])
             self.assertEqual(service.object_points, [])
             self.assertFalse((Path(directory) / "intrinsics.yaml").exists())
+            self.assertFalse((Path(directory) / "intrinsics.yaml.session.npz").exists())
 
     def test_camera_actions_require_control(self):
         with tempfile.TemporaryDirectory() as directory:
