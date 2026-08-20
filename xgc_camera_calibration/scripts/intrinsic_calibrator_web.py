@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """ROS1 pose-control adapter and Media Edge entrypoint for intrinsics.
 
-Live imagery belongs to the browser WebRTC session. This process asks the
-target-local Media Edge for one RGB snapshot only when a manual capture or an
-automatic pose sweep needs it; it never subscribes to a ROS camera image topic.
-Gazebo pose control remains a small ROS-only branch.
+Live imagery belongs to the browser WebRTC session. Simulation requests an
+immutable RGB snapshot at each authored pose. Physical calibration runs a
+bounded snapshot loop that automatically accepts only sharp, detected and
+geometrically distinct views; frames themselves are never persisted.
 """
 
 import sys
@@ -102,6 +102,15 @@ def main():
         if camera is not None:
             service.attach_camera_control(camera)
         service.attach_frame_capture(lambda: snapshot_client.capture().bgr)
+        automatic_physical_capture = bool(
+            rospy.get_param(
+                "~auto_capture", not bool(rospy.get_param("~camera_control", False))
+            )
+        )
+        if automatic_physical_capture:
+            service.start_auto_capture(
+                float(rospy.get_param("~auto_capture_interval", 0.5))
+            )
         bind_address = str(rospy.get_param("~bind_address", "127.0.0.1"))
         http_port = int(rospy.get_param("~http_port", 8766))
         if not 1 <= http_port <= 65535:
@@ -137,6 +146,7 @@ def main():
     try:
         rospy.spin()
     finally:
+        service.stop_auto_capture()
         server.shutdown()
         server.server_close()
         server_thread.join(timeout=5.0)

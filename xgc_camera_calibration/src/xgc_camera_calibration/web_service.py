@@ -634,6 +634,16 @@ class CalibrationRequestHandler(BaseHTTPRequestHandler):
                     raise ApiError(HTTPStatus.BAD_REQUEST, "Capture request must be an empty object")
                 self._send_json(HTTPStatus.OK, self._intrinsic().capture())
                 return
+            if path == "/api/v1/intrinsic/auto_capture/start":
+                if request not in ({}, None):
+                    raise ApiError(HTTPStatus.BAD_REQUEST, "auto_capture start request must be an empty object")
+                self._send_json(HTTPStatus.OK, self._intrinsic().start_auto_capture())
+                return
+            if path == "/api/v1/intrinsic/auto_capture/stop":
+                if request not in ({}, None):
+                    raise ApiError(HTTPStatus.BAD_REQUEST, "auto_capture stop request must be an empty object")
+                self._send_json(HTTPStatus.OK, self._intrinsic().stop_auto_capture())
+                return
             if path == "/api/v1/intrinsic/goto":
                 index = request.get("index") if isinstance(request, dict) else None
                 if not isinstance(index, int) or isinstance(index, bool):

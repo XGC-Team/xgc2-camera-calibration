@@ -35,6 +35,11 @@ _APRILTAG_DICTIONARIES = {
     "apriltag_36h11": "DICT_APRILTAG_36h11",
     "36h11": "DICT_APRILTAG_36h11",
 }
+_APRILGRID_RETRY_MAX_WIDTH = 1920
+_APRILGRID_FALLBACK_MIN_SHARPNESS = 160.0
+_APRILGRID_FALLBACK_MARKER_PIXELS = 80
+_APRILGRID_FALLBACK_MAX_PAYLOAD_ERRORS = 5
+_APRILGRID_FALLBACK_MAX_BORDER_ERRORS = 2
 
 
 @dataclass(frozen=True)
@@ -118,6 +123,350 @@ def _detect_aruco_markers(image: np.ndarray, dictionary: Any):
     raise CalibrationError("OpenCV aruco marker detection is unavailable")
 
 
+def _draw_aruco_marker(dictionary: Any, marker_id: int, size: int) -> np.ndarray:
+    """Render one marker across the OpenCV 4.2 and 4.7+ Python APIs."""
+    if hasattr(cv2.aruco, "generateImageMarker"):
+        return cv2.aruco.generateImageMarker(dictionary, marker_id, size)
+    if hasattr(cv2.aruco, "drawMarker"):
+        return cv2.aruco.drawMarker(dictionary, marker_id, size, borderBits=1)
+    raise CalibrationError("OpenCV aruco marker rendering is unavailable")
+
+
+def _ordered_quad(points: np.ndarray) -> np.ndarray:
+    """Return a convex quad in image TL, TR, BR, BL order."""
+    quad = np.asarray(points, dtype=np.float32).reshape(4, 2)
+    center = np.mean(quad, axis=0)
+    angles = np.arctan2(quad[:, 1] - center[1], quad[:, 0] - center[0])
+    quad = quad[np.argsort(angles)]
+    return np.roll(quad, -int(np.argmin(np.sum(quad, axis=1))), axis=0)
+
+
+def _aprilgrid_marker_templates(
+    dictionary: Any, start_id: int, count: int
+) -> List[np.ndarray]:
+    """Build 8x8 binary templates: one black border plus a 6x6 payload."""
+    marker_pixels = _APRILGRID_FALLBACK_MARKER_PIXELS
+    cell = marker_pixels // 8
+    templates: List[np.ndarray] = []
+    for marker_id in range(int(start_id), int(start_id) + int(count)):
+        marker = _draw_aruco_marker(dictionary, marker_id, marker_pixels)
+        bits = np.zeros((8, 8), dtype=np.uint8)
+        for row in range(8):
+            for col in range(8):
+                patch = marker[
+                    row * cell + 2 : (row + 1) * cell - 2,
+                    col * cell + 2 : (col + 1) * cell - 2,
+                ]
+                bits[row, col] = int(float(np.mean(patch)) > 127.0)
+        templates.append(bits)
+    return templates
+
+
+def _decode_aprilgrid_quad(
+    gray: np.ndarray,
+    quad: np.ndarray,
+    templates: Sequence[np.ndarray],
+    start_id: int,
+) -> Tuple[int, int, int, int]:
+    """Return payload errors, marker id, rotation and border errors."""
+    marker_pixels = _APRILGRID_FALLBACK_MARKER_PIXELS
+    destination = np.array(
+        (
+            (0, 0),
+            (marker_pixels - 1, 0),
+            (marker_pixels - 1, marker_pixels - 1),
+            (0, marker_pixels - 1),
+        ),
+        dtype=np.float32,
+    )
+    transform = cv2.getPerspectiveTransform(quad, destination)
+    marker = cv2.warpPerspective(gray, transform, (marker_pixels, marker_pixels))
+    _threshold, marker = cv2.threshold(
+        marker, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU
+    )
+    cell = marker_pixels // 8
+    bits = np.zeros((8, 8), dtype=np.uint8)
+    for row in range(8):
+        for col in range(8):
+            patch = marker[
+                row * cell + 2 : (row + 1) * cell - 2,
+                col * cell + 2 : (col + 1) * cell - 2,
+            ]
+            bits[row, col] = int(float(np.mean(patch)) > 127.0)
+    border = np.concatenate(
+        (bits[0, :], bits[-1, :], bits[1:-1, 0], bits[1:-1, -1])
+    )
+    border_errors = int(np.sum(border))
+    best = (37, int(start_id), 0, border_errors)
+    for offset, template in enumerate(templates):
+        for rotation in range(4):
+            rotated = np.rot90(template, rotation)
+            errors = int(np.count_nonzero(bits[1:7, 1:7] != rotated[1:7, 1:7]))
+            if errors < best[0]:
+                best = (errors, int(start_id) + offset, rotation, border_errors)
+    return best
+
+
+def _extract_aprilgrid_quads(
+    gray: np.ndarray, dictionary: Any, start_id: int, tag_count: int
+) -> List[Dict[str, Any]]:
+    """Extract and softly decode black AprilTag outer quads."""
+    templates = _aprilgrid_marker_templates(dictionary, start_id, tag_count)
+    binary = cv2.adaptiveThreshold(
+        gray,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        31,
+        7,
+    )
+    contours, _hierarchy = cv2.findContours(
+        binary, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE
+    )
+    image_area = float(gray.shape[0] * gray.shape[1])
+    candidates: List[Dict[str, Any]] = []
+    for contour in contours:
+        area = float(cv2.contourArea(contour))
+        if not image_area * 0.00035 < area < image_area * 0.03:
+            continue
+        perimeter = float(cv2.arcLength(contour, True))
+        approximate = cv2.approxPolyDP(contour, 0.04 * perimeter, True)
+        if len(approximate) != 4 or not cv2.isContourConvex(approximate):
+            continue
+        _center, dimensions, _angle = cv2.minAreaRect(approximate)
+        short_edge, long_edge = sorted((float(dimensions[0]), float(dimensions[1])))
+        if short_edge < 8.0 or long_edge / short_edge > 2.0:
+            continue
+        if area / max(1.0, short_edge * long_edge) < 0.6:
+            continue
+        quad = _ordered_quad(approximate)
+        payload_errors, marker_id, rotation, border_errors = _decode_aprilgrid_quad(
+            gray, quad, templates, start_id
+        )
+        candidates.append(
+            {
+                "quad": quad,
+                "center": np.mean(quad, axis=0),
+                "edge": float(
+                    np.mean(
+                        [
+                            np.linalg.norm(quad[(index + 1) % 4] - quad[index])
+                            for index in range(4)
+                        ]
+                    )
+                ),
+                "payload_errors": payload_errors,
+                "marker_id": marker_id,
+                "rotation": rotation,
+                "border_errors": border_errors,
+            }
+        )
+    return candidates
+
+
+def _project_points(homography: np.ndarray, points: np.ndarray) -> np.ndarray:
+    return cv2.perspectiveTransform(
+        np.asarray(points, dtype=np.float32).reshape(-1, 1, 2), homography
+    ).reshape(-1, 2)
+
+
+def _match_aprilgrid_lattice(
+    homography: np.ndarray,
+    tag_objects: Sequence[np.ndarray],
+    candidates: Sequence[Dict[str, Any]],
+) -> List[Tuple[int, int, float]]:
+    choices: List[Tuple[float, float, int, int]] = []
+    for tag_index, tag_object in enumerate(tag_objects):
+        predicted = _project_points(homography, tag_object[:, :2])
+        predicted_center = np.mean(predicted, axis=0)
+        predicted_edge = float(
+            np.mean(
+                [
+                    np.linalg.norm(predicted[(index + 1) % 4] - predicted[index])
+                    for index in range(4)
+                ]
+            )
+        )
+        limit = max(8.0, predicted_edge * 0.55)
+        for candidate_index, candidate in enumerate(candidates):
+            if int(candidate["border_errors"]) > 4:
+                continue
+            edge_ratio = float(candidate["edge"]) / max(1.0, predicted_edge)
+            if not 0.6 <= edge_ratio <= 1.4:
+                continue
+            distance = float(np.linalg.norm(candidate["center"] - predicted_center))
+            if distance < limit:
+                choices.append(
+                    (distance / limit, distance, tag_index, candidate_index)
+                )
+    matches: List[Tuple[int, int, float]] = []
+    used_tags = set()
+    used_candidates = set()
+    for _relative, distance, tag_index, candidate_index in sorted(choices):
+        if tag_index in used_tags or candidate_index in used_candidates:
+            continue
+        matches.append((tag_index, candidate_index, distance))
+        used_tags.add(tag_index)
+        used_candidates.add(candidate_index)
+    return matches
+
+
+def _align_aprilgrid_corners_to_lattice(
+    image_points: Sequence[np.ndarray], object_points: Sequence[np.ndarray]
+) -> List[np.ndarray]:
+    """Align per-tag corner order with the board lattice encoded by tag ids.
+
+    Some printed AprilGrid plates rotate every marker bitmap relative to the
+    board axes. ArUco then decodes the correct ids and centers but returns a
+    per-marker corner order that is inconsistent with the board geometry. A
+    homography fitted only from decoded tag centers resolves the board axes;
+    measured corners are then permuted, never synthesized, to match them.
+    """
+    if len(image_points) < 4 or len(image_points) != len(object_points):
+        return [np.asarray(points, dtype=np.float32) for points in image_points]
+    source_centers = np.asarray(
+        [np.mean(points[:, :2], axis=0) for points in object_points],
+        dtype=np.float32,
+    )
+    image_centers = np.asarray(
+        [np.mean(points, axis=0) for points in image_points], dtype=np.float32
+    )
+    homography, mask = cv2.findHomography(
+        source_centers, image_centers, cv2.RANSAC, 5.0
+    )
+    if homography is None or mask is None or int(np.sum(mask)) < 4:
+        return [np.asarray(points, dtype=np.float32) for points in image_points]
+    aligned_points: List[np.ndarray] = []
+    for measured, tag_object in zip(image_points, object_points):
+        predicted = _project_points(homography, tag_object[:, :2])
+        measured = np.asarray(measured, dtype=np.float32).reshape(4, 2)
+        permutations = [
+            np.roll(measured, shift, axis=0) for shift in range(4)
+        ] + [
+            np.roll(measured[::-1], shift, axis=0) for shift in range(4)
+        ]
+        aligned_points.append(
+            min(
+                permutations,
+                key=lambda quad: float(
+                    np.sum(np.linalg.norm(quad - predicted, axis=1))
+                ),
+            ).astype(np.float32)
+        )
+    return aligned_points
+
+
+def _aprilgrid_contour_fallback(
+    gray: np.ndarray,
+    dictionary: Any,
+    board_size: Sequence[int],
+    square: float,
+    tag_spacing: float,
+    start_id: int,
+    min_tags: int,
+) -> Optional[Tuple[List[np.ndarray], List[np.ndarray]]]:
+    """Recover a decoded lattice when OpenCV 4.2 rejects small real tags."""
+    sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    if sharpness < _APRILGRID_FALLBACK_MIN_SHARPNESS:
+        return None
+    tag_count = int(board_size[0]) * int(board_size[1])
+    candidates = _extract_aprilgrid_quads(gray, dictionary, start_id, tag_count)
+    anchors = [
+        candidate
+        for candidate in candidates
+        if int(candidate["payload_errors"])
+        <= _APRILGRID_FALLBACK_MAX_PAYLOAD_ERRORS
+        and int(candidate["border_errors"])
+        <= _APRILGRID_FALLBACK_MAX_BORDER_ERRORS
+    ]
+    if not anchors:
+        return None
+    tag_objects = [
+        aprilgrid_tag_object_points(
+            board_size, square, tag_spacing, start_id, start_id + offset
+        )
+        for offset in range(tag_count)
+    ]
+    if any(tag_object is None for tag_object in tag_objects):
+        return None
+    unique_anchors: Dict[int, Dict[str, Any]] = {}
+    for anchor in anchors:
+        marker_offset = int(anchor["marker_id"]) - int(start_id)
+        current = unique_anchors.get(marker_offset)
+        if current is None or int(anchor["payload_errors"]) < int(
+            current["payload_errors"]
+        ):
+            unique_anchors[marker_offset] = anchor
+    if len(unique_anchors) < 4:
+        return None
+
+    source_centers = np.asarray(
+        [
+            np.mean(tag_objects[tag_index][:, :2], axis=0)
+            for tag_index in unique_anchors
+        ],
+        dtype=np.float32,
+    )
+    image_centers = np.asarray(
+        [unique_anchors[tag_index]["center"] for tag_index in unique_anchors],
+        dtype=np.float32,
+    )
+    initial_homography, mask = cv2.findHomography(
+        source_centers, image_centers, cv2.RANSAC, 5.0
+    )
+    if initial_homography is None or mask is None or int(np.sum(mask)) < 4:
+        return None
+    initial_matches = _match_aprilgrid_lattice(
+        initial_homography, tag_objects, candidates
+    )
+    if len(initial_matches) < int(min_tags):
+        return None
+    source_centers = np.asarray(
+        [
+            np.mean(tag_objects[tag_index][:, :2], axis=0)
+            for tag_index, _candidate, _distance in initial_matches
+        ],
+        dtype=np.float32,
+    )
+    image_centers = np.asarray(
+        [
+            candidates[candidate_index]["center"]
+            for _tag, candidate_index, _distance in initial_matches
+        ],
+        dtype=np.float32,
+    )
+    refined_homography, mask = cv2.findHomography(
+        source_centers, image_centers, cv2.RANSAC, 5.0
+    )
+    if refined_homography is None or mask is None or int(np.sum(mask)) < 4:
+        return None
+    matches = _match_aprilgrid_lattice(
+        refined_homography, tag_objects, candidates
+    )
+    if len(matches) < int(min_tags):
+        return None
+
+    image_points: List[np.ndarray] = []
+    object_points: List[np.ndarray] = []
+    for tag_index, candidate_index, _distance in sorted(matches):
+        predicted = _project_points(
+            refined_homography, tag_objects[tag_index][:, :2]
+        )
+        candidate_quad = candidates[candidate_index]["quad"]
+        permutations = [
+            np.roll(candidate_quad, shift, axis=0) for shift in range(4)
+        ] + [
+            np.roll(candidate_quad[::-1], shift, axis=0) for shift in range(4)
+        ]
+        aligned = min(
+            permutations,
+            key=lambda quad: float(np.sum(np.linalg.norm(quad - predicted, axis=1))),
+        )
+        image_points.append(aligned.astype(np.float32))
+        object_points.append(tag_objects[tag_index])
+    return image_points, object_points
+
+
 def aprilgrid_tag_object_points(
     board_size: Sequence[int],
     tag_size: float,
@@ -178,24 +527,105 @@ def detect_aprilgrid(
         search = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
     dictionary = cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, dictionary_name))
     corners, ids, _rejected = _detect_aruco_markers(search, dictionary)
-    if ids is None or len(ids) == 0:
-        return None
+
+    def in_board_count(marker_ids: Optional[np.ndarray]) -> int:
+        if marker_ids is None:
+            return 0
+        first = int(start_id)
+        last = first + int(board_size[0]) * int(board_size[1])
+        return sum(first <= int(marker_id) < last for marker_id in marker_ids.reshape(-1))
+
+    # The station plate is physically large, but a full-board view makes each
+    # 88 mm tag small in the 1280x720 calibration stream. Downscaling that
+    # stream to the normal 960 px search width can leave too few decoded tags.
+    # Retry once at a bounded higher search resolution, then map the detected
+    # corners back through the combined scale so pixel/object correspondences
+    # remain in the original camera frame.
+    total_tags = int(board_size[0]) * int(board_size[1])
+    best_count = in_board_count(ids)
+    if best_count < total_tags and search.shape[1] < _APRILGRID_RETRY_MAX_WIDTH:
+        retry_scale = min(
+            2.0, float(_APRILGRID_RETRY_MAX_WIDTH) / float(search.shape[1])
+        )
+        if retry_scale > 1.0:
+            retry = cv2.resize(
+                search,
+                None,
+                fx=retry_scale,
+                fy=retry_scale,
+                interpolation=cv2.INTER_CUBIC,
+            )
+            retry_corners, retry_ids, retry_rejected = _detect_aruco_markers(
+                retry, dictionary
+            )
+            retry_count = in_board_count(retry_ids)
+            if retry_count > best_count:
+                corners, ids, _rejected = retry_corners, retry_ids, retry_rejected
+                best_count = retry_count
+                scale = scale * retry_scale
+
+            # A mild unsharp pass recovers more of the station plate when the
+            # full board is visible but its printed tag cells occupy only a
+            # few dozen source pixels. AprilTag error correction and the
+            # explicit board-id range remain the acceptance fence.
+            blurred = cv2.GaussianBlur(retry, (0, 0), 2.0)
+            sharpened = cv2.addWeighted(retry, 2.0, blurred, -1.0, 0.0)
+            sharp_corners, sharp_ids, sharp_rejected = _detect_aruco_markers(
+                sharpened, dictionary
+            )
+            sharp_count = in_board_count(sharp_ids)
+            if sharp_count > best_count:
+                corners, ids, _rejected = sharp_corners, sharp_ids, sharp_rejected
+                best_count = sharp_count
+                scale = (
+                    float(maximum_width) / float(width)
+                    if width > maximum_width
+                    else 1.0
+                ) * retry_scale
     image_points: List[np.ndarray] = []
     object_points: List[np.ndarray] = []
-    for marker_corners, marker_id in zip(corners, ids.reshape(-1)):
-        obj = aprilgrid_tag_object_points(
-            board_size, square, tag_spacing, start_id, int(marker_id)
-        )
-        if obj is None:
-            continue
-        image = (np.asarray(marker_corners, dtype=np.float32).reshape(4, 2) / scale).astype(
-            np.float32
-        )
-        image_points.append(image)
-        object_points.append(obj)
+    if ids is not None:
+        for marker_corners, marker_id in zip(corners, ids.reshape(-1)):
+            obj = aprilgrid_tag_object_points(
+                board_size, square, tag_spacing, start_id, int(marker_id)
+            )
+            if obj is None:
+                continue
+            image = (
+                np.asarray(marker_corners, dtype=np.float32).reshape(4, 2) / scale
+            ).astype(np.float32)
+            image_points.append(image)
+            object_points.append(obj)
     if len(image_points) < int(min_tags):
-        return None
+        recovered = _aprilgrid_contour_fallback(
+            gray,
+            dictionary,
+            board_size,
+            square,
+            tag_spacing,
+            start_id,
+            min_tags,
+        )
+        if recovered is None:
+            return None
+        image_points, object_points = recovered
+    image_points = _align_aprilgrid_corners_to_lattice(
+        image_points, object_points
+    )
     pixels = np.asarray(image_points, dtype=np.float32).reshape(-1, 1, 2)
+    refined = pixels.copy()
+    flat = pixels.reshape(-1, 2)
+    valid = (
+        (flat[:, 0] >= 4.0)
+        & (flat[:, 0] < float(width - 4))
+        & (flat[:, 1] >= 4.0)
+        & (flat[:, 1] < float(height - 4))
+    )
+    if bool(np.any(valid)):
+        refined[valid] = cv2.cornerSubPix(
+            gray, pixels[valid].copy(), (3, 3), (-1, -1), _SUBPIX_CRITERIA
+        )
+    pixels = refined
     objects = np.asarray(object_points, dtype=np.float32).reshape(-1, 3)
     return BoardDetection(
         image_points=pixels,

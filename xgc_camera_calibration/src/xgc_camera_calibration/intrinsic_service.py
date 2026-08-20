@@ -127,6 +127,7 @@ class IntrinsicCalibrationService:
         self.maximum_detect_width = int(maximum_detect_width)
         self.display_width = int(display_width)
         self.lock = threading.RLock()
+        self._capture_lock = threading.Lock()
         self.samples: List[Tuple[float, float, float, float]] = []
         self.image_points: List[np.ndarray] = []
         self.object_points: List[np.ndarray] = []
@@ -174,6 +175,11 @@ class IntrinsicCalibrationService:
         self._recording = False
         self.action: Optional[Dict[str, Any]] = None
         self._auto_run_thread: Optional[threading.Thread] = None
+        self._auto_capture_thread: Optional[threading.Thread] = None
+        self._auto_capture_stop = threading.Event()
+        self._auto_capture_interval = 0.5
+        self._auto_capture_error: Optional[str] = None
+        self._auto_capture_completed = False
         self._load_refs()
 
     # -- guide wiring ---------------------------------------------------------
@@ -183,14 +189,106 @@ class IntrinsicCalibrationService:
             self.camera = camera
 
     def attach_frame_capture(self, capture: Callable[[], np.ndarray]) -> None:
-        """Attach an explicit immutable-frame transaction.
-
-        It is intentionally a callback rather than a persistent subscriber:
-        the browser owns the WebRTC live path, while the calibration algorithm
-        pays for one RGB readback only when an operator captures a sample.
-        """
+        """Attach an immutable Media Edge snapshot transaction."""
         with self.lock:
             self.frame_capture = capture
+
+    def _auto_capture_document_locked(self) -> Dict[str, Any]:
+        thread = self._auto_capture_thread
+        enabled = bool(
+            thread is not None
+            and thread.is_alive()
+            and not self._auto_capture_stop.is_set()
+        )
+        return {
+            "enabled": enabled,
+            "interval_seconds": self._auto_capture_interval,
+            "last_error": self._auto_capture_error,
+            "coverage_complete": self._auto_capture_completed,
+        }
+
+    def start_auto_capture(self, interval: float = 0.5) -> Dict[str, Any]:
+        """Continuously inspect physical-camera snapshots until coverage is full.
+
+        Frames are never persisted. ``process_frame`` replaces the one in-memory
+        preview, rejects invalid/blurred/duplicate views, and stores only corner
+        coordinates for accepted samples.
+        """
+        interval = float(interval)
+        if not 0.1 <= interval <= 10.0:
+            raise ApiError(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                "auto capture interval must be between 0.1 and 10 seconds",
+            )
+        with self.lock:
+            if self.camera is not None:
+                raise ApiError(
+                    HTTPStatus.CONFLICT,
+                    "Continuous auto capture is for a physical camera; use the simulation auto sweep",
+                )
+            if self.frame_capture is None:
+                raise ApiError(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    "No calibration frame source is available",
+                )
+            current = self._auto_capture_thread
+            if current is not None and current.is_alive():
+                return {"ok": True, "auto_capture": self._auto_capture_document_locked()}
+            self._auto_capture_interval = interval
+            self._auto_capture_error = None
+            self._auto_capture_completed = False
+            self._auto_capture_stop.clear()
+            thread = threading.Thread(
+                target=self._run_auto_capture,
+                name="intrinsic-physical-auto-capture",
+                daemon=True,
+            )
+            self._auto_capture_thread = thread
+        try:
+            thread.start()
+        except RuntimeError as error:
+            with self.lock:
+                self._auto_capture_thread = None
+                self._auto_capture_error = str(error) or "Could not start auto capture"
+            raise ApiError(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                "Could not start physical auto capture",
+            ) from error
+        with self.lock:
+            return {"ok": True, "auto_capture": self._auto_capture_document_locked()}
+
+    def _run_auto_capture(self) -> None:
+        try:
+            while not self._auto_capture_stop.is_set():
+                try:
+                    self._capture_frame()
+                except Exception as error:
+                    with self.lock:
+                        self._auto_capture_error = str(error) or error.__class__.__name__
+                else:
+                    with self.lock:
+                        self._auto_capture_error = None
+                        _bars, goodenough = intrinsic_solver.coverage(self.samples)
+                        if goodenough:
+                            self._auto_capture_completed = True
+                            self._auto_capture_stop.set()
+                if self._auto_capture_stop.wait(self._auto_capture_interval):
+                    break
+        finally:
+            with self.lock:
+                if self._auto_capture_thread is threading.current_thread():
+                    self._auto_capture_thread = None
+
+    def stop_auto_capture(self) -> Dict[str, Any]:
+        with self.lock:
+            thread = self._auto_capture_thread
+            self._auto_capture_stop.set()
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=6.0)
+        with self.lock:
+            if self._auto_capture_thread is not None and not self._auto_capture_thread.is_alive():
+                self._auto_capture_thread = None
+            return {"ok": True, "auto_capture": self._auto_capture_document_locked()}
 
     def _load_refs(self) -> None:
         if not self.references_dir:
@@ -412,6 +510,7 @@ class IntrinsicCalibrationService:
                 "next": next_index,
                 "pose": pose,
                 "camera_control": self.camera is not None,
+                "auto_capture": self._auto_capture_document_locked(),
                 "action": dict(self.action) if self.action is not None else None,
                 "detection": {
                     **self.latest_detection,
@@ -441,6 +540,7 @@ class IntrinsicCalibrationService:
         self.result = None
         self.result_payload = None
         self.target_done = [False] * len(self.views)
+        self._auto_capture_completed = False
 
     def _require_camera(self) -> Any:
         if self.camera is None:
@@ -448,19 +548,29 @@ class IntrinsicCalibrationService:
         return self.camera
 
     def _capture_frame(self) -> Dict[str, Any]:
-        with self.lock:
-            capture = self.frame_capture
-        if capture is None:
-            raise ApiError(HTTPStatus.SERVICE_UNAVAILABLE, "No calibration frame source is available")
-        try:
-            frame = capture()
-        except ApiError:
-            raise
-        except Exception as error:
-            raise ApiError(HTTPStatus.SERVICE_UNAVAILABLE, "Could not capture a calibration frame: {}".format(error)) from error
-        if not isinstance(frame, np.ndarray):
-            raise ApiError(HTTPStatus.SERVICE_UNAVAILABLE, "Calibration frame source returned no image")
-        self.process_frame(frame)
+        with self._capture_lock:
+            with self.lock:
+                capture = self.frame_capture
+            if capture is None:
+                raise ApiError(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    "No calibration frame source is available",
+                )
+            try:
+                frame = capture()
+            except ApiError:
+                raise
+            except Exception as error:
+                raise ApiError(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    "Could not capture a calibration frame: {}".format(error),
+                ) from error
+            if not isinstance(frame, np.ndarray):
+                raise ApiError(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    "Calibration frame source returned no image",
+                )
+            self.process_frame(frame)
         with self.lock:
             return {"ok": True, "samples": len(self.samples)}
 

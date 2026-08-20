@@ -3,6 +3,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import cv2
 import numpy as np
@@ -129,8 +130,82 @@ class IntrinsicSolverTest(unittest.TestCase):
         self.assertAlmostEqual(result.camera_matrix[0, 0], 2288.17, delta=2.0)
         self.assertLess(result.rms_reprojection_error_px, 0.5)
 
+    def test_retries_small_physical_aprilgrid_at_bounded_resolution(self):
+        if not hasattr(cv2, "aruco") or not hasattr(cv2.aruco, "DICT_APRILTAG_36h11"):
+            self.skipTest("OpenCV AprilTag 36h11 dictionary is unavailable")
+        gray = _render_aprilgrid((6, 6), tag_pixels=12, gap_pixels=4, border=20)
+        detection = solver.detect_aprilgrid(
+            gray, (6, 6), square=0.088, tag_spacing=0.0264, min_tags=6, maximum_width=960
+        )
+        self.assertIsNotNone(detection)
+        self.assertGreaterEqual(len(detection.image_points), 24)
+        points = detection.image_points.reshape(-1, 2)
+        self.assertGreaterEqual(float(points.min()), 0.0)
+        self.assertLessEqual(float(points[:, 0].max()), float(gray.shape[1]))
+        self.assertLessEqual(float(points[:, 1].max()), float(gray.shape[0]))
 
-def _render_aprilgrid(board_size, tag_pixels=80, gap_pixels=24, border=40):
+    def test_contour_fallback_supports_opencv_42_aprilgrid_detection(self):
+        if not hasattr(cv2, "aruco") or not hasattr(cv2.aruco, "DICT_APRILTAG_36h11"):
+            self.skipTest("OpenCV AprilTag 36h11 dictionary is unavailable")
+        gray = _render_aprilgrid((6, 6), tag_pixels=45, gap_pixels=14, border=40)
+        # OpenCV 4.2 frequently returns rejected quads but no decoded ids for
+        # the real station plate. Force that result so the compatibility path
+        # remains covered even when tests run with a newer host OpenCV.
+        with mock.patch.object(
+            solver, "_detect_aruco_markers", return_value=([], None, [])
+        ):
+            detection = solver.detect_aprilgrid(
+                gray,
+                (6, 6),
+                square=0.088,
+                tag_spacing=0.0264,
+                min_tags=6,
+                maximum_width=960,
+            )
+        self.assertIsNotNone(detection)
+        self.assertEqual(len(detection.image_points), 144)
+        self.assertEqual(len(detection.object_points), 144)
+
+    def test_physical_station_tag_rotation_keeps_board_geometry_aligned(self):
+        if not hasattr(cv2, "aruco") or not hasattr(cv2.aruco, "DICT_APRILTAG_36h11"):
+            self.skipTest("OpenCV AprilTag 36h11 dictionary is unavailable")
+        gray = _render_aprilgrid(
+            (6, 6),
+            tag_pixels=45,
+            gap_pixels=14,
+            border=40,
+            physical_station_layout=True,
+        )
+        with mock.patch.object(
+            solver, "_detect_aruco_markers", return_value=([], None, [])
+        ):
+            detection = solver.detect_aprilgrid(
+                gray,
+                (6, 6),
+                square=0.088,
+                tag_spacing=0.0264,
+                min_tags=6,
+                maximum_width=960,
+            )
+        self.assertIsNotNone(detection)
+        homography, _mask = cv2.findHomography(
+            detection.object_points[:, :2], detection.image_points.reshape(-1, 2)
+        )
+        projected = cv2.perspectiveTransform(
+            detection.object_points[:, :2].reshape(-1, 1, 2), homography
+        ).reshape(-1, 2)
+        error = np.linalg.norm(projected - detection.image_points.reshape(-1, 2), axis=1)
+        self.assertLess(float(np.mean(error)), 0.5)
+        self.assertLess(float(np.max(error)), 1.5)
+
+
+def _render_aprilgrid(
+    board_size,
+    tag_pixels=80,
+    gap_pixels=24,
+    border=40,
+    physical_station_layout=False,
+):
     dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
     cols, rows = board_size
     pitch = tag_pixels + gap_pixels
@@ -139,10 +214,14 @@ def _render_aprilgrid(board_size, tag_pixels=80, gap_pixels=24, border=40):
     image = np.full((height, width), 255, np.uint8)
     for row in range(rows):
         for col in range(cols):
+            tag_row = rows - 1 - row if physical_station_layout else row
+            tag_id = tag_row * cols + col
             if hasattr(cv2.aruco, "generateImageMarker"):
-                tag = cv2.aruco.generateImageMarker(dictionary, row * cols + col, tag_pixels)
+                tag = cv2.aruco.generateImageMarker(dictionary, tag_id, tag_pixels)
             else:
-                tag = cv2.aruco.drawMarker(dictionary, row * cols + col, tag_pixels)
+                tag = cv2.aruco.drawMarker(dictionary, tag_id, tag_pixels)
+            if physical_station_layout:
+                tag = np.rot90(tag, 2)
             y0 = border + row * pitch
             x0 = border + col * pitch
             image[y0:y0 + tag_pixels, x0:x0 + tag_pixels] = tag
