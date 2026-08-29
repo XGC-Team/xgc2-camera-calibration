@@ -45,7 +45,9 @@ projection_matrix:
 YAML
 roslaunch --files xgc_camera_calibration extrinsic_calibrator.launch \
   intrinsic_file:="${INTRINSIC_FILE}" >/dev/null
-roslaunch --files xgc_camera_calibration intrinsic_calibrator.launch >/dev/null
+roslaunch --files xgc_camera_calibration intrinsic_calibrator.launch \
+  calibration_root:="${RUNTIME}/calibrations" calibration_mode:=sim \
+  camera_name:=package_smoke >/dev/null
 roslaunch --files xgc_camera_calibration extrinsic_tf.launch >/dev/null
 
 ROSCORE_PID=""
@@ -129,7 +131,7 @@ INTRINSIC_PID="$!"
 
 wait_http 18765 "${EXTRINSIC_PID}"
 wait_http 18766 "${INTRINSIC_PID}"
-python3 -c 'import json, urllib.request; p=json.load(urllib.request.urlopen("http://127.0.0.1:18765/healthz")); assert p["status"] == "ok" and not p["image_ready"] and not p["camera_info_ready"]'
+python3 -c 'import json, urllib.request; p=json.load(urllib.request.urlopen("http://127.0.0.1:18765/healthz")); assert p["status"] == "ok" and not p["image_ready"] and p["intrinsic_ready"]'
 python3 -c 'import json, urllib.request; p=json.load(urllib.request.urlopen("http://127.0.0.1:18766/healthz")); assert p["status"] == "ok" and not p["image_ready"] and not p["camera_control"]'
 python3 -c 'import urllib.request; assert b"Camera extrinsic calibration" in urllib.request.urlopen("http://127.0.0.1:18765/").read()'
 python3 -c 'import urllib.request; assert b"Camera intrinsic calibration" in urllib.request.urlopen("http://127.0.0.1:18766/").read()'

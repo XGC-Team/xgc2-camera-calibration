@@ -2,11 +2,16 @@
   <arg name="media_edge_address" default="http://127.0.0.1:18090" />
   <arg name="media_source_id" default="usb_cam" />
   <arg name="snapshot_timeout" default="5.0" />
-  <arg name="output_file" default="$(env HOME)/.local/state/xgc2/camera/calibrations/usb_cam/intrinsics.yaml" />
-  <arg name="references_dir" default="$(env HOME)/.local/state/xgc2/camera/calibrations/usb_cam/intrinsic_refs" />
-  <arg name="board_cols" default="7" />
-  <arg name="board_rows" default="5" />
-  <arg name="square_size" default="0.20" />
+  <arg name="calibration_root" />
+  <arg name="calibration_mode" />
+  <arg name="camera_name" />
+  <arg name="board_cols" default="6" />
+  <arg name="board_rows" default="6" />
+  <arg name="square_size" default="0.088" />
+  <arg name="tag_spacing" default="0.0264" />
+  <arg name="tag_family" default="tag36h11" />
+  <arg name="tag_start_id" default="0" />
+  <arg name="min_tags" default="6" />
   <arg name="board_x" default="2.0" />
   <arg name="board_y" default="0.0" />
   <arg name="board_z" default="2.2" />
@@ -29,11 +34,17 @@
     <param name="media_edge_address" value="$(arg media_edge_address)" />
     <param name="media_source_id" value="$(arg media_source_id)" />
     <param name="snapshot_timeout" value="$(arg snapshot_timeout)" />
-    <param name="output_file" value="$(arg output_file)" />
-    <param name="references_dir" value="$(arg references_dir)" />
+    <param name="calibration_root" value="$(arg calibration_root)" />
+    <param name="calibration_mode" value="$(arg calibration_mode)" />
+    <param name="camera_name" value="$(arg camera_name)" />
+    <param name="board_type" value="aprilgrid" />
     <param name="board_cols" value="$(arg board_cols)" />
     <param name="board_rows" value="$(arg board_rows)" />
     <param name="square_size" value="$(arg square_size)" />
+    <param name="tag_spacing" value="$(arg tag_spacing)" />
+    <param name="tag_family" value="$(arg tag_family)" />
+    <param name="tag_start_id" value="$(arg tag_start_id)" />
+    <param name="min_tags" value="$(arg min_tags)" />
     <param name="board_x" value="$(arg board_x)" />
     <param name="board_y" value="$(arg board_y)" />
     <param name="board_z" value="$(arg board_z)" />

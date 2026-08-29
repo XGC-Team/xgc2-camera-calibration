@@ -601,7 +601,7 @@ class CalibrationRequestHandler(BaseHTTPRequestHandler):
                 if self.calibration_server.service is not None:
                     state = self.calibration_server.service.state()
                     payload["image_ready"] = bool(state["source"].get("image_ready"))
-                    payload["camera_info_ready"] = bool(state["source"].get("camera_info_ready"))
+                    payload["intrinsic_ready"] = bool(state["source"].get("intrinsic_ready"))
                     payload["marker_count"] = int(state["source"].get("marker_count", 0))
                 if self.calibration_server.intrinsic_service is not None:
                     intrinsic_state = self.calibration_server.intrinsic_service.state()

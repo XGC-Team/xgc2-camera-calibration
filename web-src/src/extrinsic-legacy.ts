@@ -19,7 +19,7 @@ const ui = {
   clear: document.getElementById("clear-button"),
   solve: document.getElementById("solve-button"),
   imageTopic: document.getElementById("image-topic"),
-  infoTopic: document.getElementById("info-topic"),
+  intrinsicFile: document.getElementById("intrinsic-file"),
   posePrefix: document.getElementById("pose-prefix"),
   outputFile: document.getElementById("output-file"),
 };
@@ -205,13 +205,13 @@ function renderState(serverState) {
     state.restoredResultGeneration = serverState.generation;
   }
   const source = serverState.source;
-  const ready = source.image_ready && source.camera_info_ready && source.marker_count > 0;
+  const ready = source.image_ready && source.intrinsic_ready && source.marker_count > 0;
   ui.modeChip.textContent = serverState.mode === "frozen" ? "Frozen" : "Live";
   ui.modeChip.classList.toggle("muted", serverState.mode !== "frozen");
   ui.inputChip.textContent = ready ? `${source.marker_count} pose markers` : "Waiting for ROS inputs";
   ui.inputChip.classList.toggle("muted", !ready);
   ui.imageTopic.textContent = source.image_topic;
-  ui.infoTopic.textContent = source.camera_info_topic;
+  ui.intrinsicFile.textContent = source.intrinsic_file;
   ui.posePrefix.textContent = source.pose_prefix;
   ui.outputFile.textContent = serverState.output_file;
   if (serverState.frame) {

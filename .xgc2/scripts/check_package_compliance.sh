@@ -112,6 +112,21 @@ if grep -Eq 'camera_info_topic|_camera_info_topic' \
   echo "extrinsic calibration retained the removed CameraInfo topic contract" >&2
   exit 1
 fi
+if grep -Eq 'camera_info_(topic|ready)|CameraInfo|info-topic' \
+  web-src/src/extrinsic-legacy.ts web-src/src/main.tsx \
+  xgc_camera_calibration/src/xgc_camera_calibration/web_service.py; then
+  echo "extrinsic WebUI retained the removed CameraInfo compatibility state" >&2
+  exit 1
+fi
+if grep -Eq '<arg name="(output_file|references_dir)"|<param name="(output_file|references_dir)"' \
+  xgc_camera_calibration/launch/intrinsic_calibrator.launch; then
+  echo "intrinsic launch retained ignored output/reference compatibility parameters" >&2
+  exit 1
+fi
+for required_arg in calibration_root calibration_mode camera_name; do
+  grep -q "<arg name=\"${required_arg}\" />" \
+    xgc_camera_calibration/launch/intrinsic_calibrator.launch
+done
 grep -q 'CompressedImage' xgc_camera_calibration/scripts/extrinsic_calibrator_web.py
 grep -q 'wait_for_message' xgc_camera_calibration/scripts/extrinsic_calibrator_web.py
 if grep -q 'Subscriber(.*self.image_topic' \

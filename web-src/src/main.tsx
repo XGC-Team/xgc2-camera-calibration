@@ -312,7 +312,7 @@ function ExtrinsicPage() {
                   <summary>ROS and output details</summary>
                   <DescriptionList className="calibration-description-list">
                     <DescriptionItem label="Image" value={<span id="image-topic">—</span>} />
-                    <DescriptionItem label="CameraInfo" value={<span id="info-topic">—</span>} />
+                    <DescriptionItem label="Intrinsic file" value={<span id="intrinsic-file">—</span>} />
                     <DescriptionItem label="Pose prefix" value={<span id="pose-prefix">—</span>} />
                     <DescriptionItem label="Output" value={<span id="output-file">—</span>} />
                   </DescriptionList>
