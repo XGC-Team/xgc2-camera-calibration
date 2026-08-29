@@ -65,6 +65,16 @@ class IntrinsicSolverTest(unittest.TestCase):
         self.assertTrue(solver.is_new_sample((0.9, 0.1, 0.35, 0.2), params))
         self.assertFalse(solver.is_new_sample(params[0], params))
 
+    def test_aprilgrid_xy_coverage_uses_visible_board_extent(self):
+        left = np.array([[10, 100], [310, 100], [310, 500], [10, 500]], np.float32)
+        right = left + np.array([680, 0], np.float32)
+        left_params = solver._coverage_params_from_points(left, 1000, 600)
+        right_params = solver._coverage_params_from_points(right, 1000, 600)
+        self.assertLess(left_params[0], 0.02)
+        self.assertGreater(right_params[0], 0.98)
+        bars, _ = solver.coverage([left_params, right_params])
+        self.assertEqual(bars[0]["progress"], 1.0)
+
     def test_next_view_guidance_uses_history_to_name_the_missing_direction(self):
         self.assertEqual(solver.next_view_guidance([]), {
             "complete": False, "dimension": None, "direction": "center", "progress": 0.0,

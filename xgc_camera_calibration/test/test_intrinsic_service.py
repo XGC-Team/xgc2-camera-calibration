@@ -9,6 +9,7 @@ import urllib.request
 from http import HTTPStatus
 from pathlib import Path
 from time import monotonic, sleep
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import cv2
@@ -66,14 +67,22 @@ class FakeCameraControl:
             return None
         return self.current_pose["position"]
 
+    def current_optical_pose(self):
+        if self.current_pose is None:
+            return None
+        return {
+            "position": tuple(self.current_pose["position"]),
+            "orientation": (0.0, 0.0, 0.0, 1.0),
+        }
+
 
 class IntrinsicServiceTest(unittest.TestCase):
     def test_90_degree_simulation_sweep_stays_high_and_near(self):
         views = recommended_views((2.0, 0.0, 2.2))
         near = next(view for view in views if view["name"] == "near maximum")
         oblique_high = next(view for view in views if view["name"] == "oblique high")
-        self.assertEqual(near["position"], [0.9, 0.0, 2.2])
-        self.assertEqual(oblique_high["position"], [0.55, 0.45, 2.65])
+        self.assertEqual(near["position"], [0.05, 0.0, 2.2])
+        self.assertEqual(oblique_high["position"], [-0.2, 0.35, 2.55])
         self.assertEqual(len({tuple(view["position"]) for view in views}), len(views))
         self.assertGreaterEqual(min(view["position"][2] for view in views), 1.75)
         self.assertLessEqual(max(view["position"][2] for view in views), 2.65)
@@ -84,7 +93,8 @@ class IntrinsicServiceTest(unittest.TestCase):
         left = next(view for view in views if view["name"] == "left edge")
         near = next(view for view in views if view["name"] == "near maximum")
         self.assertEqual(left["position"], [0.8, 0.02, 2.2])
-        self.assertEqual(near["position"], [1.55, 0.0, 2.2])
+        self.assertEqual(left["yaw_offset"], -0.46)
+        self.assertEqual(near["position"], [1.2, 0.0, 2.2])
         self.assertGreaterEqual(min(view["position"][2] for view in views), 2.01)
         self.assertEqual(len({tuple(view["position"]) for view in views}), len(views))
 
@@ -117,6 +127,28 @@ class IntrinsicServiceTest(unittest.TestCase):
             self.assertFalse(state["detection"]["duplicate"])
             self.assertEqual([metric["label"] for metric in state["detection"]["metrics"]], ["X", "Y", "Size", "Skew"])
             self.assertTrue(service.image_jpeg().startswith(b"\xff\xd8"))
+
+    def test_simulation_alignment_uses_the_captured_render_pose(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = make_service(Path(directory) / "intrinsics.yaml")
+            camera = FakeCameraControl()
+            service.attach_camera_control(camera)
+            target = service.views[0]["position"]
+            camera.current_pose = {"position": list(target)}
+            service.attach_frame_capture(lambda: SimpleNamespace(
+                bgr=render_board(), render_position=(99.0, 99.0, 99.0),
+                render_orientation=(0.0, 0.0, 0.0, 1.0),
+            ))
+            service._capture_frame()
+            self.assertFalse(service.target_done[0])
+            self.assertEqual(len(service.samples), 0)
+
+            service.attach_frame_capture(lambda: SimpleNamespace(
+                bgr=render_board(), render_position=tuple(target),
+                render_orientation=(0.0, 0.0, 0.0, 1.0),
+            ))
+            service._capture_frame()
+            self.assertTrue(service.target_done[0])
 
     def test_repeated_board_frame_reports_geometric_duplicate(self):
         with tempfile.TemporaryDirectory() as directory:

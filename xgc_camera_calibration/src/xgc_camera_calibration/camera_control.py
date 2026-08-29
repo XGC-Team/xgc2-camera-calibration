@@ -117,6 +117,28 @@ class GazeboCameraControl:
             return None
         return (float(pose.position.x), float(pose.position.y), float(pose.position.z))
 
+    def current_optical_pose(self):
+        from tf.transformations import quaternion_from_euler, quaternion_multiply
+
+        with self._lock:
+            pose = copy.deepcopy(self._latest_pose)
+        if pose is None:
+            return None
+        link_orientation = (
+            float(pose.orientation.x), float(pose.orientation.y),
+            float(pose.orientation.z), float(pose.orientation.w),
+        )
+        optical_orientation = quaternion_multiply(
+            link_orientation,
+            quaternion_from_euler(-math.pi / 2.0, 0.0, -math.pi / 2.0),
+        )
+        return {
+            "position": (
+                float(pose.position.x), float(pose.position.y), float(pose.position.z)
+            ),
+            "orientation": tuple(float(value) for value in optical_orientation),
+        }
+
     def _publish(self, pose):
         state = self._model_state_cls()
         state.model_name = self.model_name

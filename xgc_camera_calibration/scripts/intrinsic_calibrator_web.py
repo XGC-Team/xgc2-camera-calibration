@@ -101,7 +101,7 @@ def main():
         camera = maybe_camera_control(board_center)
         if camera is not None:
             service.attach_camera_control(camera)
-        service.attach_frame_capture(lambda: snapshot_client.capture().bgr)
+        service.attach_frame_capture(snapshot_client.capture)
         automatic_physical_capture = bool(
             rospy.get_param(
                 "~auto_capture", not bool(rospy.get_param("~camera_control", False))

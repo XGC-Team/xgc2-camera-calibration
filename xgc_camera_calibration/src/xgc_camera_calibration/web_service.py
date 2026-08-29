@@ -6,6 +6,7 @@ import json
 import math
 import mimetypes
 import threading
+import time
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -514,6 +515,33 @@ class CalibrationRequestHandler(BaseHTTPRequestHandler):
         encoded = json.dumps(payload, separators=(",", ":"), allow_nan=False).encode("utf-8")
         self._send_bytes(status, "application/json; charset=utf-8", encoded)
 
+    def _send_intrinsic_state_events(self) -> None:
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        origin = self._origin()
+        if origin:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+        self.end_headers()
+        previous = b""
+        event_id = 0
+        while True:
+            payload = json.dumps(
+                self._intrinsic().state(), separators=(",", ":"), allow_nan=False
+            ).encode("utf-8")
+            if payload != previous:
+                event_id += 1
+                self.wfile.write(
+                    "id: {}\nevent: state\ndata: ".format(event_id).encode("ascii")
+                    + payload
+                    + b"\n\n"
+                )
+                self.wfile.flush()
+                previous = payload
+            time.sleep(0.25)
+
     def _send_error(self, error: ApiError) -> None:
         payload: Dict[str, Any] = {"error": error.message}
         if error.details:
@@ -582,6 +610,9 @@ class CalibrationRequestHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/v1/intrinsic/state":
                 self._send_json(HTTPStatus.OK, self._intrinsic().state())
+                return
+            if path == "/api/v1/intrinsic/events":
+                self._send_intrinsic_state_events()
                 return
             if path == "/api/v1/intrinsic/image.jpg":
                 self._send_bytes(HTTPStatus.OK, "image/jpeg", self._intrinsic().image_jpeg())

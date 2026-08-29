@@ -17,6 +17,7 @@ camera through the catalogue (goto / auto-run / reset).
 from __future__ import annotations
 
 import json
+import math
 import os
 import tempfile
 import threading
@@ -62,31 +63,26 @@ def recommended_views(
             ty + dy * view_scale,
             tz + dz * view_scale,
         )
-    # Measured against the product's 1280x720, 90-degree field-calibration
-    # profile.  Near views make the official tags decodable; yaw/pitch offsets
-    # move the visible subset to all image edges, roll fills skew, and oblique
-    # positions add real perspective.  Even at the legacy 1.6 m extent the
-    # lowest camera remains 1.75 m high for the default 2.2 m board centre.
+    # Tuned for the product's 1280x720, 90-degree field-calibration profile.
+    # Keep the whole plate (or all but a narrow border) visible at the four
+    # coverage extremes.  The former 33-45 degree aim offsets left only a few
+    # tags in most frames even though the coverage heuristic eventually passed.
     specs = [
-        # The lateral extremes are deliberately farther from the plate than
-        # the size views.  At the 0.66 m field target this keeps at least six
-        # complete tags inside the frame while their mean centres still land
-        # at x~=0.15 and x~=0.85, satisfying the ROS 0.70 X-range gate.
-        ("left edge", position(-2.91, 0.05, 0.00), -0.78, 0.00, 0.12),
-        ("right edge", position(-2.91, -0.05, 0.00), 0.76, 0.00, 0.00),
-        ("lower edge", position(-2.42, 0.00, 0.00), 0.00, -0.57, 0.00),
-        ("upper edge", position(-2.40, 0.03, 0.00), 0.00, 0.60, 0.00),
-        ("left edge tilted", position(-1.50, 0.10, -0.10), -0.70, 0.00, 0.12),
-        ("right edge tilted", position(-1.50, -0.10, -0.08), 0.70, 0.00, -0.12),
-        ("lower edge tilted", position(-2.35, 0.05, 0.02), 0.00, -0.50, 0.00),
-        ("upper edge tilted", position(-2.35, -0.05, -0.02), 0.00, 0.50, 0.00),
-        ("center face", position(-1.65, 0.00, 0.00), 0.00, 0.00, 0.00),
-        ("near large", position(-1.30, 0.00, 0.00), 0.00, 0.00, 0.00),
-        ("near maximum", position(-1.10, 0.00, 0.00), 0.00, 0.00, 0.00),
-        ("clockwise skew", position(-1.45, 0.04, 0.04), 0.00, 0.00, 0.46),
-        ("counter-clockwise skew", position(-1.45, -0.04, -0.04), 0.00, 0.00, -0.46),
-        ("oblique high", position(-1.45, 0.45, 0.45), 0.00, 0.00, 0.28),
-        ("oblique low", position(-1.45, -0.45, -0.45), 0.00, 0.00, -0.28),
+        ("left edge", position(-2.91, 0.05, 0.00), -0.46, 0.00, 0.08),
+        ("right edge", position(-2.91, -0.05, 0.00), 0.46, 0.00, -0.08),
+        ("lower edge", position(-2.42, 0.00, 0.00), 0.00, -0.14, 0.00),
+        ("upper edge", position(-2.42, 0.03, 0.00), 0.00, 0.13, 0.00),
+        ("left edge tilted", position(-2.20, 0.15, -0.10), -0.24, 0.00, 0.18),
+        ("right edge tilted", position(-2.20, -0.15, -0.08), 0.24, 0.00, -0.18),
+        ("lower edge tilted", position(-2.42, 0.05, 0.02), 0.00, -0.06, 0.10),
+        ("upper edge tilted", position(-2.42, -0.05, -0.02), 0.00, 0.06, -0.10),
+        ("center face", position(-2.30, 0.00, 0.00), 0.00, 0.00, 0.00),
+        ("near large", position(-2.10, 0.00, 0.00), 0.00, 0.00, 0.00),
+        ("near maximum", position(-1.95, 0.00, 0.00), 0.00, 0.00, 0.00),
+        ("clockwise skew", position(-2.20, 0.04, 0.04), 0.00, 0.00, 0.46),
+        ("counter-clockwise skew", position(-2.20, -0.04, -0.04), 0.00, 0.00, -0.46),
+        ("oblique high", position(-2.20, 0.35, 0.35), 0.00, 0.00, 0.28),
+        ("oblique low", position(-2.20, -0.35, -0.35), 0.00, 0.00, -0.28),
     ]
     return [{
         "name": name,
@@ -533,7 +529,12 @@ class IntrinsicCalibrationService:
                 best_distance, best_index = distance, index
         return best_index, best_distance
 
-    def _mark_aligned(self, display: np.ndarray) -> None:
+    def _mark_aligned(
+        self,
+        display: np.ndarray,
+        render_position: Optional[Sequence[float]] = None,
+        render_orientation: Optional[Sequence[float]] = None,
+    ) -> None:
         """Green the nearest target once the camera aligns to it and the board is
         visible this frame -- independent of whether this frame became a *new*
         sample (is_new_sample de-duplicates similar views, so a
@@ -542,7 +543,9 @@ class IntrinsicCalibrationService:
         """
         if self._recording or self.camera is None:
             return
-        position = self.camera.current_position()
+        if not self._render_pose_matches_camera(render_position, render_orientation):
+            return
+        position = tuple(render_position) if render_position is not None else self.camera.current_position()
         if position is None:
             return
         index = None
@@ -565,13 +568,42 @@ class IntrinsicCalibrationService:
         if ok:
             self._save_ref(index, encoded.tobytes())
 
+    def _render_pose_matches_camera(
+        self,
+        render_position: Optional[Sequence[float]],
+        render_orientation: Optional[Sequence[float]],
+    ) -> bool:
+        if render_position is None or render_orientation is None or self.camera is None:
+            return True
+        current_optical_pose = getattr(self.camera, "current_optical_pose", None)
+        if not callable(current_optical_pose):
+            return True
+        current = current_optical_pose()
+        if current is None:
+            return False
+        position_error = sum(
+            (float(render_position[index]) - float(current["position"][index])) ** 2
+            for index in range(3)
+        ) ** 0.5
+        dot = abs(sum(
+            float(render_orientation[index]) * float(current["orientation"][index])
+            for index in range(4)
+        ))
+        angle_error = 2.0 * math.acos(min(1.0, max(0.0, dot)))
+        return position_error <= 0.12 and angle_error <= 0.04
+
     def _encode_jpeg(self, image: np.ndarray) -> bytes:
         ok, encoded = cv2.imencode(".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality])
         if not ok:
             raise ApiError(HTTPStatus.INTERNAL_SERVER_ERROR, "Could not encode camera frame")
         return encoded.tobytes()
 
-    def process_frame(self, bgr: np.ndarray) -> None:
+    def process_frame(
+        self,
+        bgr: np.ndarray,
+        render_position: Optional[Sequence[float]] = None,
+        render_orientation: Optional[Sequence[float]] = None,
+    ) -> None:
         """Ingest one decoded BGR frame: detect the board, auto-collect, annotate."""
         if bgr.ndim != 3 or bgr.shape[2] != 3:
             return
@@ -622,7 +654,10 @@ class IntrinsicCalibrationService:
                         )
                 else:
                     cv2.drawChessboardCorners(display, self.board_size, scaled, True)
-                if self.result is None:
+                pose_matches = self._render_pose_matches_camera(
+                    render_position, render_orientation
+                )
+                if self.result is None and pose_matches:
                     accepted = intrinsic_solver.is_new_sample(
                         params, self.samples, self.sample_distance
                     )
@@ -635,7 +670,7 @@ class IntrinsicCalibrationService:
                             self._save_checkpoint_locked()
                         except Exception as error:
                             self._recovery_error = str(error) or error.__class__.__name__
-                self._mark_aligned(display)
+                self._mark_aligned(display, render_position, render_orientation)
                 self.latest_detection = {
                     "status": "detected",
                     "corner_count": int(len(corners)),
@@ -799,12 +834,16 @@ class IntrinsicCalibrationService:
                     HTTPStatus.SERVICE_UNAVAILABLE,
                     "Could not capture a calibration frame: {}".format(error),
                 ) from error
+            render_position = getattr(frame, "render_position", None)
+            render_orientation = getattr(frame, "render_orientation", None)
+            if not isinstance(frame, np.ndarray):
+                frame = getattr(frame, "bgr", None)
             if not isinstance(frame, np.ndarray):
                 raise ApiError(
                     HTTPStatus.SERVICE_UNAVAILABLE,
                     "Calibration frame source returned no image",
                 )
-            self.process_frame(frame)
+            self.process_frame(frame, render_position, render_orientation)
         with self.lock:
             return {"ok": True, "samples": len(self.samples)}
 
@@ -838,8 +877,8 @@ class IntrinsicCalibrationService:
     def auto_run(self, settle: float = 1.3) -> Dict[str, Any]:
         """Start a background sweep through every recommended sample view.
 
-        The HTTP transport must remain responsive while the camera dwells at
-        each pose.  State polling exposes the authoritative in-flight action;
+        The HTTP transport remains responsive while the camera dwells at each
+        pose. The state event stream exposes the authoritative in-flight action;
         mutating operator actions are rejected until the sweep finishes.
         """
         if float(settle) < 0.0:
@@ -906,6 +945,13 @@ class IntrinsicCalibrationService:
                         with self.lock:
                             detected_at_target = self.target_done[index]
                         if detected_at_target:
+                            # The snapshot that proves this target also asks
+                            # the media source for an H264 keyframe. One more
+                            # same-pose capture drains the encoder's preceding
+                            # frame without adding a duplicate calibration
+                            # sample, so WebRTC and the annotated preview agree
+                            # before the sweep advances to the next target.
+                            self._capture_frame()
                             break
                         if attempt < 3:
                             time.sleep(0.35)

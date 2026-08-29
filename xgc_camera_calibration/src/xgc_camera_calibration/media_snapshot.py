@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, Sequence
+from typing import Any, Dict, Optional, Sequence, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlsplit
 from urllib.request import Request, urlopen
@@ -43,6 +43,8 @@ class MediaSnapshot:
     distortion: np.ndarray
     jpeg: bytes
     bgr: np.ndarray
+    render_position: Optional[Tuple[float, float, float]] = None
+    render_orientation: Optional[Tuple[float, float, float, float]] = None
 
 
 class MediaSnapshotClient:
@@ -117,6 +119,8 @@ class MediaSnapshotClient:
                 distortion=np.asarray(parsed["distortion"], dtype=np.float64),
                 jpeg=jpeg,
                 bgr=bgr,
+                render_position=parsed["render_position"],
+                render_orientation=parsed["render_orientation"],
             )
         finally:
             # Deletion is best-effort: a failed cleanup still expires quickly
@@ -146,6 +150,7 @@ class MediaSnapshotClient:
         pixel_format = value.get("pixelFormat")
         matrix = value.get("cameraMatrix")
         distortion = value.get("distortion")
+        render_pose = value.get("renderPose")
         if source_id != self.source_id or not isinstance(frame_id, str) or not frame_id:
             raise MediaSnapshotError("media snapshot source metadata is invalid")
         if not isinstance(width, int) or not isinstance(height, int) or not (16 <= width <= 8192 and 16 <= height <= 8192):
@@ -160,6 +165,24 @@ class MediaSnapshotClient:
             raise MediaSnapshotError("media snapshot pixel format is invalid")
         if not _finite_vector(matrix, 9) or not _finite_vector(distortion, 4):
             raise MediaSnapshotError("media snapshot camera metadata is invalid")
+        render_position = None
+        render_orientation = None
+        if render_pose is not None:
+            if (
+                not isinstance(render_pose, dict)
+                or not _finite_xyz(render_pose.get("position"))
+                or not _finite_xyzw(render_pose.get("orientation"))
+            ):
+                raise MediaSnapshotError("media snapshot render pose is invalid")
+            position = render_pose["position"]
+            orientation = render_pose["orientation"]
+            render_position = (
+                float(position["x"]), float(position["y"]), float(position["z"])
+            )
+            render_orientation = (
+                float(orientation["x"]), float(orientation["y"]),
+                float(orientation["z"]), float(orientation["w"]),
+            )
         return {
             "id": snapshot_id,
             "source_id": source_id,
@@ -169,6 +192,8 @@ class MediaSnapshotClient:
             "height": height,
             "camera_matrix": matrix,
             "distortion": distortion,
+            "render_position": render_position,
+            "render_orientation": render_orientation,
         }
 
     def _validate_raw_headers(self, headers: Any, metadata: Dict[str, Any]) -> None:
@@ -225,6 +250,18 @@ def _finite_vector(value: Any, minimum: int) -> bool:
     except (TypeError, ValueError):
         return False
     return array.ndim == 1 and bool(np.all(np.isfinite(array)))
+
+
+def _finite_xyz(value: Any) -> bool:
+    if not isinstance(value, dict) or set(value) != {"x", "y", "z"}:
+        return False
+    return _finite_vector([value["x"], value["y"], value["z"]], 3)
+
+
+def _finite_xyzw(value: Any) -> bool:
+    if not isinstance(value, dict) or set(value) != {"x", "y", "z", "w"}:
+        return False
+    return _finite_vector([value["x"], value["y"], value["z"], value["w"]], 4)
 
 
 def _http_error_message(error: HTTPError) -> str:

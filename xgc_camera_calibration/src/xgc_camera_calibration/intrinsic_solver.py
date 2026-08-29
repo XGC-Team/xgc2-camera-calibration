@@ -657,14 +657,20 @@ def _coverage_params_from_points(
         return (0.5, 0.5, 0.0, 0.0)
     mean_x = float(np.mean(points[:, 0]))
     mean_y = float(np.mean(points[:, 1]))
+    span_x = float(np.max(points[:, 0]) - np.min(points[:, 0]))
+    span_y = float(np.max(points[:, 1]) - np.min(points[:, 1]))
     hull = cv2.convexHull(points)
     area = float(cv2.contourArea(hull))
     rect = cv2.minAreaRect(points)
     angle = abs(float(rect[2]))
     if angle > 45.0:
         angle = 90.0 - angle
-    p_x = min(1.0, max(0.0, mean_x / max(1.0, float(width))))
-    p_y = min(1.0, max(0.0, mean_y / max(1.0, float(height))))
+    # Match the checkerboard/ROS coverage meaning: zero and one represent the
+    # board touching the two image edges, not its centroid leaving the frame.
+    # Without the visible-span correction a large AprilGrid had to be mostly
+    # cropped before X/Y could ever reach the 0.70 range gate.
+    p_x = min(1.0, max(0.0, (mean_x - span_x / 2.0) / max(1.0, float(width) - span_x)))
+    p_y = min(1.0, max(0.0, (mean_y - span_y / 2.0) / max(1.0, float(height) - span_y)))
     p_size = math.sqrt(area / float(width * height)) if area > 0 else 0.0
     p_skew = min(1.0, angle / 45.0)
     return (p_x, p_y, p_size, p_skew)

@@ -35,6 +35,10 @@ class FakeMediaEdge:
                 0.0, 0.0, 1.0,
             ],
             "distortion": [0.1, -0.2, 0.01, -0.01, 0.0],
+            "renderPose": {
+                "position": {"x": 1.2, "y": -0.3, "z": 2.1},
+                "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+            },
         }
         self.server = None
         self.thread = None
@@ -147,6 +151,8 @@ class MediaSnapshotClientTest(unittest.TestCase):
         self.assertEqual(snapshot.jpeg, edge.jpeg)
         self.assertEqual(snapshot.bgr.shape, (16, 16, 3))
         self.assertEqual(snapshot.bgr[0, 0].tolist(), [30, 20, 10])
+        self.assertEqual(snapshot.render_position, (1.2, -0.3, 2.1))
+        self.assertEqual(snapshot.render_orientation, (0.0, 0.0, 0.0, 1.0))
         np.testing.assert_allclose(
             snapshot.camera_matrix,
             np.asarray(edge.metadata["cameraMatrix"]).reshape(3, 3),
