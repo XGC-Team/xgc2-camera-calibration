@@ -33,6 +33,11 @@ _VIEWS = (
     ("undistorted", "Undistorted", "The same snapshot after applying the selected K/D model."),
 )
 
+_LABEL_SURFACE_BGR = (20, 22, 24)  # XGC dark surface #181614.
+_LABEL_BORDER_BGR = (46, 51, 56)  # XGC dark border #38332e.
+_LABEL_ACCENT_BGR = (111, 160, 208)  # XGC dark accent #d0a06f.
+_LABEL_TEXT_BGR = (220, 228, 233)  # XGC dark heading text #e9e4dc.
+
 
 def generate_intrinsic_validation(
     raw: np.ndarray,
@@ -72,12 +77,13 @@ def generate_intrinsic_validation(
         checker[:, x] = (checker[:, x] * 0.45 + (40, 40, 40)).astype(np.uint8)
     for y in range(tile, height, tile):
         checker[y, :] = (checker[y, :] * 0.45 + (40, 40, 40)).astype(np.uint8)
+    label(checker, "RAW EVEN  /  UNDISTORT ODD")
 
     red_cyan = np.zeros_like(image)
     red_cyan[:, :, 2] = image[:, :, 2]
     red_cyan[:, :, 1] = undistorted[:, :, 1]
     red_cyan[:, :, 0] = undistorted[:, :, 0]
-    label(red_cyan, "RAW red + UNDISTORT cyan", (0, 255, 255))
+    label(red_cyan, "RAW RED  /  UNDISTORT CYAN")
 
     difference = cv2.absdiff(image, undistorted)
     amplified = np.clip(
@@ -87,7 +93,7 @@ def generate_intrinsic_validation(
     ).astype(np.uint8)
     difference_heatmap = cv2.applyColorMap(amplified, cv2.COLORMAP_INFERNO)
     difference_heatmap = cv2.addWeighted(image, 0.35, difference_heatmap, 0.65, 0)
-    label(difference_heatmap, "absolute difference x8", (255, 255, 255))
+    label(difference_heatmap, "ABSOLUTE DIFFERENCE  x8")
 
     magnitude_u8 = np.clip(
         magnitude / max(float(magnitude.max()), 1e-6) * 255.0,
@@ -95,13 +101,13 @@ def generate_intrinsic_validation(
         255,
     ).astype(np.uint8)
     displacement = cv2.applyColorMap(magnitude_u8, cv2.COLORMAP_JET)
-    label(displacement, "remap displacement magnitude", (255, 255, 255))
+    label(displacement, "REMAP DISPLACEMENT MAGNITUDE")
 
     compare = np.full((height, width * 2 + 8, 3), 24, np.uint8)
     compare[:, :width] = image
     compare[:, width + 8:] = undistorted
-    label(compare[:, :width], "raw", (0, 0, 255))
-    label(compare[:, width + 8:], "undistorted", (0, 220, 80))
+    label(compare[:, :width], "RAW")
+    label(compare[:, width + 8:], "UNDISTORTED")
 
     corner_detail = corner_zoom(image, undistorted, checker, magnitude)
     encoded = {}
@@ -198,9 +204,46 @@ def encode_jpeg(image: np.ndarray, quality: int) -> bytes:
     return encoded.tobytes()
 
 
-def label(image: np.ndarray, text: str, color: Tuple[int, int, int]) -> None:
+def label(image: np.ndarray, text: str) -> None:
+    """Burn a compact XGC-themed legend into an exported validation image."""
+    height, width = image.shape[:2]
+    font_scale = float(np.clip(min(width, height) / 900.0, 0.65, 1.35))
+    thickness = max(1, int(round(font_scale * 1.5)))
+    margin = max(8, int(round(12 * font_scale)))
+    padding_x = max(9, int(round(11 * font_scale)))
+    padding_y = max(6, int(round(7 * font_scale)))
+    accent_width = max(3, int(round(4 * font_scale)))
+    (text_width, text_height), baseline = cv2.getTextSize(
+        text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness
+    )
+    box_width = min(width - margin, accent_width + padding_x * 2 + text_width)
+    box_height = min(height - margin, padding_y * 2 + text_height + baseline)
+    if box_width <= 0 or box_height <= 0:
+        return
+
+    x0, y0 = margin, margin
+    x1, y1 = x0 + box_width, y0 + box_height
+    region = image[y0:y1, x0:x1]
+    surface = np.full_like(region, _LABEL_SURFACE_BGR)
+    cv2.addWeighted(surface, 0.84, region, 0.16, 0.0, region)
+    cv2.rectangle(image, (x0, y0), (x1 - 1, y1 - 1), _LABEL_BORDER_BGR, 1, cv2.LINE_AA)
+    cv2.rectangle(
+        image,
+        (x0 + 1, y0 + 1),
+        (min(x0 + accent_width, x1 - 1), y1 - 2),
+        _LABEL_ACCENT_BGR,
+        -1,
+        cv2.LINE_AA,
+    )
     cv2.putText(
-        image, text, (16, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.75, color, 2, cv2.LINE_AA
+        image,
+        text,
+        (x0 + accent_width + padding_x, y0 + padding_y + text_height),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        font_scale,
+        _LABEL_TEXT_BGR,
+        thickness,
+        cv2.LINE_AA,
     )
 
 
@@ -231,7 +274,7 @@ def corner_zoom(
     strip[:, :zoom_width] = panels[0]
     strip[:, zoom_width + gap:zoom_width * 2 + gap] = panels[1]
     strip[:, zoom_width * 2 + gap * 2:] = panels[2]
-    label(strip[:, :zoom_width], "RAW 3x", (0, 0, 255))
-    label(strip[:, zoom_width + gap:zoom_width * 2 + gap], "UNDISTORT 3x", (0, 220, 80))
-    label(strip[:, zoom_width * 2 + gap * 2:], "CHECKER 3x", (0, 200, 255))
+    label(strip[:, :zoom_width], "RAW 3x")
+    label(strip[:, zoom_width + gap:zoom_width * 2 + gap], "UNDISTORT 3x")
+    label(strip[:, zoom_width * 2 + gap * 2:], "CHECKER 3x")
     return strip
