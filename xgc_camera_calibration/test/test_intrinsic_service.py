@@ -25,6 +25,8 @@ from xgc_camera_calibration.web_service import ApiError, CalibrationHttpServer
 
 WEB_ROOT = Path(__file__).resolve().parents[1] / "web" / "intrinsic"
 WEB_SOURCE = Path(__file__).resolve().parents[2] / "web-src" / "src" / "intrinsic-legacy.ts"
+ENTRYPOINT = Path(__file__).resolve().parents[1] / "scripts" / "intrinsic_calibrator_web.py"
+WEB_SERVICE_SOURCE = Path(__file__).resolve().parents[1] / "src" / "xgc_camera_calibration" / "web_service.py"
 
 
 def render_board(cols_squares=8, rows_squares=6, square=40, border=40):
@@ -117,6 +119,16 @@ class IntrinsicServiceTest(unittest.TestCase):
         self.assertNotIn("setInterval(refreshImage", source)
         self.assertIn(".xgc-topbar", styles)
 
+    def test_entrypoint_runs_one_continuous_detector_for_both_camera_origins(self):
+        source = ENTRYPOINT.read_text(encoding="utf-8")
+        self.assertIn('rospy.get_param("~auto_capture", True)', source)
+        self.assertIn('rospy.get_param("~auto_capture_interval", 0.0)', source)
+        self.assertNotIn('rospy.get_param("~auto_capture", not bool(', source)
+        self.assertIn('rospy.get_param("~maximum_detect_width", display_width)', source)
+        self.assertIn('rospy.get_param("~detection_target_pixels", 640 * 480)', " ".join(source.split()))
+        self.assertIn('kwargs={"poll_interval": 0.05}', source)
+        self.assertIn("time.sleep(0.1)", WEB_SERVICE_SOURCE.read_text(encoding="utf-8"))
+
     def test_process_frame_collects_a_board_sample(self):
         with tempfile.TemporaryDirectory() as directory:
             service = make_service(Path(directory) / "intrinsics.yaml")
@@ -154,6 +166,108 @@ class IntrinsicServiceTest(unittest.TestCase):
             ))
             service._capture_frame()
             self.assertTrue(service.target_done[0])
+
+    def test_reduced_detection_frame_keeps_source_calibration_coordinates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = make_service(Path(directory) / "intrinsics.yaml")
+            frame = render_board()
+            reduced_height, reduced_width = frame.shape[:2]
+            service.attach_frame_capture(lambda: SimpleNamespace(
+                bgr=frame,
+                width=reduced_width * 4,
+                height=reduced_height * 4,
+            ))
+            service._capture_frame()
+            self.assertEqual(service.image_size, (reduced_width * 4, reduced_height * 4))
+            points = service.image_points[0].reshape(-1, 2)
+            self.assertGreater(float(points[:, 0].max()), float(reduced_width))
+            state = service.state()
+            self.assertEqual(state["detection"]["frame_width"], reduced_width * 4)
+            self.assertEqual(state["detection"]["frame_height"], reduced_height * 4)
+
+    def test_distinct_aprilgrid_sample_refines_on_source_jpeg_before_storage(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = IntrinsicCalibrationService(
+                board_size=(2, 2),
+                square=0.088,
+                output_file=str(Path(directory) / "intrinsics.yaml"),
+                board_type="aprilgrid",
+                tag_spacing=0.0264,
+                min_tags=4,
+            )
+            reduced = np.zeros((120, 160, 3), np.uint8)
+            source = np.zeros((480, 640, 3), np.uint8)
+            ok, encoded = cv2.imencode(".jpg", source)
+            self.assertTrue(ok)
+            corners = np.asarray(
+                [[20, 20], [40, 20], [40, 40], [20, 40]],
+                dtype=np.float32,
+            ).reshape(-1, 1, 2)
+            detection = intrinsic_solver.BoardDetection(
+                image_points=corners,
+                object_points=np.zeros((4, 3), np.float32),
+                coverage=(0.2, 0.3, 0.4, 0.5),
+                calibration_image_points=np.asarray([[[30, 30]]], np.float32),
+                calibration_object_points=np.zeros((1, 3), np.float32),
+            )
+            refined = np.asarray([[[123.0, 234.0]]], np.float32)
+            with patch.object(
+                intrinsic_solver, "detect_board", return_value=detection
+            ) as detect, patch.object(
+                intrinsic_solver,
+                "refine_aprilgrid_calibration_centers",
+                return_value=refined,
+            ) as refine:
+                service.process_frame(
+                    reduced,
+                    source_image_size=(640, 480),
+                    source_jpeg=encoded.tobytes(),
+                )
+            self.assertEqual(detect.call_args.args[2], 160)
+            self.assertEqual(refine.call_args.args[0].shape, (480, 640))
+            np.testing.assert_allclose(
+                refine.call_args.args[1].reshape(-1, 2),
+                corners.reshape(-1, 2) * 4.0,
+            )
+            np.testing.assert_allclose(service.image_points[0], refined)
+
+    def test_aprilgrid_candidate_redecodes_original_jpeg_for_adaptive_search(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = IntrinsicCalibrationService(
+                board_size=(2, 2), square=0.088,
+                output_file=str(Path(directory) / "intrinsics.yaml"),
+                board_type="aprilgrid", tag_spacing=0.0264, min_tags=4,
+            )
+            reduced = np.zeros((270, 480, 3), np.uint8)
+            source = np.zeros((1080, 1920, 3), np.uint8)
+            ok, encoded = cv2.imencode(".jpg", source)
+            self.assertTrue(ok)
+            corners = np.asarray(
+                [[100, 100], [140, 100], [140, 140], [100, 140]],
+                dtype=np.float32,
+            ).reshape(-1, 1, 2)
+            detection = intrinsic_solver.BoardDetection(
+                image_points=corners,
+                object_points=np.zeros((4, 3), np.float32),
+                coverage=(0.2, 0.3, 0.4, 0.5),
+                calibration_image_points=np.asarray([[[120, 120]]], np.float32),
+                calibration_object_points=np.zeros((1, 3), np.float32),
+            )
+            with patch.object(
+                intrinsic_solver, "detect_board", side_effect=[None, detection]
+            ) as detect, patch.object(
+                intrinsic_solver, "aprilgrid_has_candidate_evidence", return_value=True
+            ), patch.object(
+                intrinsic_solver, "refine_aprilgrid_calibration_centers",
+                return_value=np.asarray([[[180, 180]]], np.float32),
+            ):
+                service.process_frame(
+                    reduced,
+                    source_image_size=(1920, 1080),
+                    source_jpeg=encoded.tobytes(),
+                )
+            self.assertEqual([call.args[2] for call in detect.call_args_list], [480, 1920])
+            self.assertEqual(service.state()["detection"]["corner_count"], 4)
 
     def test_repeated_board_frame_reports_geometric_duplicate(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -205,7 +319,7 @@ class IntrinsicServiceTest(unittest.TestCase):
             self.assertFalse(state["camera_control"])
             self.assertEqual(state["auto_capture"], {
                 "enabled": False,
-                "interval_seconds": 0.5,
+                "interval_seconds": 0.0,
                 "last_error": None,
                 "coverage_complete": False,
             })
@@ -249,12 +363,13 @@ class IntrinsicServiceTest(unittest.TestCase):
             self.assertTrue(state["result_restored"])
             self.assertEqual(state["samples"], 40)
             self.assertAlmostEqual(state["result"]["fx"], 638.0)
-            self.assertFalse(restored.start_auto_capture(interval=0.1)["auto_capture"]["enabled"])
+            self.assertTrue(restored.start_auto_capture(interval=0.1)["auto_capture"]["enabled"])
+            restored.stop_auto_capture()
 
             restored.reset()
             self.assertFalse(output.exists())
 
-    def test_physical_auto_capture_collects_without_manual_click_and_stops_when_ready(self):
+    def test_continuous_detection_keeps_running_after_coverage_is_ready(self):
         with tempfile.TemporaryDirectory() as directory:
             service = make_service(Path(directory) / "intrinsics.yaml")
             service.attach_frame_capture(lambda: render_board())
@@ -269,12 +384,72 @@ class IntrinsicServiceTest(unittest.TestCase):
                 started = service.start_auto_capture(interval=0.1)
                 self.assertTrue(started["auto_capture"]["enabled"])
                 deadline = monotonic() + 2.0
-                while service.state()["auto_capture"]["enabled"] and monotonic() < deadline:
+                while not service.state()["auto_capture"]["coverage_complete"] and monotonic() < deadline:
                     sleep(0.01)
             state = service.state()
             self.assertEqual(state["samples"], 1)
             self.assertTrue(state["auto_capture"]["coverage_complete"])
-            self.assertFalse(state["auto_capture"]["enabled"])
+            first_sequence = state["detection"]["sequence"]
+            deadline = monotonic() + 1.0
+            while service.state()["detection"]["sequence"] <= first_sequence and monotonic() < deadline:
+                sleep(0.01)
+            self.assertGreater(service.state()["detection"]["sequence"], first_sequence)
+            self.assertTrue(service.state()["auto_capture"]["enabled"])
+            service.stop_auto_capture()
+
+    def test_simulation_and_physical_share_continuous_detection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = make_service(Path(directory) / "intrinsics.yaml")
+            service.attach_camera_control(FakeCameraControl())
+            service.attach_frame_capture(lambda: render_board())
+            service.start_auto_capture(interval=0.1)
+            deadline = monotonic() + 1.0
+            while service.state()["detection"]["sequence"] < 3 and monotonic() < deadline:
+                sleep(0.01)
+            self.assertGreaterEqual(service.state()["detection"]["sequence"], 3)
+            self.assertTrue(service.state()["auto_capture"]["enabled"])
+            service.stop_auto_capture()
+
+    def test_continuous_detector_uses_fixed_start_cadence_without_backlog(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = make_service(Path(directory) / "intrinsics.yaml")
+            starts = []
+
+            def capture():
+                starts.append(monotonic())
+                sleep(0.04)
+                return np.full((200, 320, 3), 127, np.uint8)
+
+            service.attach_frame_capture(capture)
+            service.start_auto_capture(interval=0.1)
+            deadline = monotonic() + 1.5
+            while len(starts) < 5 and monotonic() < deadline:
+                sleep(0.01)
+            service.stop_auto_capture()
+            self.assertGreaterEqual(len(starts), 5)
+            periods = [right - left for left, right in zip(starts, starts[1:])]
+            self.assertLess(max(periods[:4]), 0.13)
+
+    def test_continuous_detector_has_no_artificial_success_delay(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = make_service(Path(directory) / "intrinsics.yaml")
+            starts = []
+
+            def capture():
+                starts.append(monotonic())
+                sleep(0.02)
+                return np.full((200, 320, 3), 127, np.uint8)
+
+            service.attach_frame_capture(capture)
+            with patch.object(service, "process_frame", return_value=None):
+                service.start_auto_capture()
+                deadline = monotonic() + 1.0
+                while len(starts) < 5 and monotonic() < deadline:
+                    sleep(0.01)
+                service.stop_auto_capture()
+            self.assertGreaterEqual(len(starts), 5)
+            periods = [right - left for left, right in zip(starts, starts[1:])]
+            self.assertLess(max(periods[:4]), 0.05)
 
     def test_physical_auto_capture_does_not_retain_invalid_frames(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -308,18 +483,13 @@ class IntrinsicServiceTest(unittest.TestCase):
             camera = FakeCameraControl()
             service.attach_camera_control(camera)
             service.attach_frame_capture(lambda: render_board())
+            service.start_auto_capture(interval=0.1)
 
             bars = [{"label": label, "progress": 1.0} for label in ("X", "Y", "Size", "Skew")]
-            def capture_at_current_target():
-                with service.lock:
-                    index = service.action["target_index"]
-                    service.target_done[index] = True
-                return {"ok": True, "samples": 15}
-
             with patch(
                 "xgc_camera_calibration.intrinsic_service.intrinsic_solver.coverage",
                 return_value=(bars, True),
-            ), patch.object(service, "_capture_frame", side_effect=capture_at_current_target), patch.object(
+            ), patch.object(
                 service, "_calibrate_locked", return_value={"output_file": str(Path(directory) / "intrinsics.yaml")}
             ):
                 started = monotonic()
@@ -339,12 +509,13 @@ class IntrinsicServiceTest(unittest.TestCase):
                     self.assertEqual(caught.exception.status, int(HTTPStatus.CONFLICT))
                     self.assertIn("already running", caught.exception.message)
 
-                deadline = monotonic() + 2.0
+                deadline = monotonic() + 4.0
                 while service.state()["action"]["status"] == "running" and monotonic() < deadline:
                     sleep(0.01)
             self.assertEqual(service.state()["action"]["status"], "succeeded")
             self.assertEqual(len(camera.positions), 15)
             self.assertTrue(all(target["done"] for target in service.state()["targets"]))
+            service.stop_auto_capture()
             self.assertEqual(service.reset()["samples"], 0)
             self.assertIsNone(service.state()["action"])
 
@@ -352,18 +523,18 @@ class IntrinsicServiceTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             service = make_service(Path(directory) / "intrinsics.yaml")
             service.attach_camera_control(FakeCameraControl())
-            service.attach_frame_capture(lambda: render_board())
-            with patch.object(service, "_capture_frame", return_value={"ok": True, "samples": 0}), patch(
-                "xgc_camera_calibration.intrinsic_service.time.sleep", return_value=None,
-            ):
-                service.auto_run(settle=0)
+            service.attach_frame_capture(lambda: np.full((200, 320, 3), 127, np.uint8))
+            service.start_auto_capture(interval=0.1)
+            with patch("xgc_camera_calibration.intrinsic_service.time.sleep", return_value=None):
+                service.auto_run(settle=0, detection_timeout=0.2)
                 deadline = monotonic() + 1.0
                 while service.state()["action"]["status"] == "running" and monotonic() < deadline:
                     sleep(0.01)
             action = service.state()["action"]
             self.assertEqual(action["status"], "failed")
             self.assertIn("left edge", action["error"])
-            self.assertIn("could not detect", action["error"])
+            self.assertIn("continuous detection could not find", action["error"])
+            service.stop_auto_capture()
 
     def test_auto_run_camera_failure_is_reported_and_recoverable(self):
         class FailingCameraControl(FakeCameraControl):
@@ -373,6 +544,8 @@ class IntrinsicServiceTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             service = make_service(Path(directory) / "intrinsics.yaml")
             service.attach_camera_control(FailingCameraControl())
+            service.attach_frame_capture(lambda: render_board())
+            service.start_auto_capture(interval=0.1)
             service.auto_run(settle=0)
             deadline = monotonic() + 1.0
             while service.state()["action"]["status"] == "running" and monotonic() < deadline:
@@ -380,6 +553,7 @@ class IntrinsicServiceTest(unittest.TestCase):
             action = service.state()["action"]
             self.assertEqual(action["status"], "failed")
             self.assertIn("rejected the pose", action["error"])
+            service.stop_auto_capture()
             self.assertEqual(service.reset()["samples"], 0)
             self.assertIsNone(service.state()["action"])
 
@@ -387,12 +561,15 @@ class IntrinsicServiceTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             service = make_service(Path(directory) / "intrinsics.yaml")
             service.attach_camera_control(FakeCameraControl())
+            service.attach_frame_capture(lambda: render_board())
+            service.start_auto_capture(interval=0.1)
             with patch("xgc_camera_calibration.intrinsic_service.threading.Thread") as constructor:
                 constructor.return_value.start.side_effect = RuntimeError("thread unavailable")
                 with self.assertRaises(ApiError) as caught:
                     service.auto_run()
             self.assertEqual(caught.exception.status, int(HTTPStatus.INTERNAL_SERVER_ERROR))
             self.assertEqual(service.state()["action"]["status"], "failed")
+            service.stop_auto_capture()
             self.assertEqual(service.reset()["samples"], 0)
             self.assertIsNone(service.state()["action"])
 

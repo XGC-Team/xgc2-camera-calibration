@@ -2,13 +2,16 @@
 
 The live video path is WebRTC in the browser.  Calibration is intentionally a
 different operation: an algorithm asks the co-located Media Edge for one
-immutable RGB8 frame, consumes it, then releases it.  This module never polls
-JPEG previews and never creates a ROS image subscriber.
+immutable snapshot, consumes it, then releases it. Continuous intrinsic
+detection requests a fresh JPEG without RGB; operations that truly require raw
+pixels can still request RGB8. This module never polls JPEG previews and never
+creates a ROS image subscriber.
 """
 
 from __future__ import annotations
 
 import json
+import math
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Sequence, Tuple
@@ -31,7 +34,7 @@ class MediaSnapshotError(RuntimeError):
 
 @dataclass(frozen=True)
 class MediaSnapshot:
-    """One RGB frame and the camera metadata produced by the same render pass."""
+    """One decoded working frame and source metadata from the same snapshot."""
 
     id: str
     source_id: str
@@ -77,9 +80,11 @@ class MediaSnapshotClient:
         if not isinstance(payload, dict):
             raise MediaSnapshotError("media edge health response is invalid")
         sources = payload.get("sources")
-        if not isinstance(sources, list) or not any(
-            isinstance(item, dict) and item.get("id") == self.source_id for item in sources
-        ):
+        source = next((
+            item for item in sources
+            if isinstance(item, dict) and item.get("id") == self.source_id
+        ), None) if isinstance(sources, list) else None
+        if source is None:
             raise MediaSnapshotError("configured media source is unavailable")
         return payload
 
@@ -90,24 +95,55 @@ class MediaSnapshotClient:
         important at 4K: it releases the ~24 MiB RGB transaction immediately
         instead of waiting for TTL-based cleanup.
         """
+        return self._capture(include_rgb=True, maximum_pixels=None)
+
+    def capture_detection(self, maximum_pixels: int = 640 * 480) -> MediaSnapshot:
+        """Capture one fresh JPEG-only frame near the detector pixel budget.
+
+        Source metadata and camera intrinsics retain their original dimensions;
+        only ``bgr`` is reduced. This avoids the 4K RGB payload, preserves the
+        source aspect ratio at an approximately VGA budget, and lets the
+        calibration service map detected corners back to the source plane.
+        """
+        if (
+            not isinstance(maximum_pixels, int)
+            or isinstance(maximum_pixels, bool)
+            or maximum_pixels < 64 * 64
+        ):
+            raise ValueError("maximum detection pixels must be an integer of at least 4096")
+        return self._capture(include_rgb=False, maximum_pixels=maximum_pixels)
+
+    def _capture(self, include_rgb: bool, maximum_pixels: Optional[int]) -> MediaSnapshot:
+        request = b"{}" if include_rgb else json.dumps(
+            {"includeRgb": False, "requestKeyframe": False, "requireFresh": True},
+            separators=(",", ":"),
+        ).encode("utf-8")
         metadata = self._json(
             "POST",
             "/api/v1/sources/{}/snapshots".format(quote(self.source_id, safe="")),
-            b"{}",
+            request,
         )
         snapshot_id = self._snapshot_id(metadata)
         try:
             parsed = self._metadata(metadata)
             jpeg = self._bytes("GET", "/api/v1/snapshots/{}/jpeg".format(quote(snapshot_id, safe="")), _MAX_JPEG_BYTES)
-            raw, headers = self._bytes_with_headers(
-                "GET", "/api/v1/snapshots/{}/raw".format(quote(snapshot_id, safe="")), _MAX_RGB_BYTES
-            )
-            self._validate_raw_headers(headers, parsed)
-            expected_size = parsed["width"] * parsed["height"] * 3
-            if len(raw) != expected_size:
-                raise MediaSnapshotError("media snapshot RGB size does not match its dimensions")
-            rgb = np.frombuffer(raw, dtype=np.uint8).reshape(parsed["height"], parsed["width"], 3)
-            bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+            if include_rgb:
+                raw, headers = self._bytes_with_headers(
+                    "GET", "/api/v1/snapshots/{}/raw".format(quote(snapshot_id, safe="")), _MAX_RGB_BYTES
+                )
+                self._validate_raw_headers(headers, parsed)
+                expected_size = parsed["width"] * parsed["height"] * 3
+                if len(raw) != expected_size:
+                    raise MediaSnapshotError("media snapshot RGB size does not match its dimensions")
+                rgb = np.frombuffer(raw, dtype=np.uint8).reshape(parsed["height"], parsed["width"], 3)
+                bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+            else:
+                bgr = self._decode_detection_jpeg(
+                    jpeg,
+                    parsed["width"],
+                    parsed["height"],
+                    maximum_pixels or parsed["width"] * parsed["height"],
+                )
             return MediaSnapshot(
                 id=snapshot_id,
                 source_id=parsed["source_id"],
@@ -129,6 +165,36 @@ class MediaSnapshotClient:
                 self._bytes("DELETE", "/api/v1/snapshots/{}".format(quote(snapshot_id, safe="")), 0)
             except MediaSnapshotError:
                 pass
+
+    @staticmethod
+    def _decode_detection_jpeg(
+        jpeg: bytes,
+        source_width: int,
+        source_height: int,
+        maximum_pixels: int,
+    ) -> np.ndarray:
+        ratio = math.sqrt(float(source_width * source_height) / float(maximum_pixels))
+        if ratio >= 8.0:
+            flag = cv2.IMREAD_REDUCED_COLOR_8
+        elif ratio >= 4.0:
+            flag = cv2.IMREAD_REDUCED_COLOR_4
+        elif ratio >= 2.0:
+            flag = cv2.IMREAD_REDUCED_COLOR_2
+        else:
+            flag = cv2.IMREAD_COLOR
+        bgr = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), flag)
+        if not isinstance(bgr, np.ndarray) or bgr.ndim != 3 or bgr.shape[2] != 3:
+            raise MediaSnapshotError("media snapshot JPEG could not be decoded")
+        if bgr.shape[0] * bgr.shape[1] > maximum_pixels:
+            scale = math.sqrt(float(maximum_pixels) / float(bgr.shape[0] * bgr.shape[1]))
+            target_width = max(1, int(bgr.shape[1] * scale))
+            target_height = max(1, int(bgr.shape[0] * scale))
+            bgr = cv2.resize(
+                bgr,
+                (target_width, target_height),
+                interpolation=cv2.INTER_AREA,
+            )
+        return bgr
 
     def _snapshot_id(self, value: Any) -> str:
         if not isinstance(value, dict):

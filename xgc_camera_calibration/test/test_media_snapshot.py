@@ -5,6 +5,7 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import cv2
 import numpy as np
 
 from xgc_camera_calibration.media_snapshot import (
@@ -75,7 +76,10 @@ class FakeMediaEdge:
                 body = edge._record(self)
                 if (
                     self.path == "/api/v1/sources/usb_cam/snapshots"
-                    and body == b"{}"
+                    and body in (
+                        b"{}",
+                        b'{"includeRgb":false,"requestKeyframe":false,"requireFresh":true}',
+                    )
                 ):
                     self._json(edge.metadata)
                     return
@@ -172,6 +176,36 @@ class MediaSnapshotClientTest(unittest.TestCase):
                 ("DELETE", "/api/v1/snapshots/snapshot-1"),
             ],
         )
+
+    def test_detection_capture_requests_fresh_jpeg_only_and_decodes_near_vga_area(self):
+        with FakeMediaEdge() as edge:
+            image = np.zeros((1080, 1920, 3), dtype=np.uint8)
+            image[:, :, 1] = 180
+            ok, encoded = cv2.imencode(".jpg", image)
+            self.assertTrue(ok)
+            edge.jpeg = encoded.tobytes()
+            edge.metadata["width"] = 1920
+            edge.metadata["height"] = 1080
+            client = MediaSnapshotClient(edge.address, "usb_cam", 1.0)
+
+            snapshot = client.capture_detection()
+
+        self.assertEqual((snapshot.width, snapshot.height), (1920, 1080))
+        self.assertEqual(snapshot.bgr.shape[:2], (415, 739))
+        self.assertLessEqual(snapshot.bgr.shape[0] * snapshot.bgr.shape[1], 640 * 480)
+        self.assertIn(
+            (
+                "POST",
+                "/api/v1/sources/usb_cam/snapshots",
+                b'{"includeRgb":false,"requestKeyframe":false,"requireFresh":true}',
+            ),
+            edge.requests,
+        )
+        self.assertNotIn(
+            ("GET", "/api/v1/snapshots/snapshot-1/raw"),
+            [(method, path) for method, path, _body in edge.requests],
+        )
+        self.assertEqual(edge.deleted, ["snapshot-1"])
 
     def test_capture_deletes_snapshot_after_raw_metadata_validation_fails(self):
         with FakeMediaEdge() as edge:

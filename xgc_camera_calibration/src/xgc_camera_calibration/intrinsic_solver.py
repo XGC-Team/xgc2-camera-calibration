@@ -35,7 +35,6 @@ _APRILTAG_DICTIONARIES = {
     "apriltag_36h11": "DICT_APRILTAG_36h11",
     "36h11": "DICT_APRILTAG_36h11",
 }
-_APRILGRID_RETRY_MAX_WIDTH = 2880
 _APRILGRID_FALLBACK_MIN_SHARPNESS = 160.0
 _APRILGRID_FALLBACK_MARKER_PIXELS = 80
 _APRILGRID_FALLBACK_MAX_PAYLOAD_ERRORS = 5
@@ -127,6 +126,56 @@ def _detect_aruco_markers(image: np.ndarray, dictionary: Any):
     if hasattr(cv2.aruco, "detectMarkers"):
         return cv2.aruco.detectMarkers(image, dictionary)
     raise CalibrationError("OpenCV aruco marker detection is unavailable")
+
+
+def aprilgrid_has_candidate_evidence(
+    gray: np.ndarray,
+    tag_family: str = "tag36h11",
+    minimum_quads: int = 6,
+) -> bool:
+    """Return whether a low-resolution frame justifies a source-level retry."""
+    if gray.ndim != 2 or minimum_quads < 1 or not hasattr(cv2, "aruco"):
+        return False
+    dictionary_name = _APRILTAG_DICTIONARIES.get(str(tag_family).strip().lower())
+    if not dictionary_name or not hasattr(cv2.aruco, dictionary_name):
+        return False
+    dictionary = cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, dictionary_name))
+    _corners, ids, rejected = _detect_aruco_markers(gray, dictionary)
+    decoded = 0 if ids is None else len(ids)
+    rejected_count = 0 if rejected is None else len(rejected)
+    return decoded >= minimum_quads or rejected_count >= minimum_quads
+
+
+def refine_aprilgrid_calibration_centers(
+    source_gray: np.ndarray,
+    source_tag_corners: np.ndarray,
+) -> np.ndarray:
+    """Refine accepted tag corners locally on the source image, then center them.
+
+    Continuous detection stays on the small search plane. Only a geometrically
+    distinct sample pays for this source-resolution grayscale refinement.
+    """
+    if source_gray.ndim != 2:
+        raise ValueError("AprilGrid source refinement expects a grayscale image")
+    corners = np.asarray(source_tag_corners, dtype=np.float32).reshape(-1, 4, 2)
+    pixels = corners.reshape(-1, 1, 2).copy()
+    height, width = source_gray.shape[:2]
+    flat = pixels.reshape(-1, 2)
+    valid = (
+        (flat[:, 0] >= 6.0)
+        & (flat[:, 0] < float(width - 6))
+        & (flat[:, 1] >= 6.0)
+        & (flat[:, 1] < float(height - 6))
+    )
+    if bool(np.any(valid)):
+        pixels[valid] = cv2.cornerSubPix(
+            source_gray,
+            pixels[valid].copy(),
+            (5, 5),
+            (-1, -1),
+            _SUBPIX_CRITERIA,
+        )
+    return np.mean(pixels.reshape(-1, 4, 2), axis=1).reshape(-1, 1, 2).astype(np.float32)
 
 
 def _draw_aruco_marker(dictionary: Any, marker_id: int, size: int) -> np.ndarray:
@@ -541,53 +590,28 @@ def detect_aprilgrid(
         last = first + int(board_size[0]) * int(board_size[1])
         return sum(first <= int(marker_id) < last for marker_id in marker_ids.reshape(-1))
 
-    # OpenCV 4.2's AprilTag decoder has a narrow useful marker-pixel band: the
-    # official plate can return only rejected quads when tags are either below
-    # that band or very large.  Probe a bounded deterministic scale pyramid
-    # only when the normal search did not reach min_tags.  This keeps common
-    # physical captures cheap while recovering the 90-degree Gazebo views used
-    # to fill the image edges.  Every winning scale is mapped back to original
-    # image coordinates below.
-    total_tags = int(board_size[0]) * int(board_size[1])
     best_count = in_board_count(ids)
     base_scale = scale
-    retry_specs = (
-        (0.67, cv2.INTER_AREA, False),
-        (0.80, cv2.INTER_AREA, False),
-        (1.25, cv2.INTER_CUBIC, True),
-        (1.50, cv2.INTER_CUBIC, True),
-        (2.00, cv2.INTER_CUBIC, False),
-        (2.00, cv2.INTER_CUBIC, True),
-        (2.50, cv2.INTER_AREA, False),
-        (3.00, cv2.INTER_AREA, False),
-        (3.00, cv2.INTER_AREA, True),
-        (3.00, cv2.INTER_NEAREST, False),
-    )
+    recovered = None
     if best_count < int(min_tags):
-        for retry_scale, interpolation, sharpen in retry_specs:
-            retry_width = int(round(float(search.shape[1]) * retry_scale))
-            if retry_width > _APRILGRID_RETRY_MAX_WIDTH:
-                continue
-            retry = cv2.resize(
-                search,
-                None,
-                fx=retry_scale,
-                fy=retry_scale,
-                interpolation=interpolation,
-            )
-            if sharpen:
-                blurred = cv2.GaussianBlur(retry, (0, 0), 1.2)
-                retry = cv2.addWeighted(retry, 2.0, blurred, -1.0, 0.0)
-            retry_corners, retry_ids, retry_rejected = _detect_aruco_markers(
-                retry, dictionary
-            )
-            retry_count = in_board_count(retry_ids)
-            if retry_count > best_count:
-                corners, ids, _rejected = retry_corners, retry_ids, retry_rejected
-                best_count = retry_count
-                scale = base_scale * retry_scale
-            if best_count >= total_tags:
-                break
+        # The contour/lattice path works at the already bounded search plane
+        # and is the compatibility path for older OpenCV AprilTag decoders.
+        # Try it before enlarging that plane through the recovery pyramid: a
+        # missing or motion-blurred board is common during physical movement
+        # and must not pay for ten large ArUco scans on every live cycle.
+        recovered = _aprilgrid_contour_fallback(
+            search,
+            dictionary,
+            board_size,
+            square,
+            tag_spacing,
+            start_id,
+            min_tags,
+        )
+    # Do not upscale this search image. AprilTag payload bits discarded by the
+    # low-resolution decode cannot be reconstructed by interpolation. The
+    # service uses rejected quads as evidence and retries by decoding the
+    # original JPEG into a larger, still-bounded working plane.
     image_points: List[np.ndarray] = []
     object_points: List[np.ndarray] = []
     if ids is not None:
@@ -602,19 +626,15 @@ def detect_aprilgrid(
             ).astype(np.float32)
             image_points.append(image)
             object_points.append(obj)
-    if len(image_points) < int(min_tags):
-        recovered = _aprilgrid_contour_fallback(
-            gray,
-            dictionary,
-            board_size,
-            square,
-            tag_spacing,
-            start_id,
-            min_tags,
-        )
-        if recovered is None:
-            return None
+    if recovered is not None:
         image_points, object_points = recovered
+        if base_scale != 1.0:
+            image_points = [
+                (np.asarray(points, dtype=np.float32) / base_scale).astype(np.float32)
+                for points in image_points
+            ]
+    elif len(image_points) < int(min_tags):
+        return None
     image_points = _align_aprilgrid_corners_to_lattice(
         image_points, object_points
     )

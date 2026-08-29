@@ -33,6 +33,8 @@ from xgc_camera_calibration import intrinsic_solver
 from xgc_camera_calibration.solver import CalibrationError
 from xgc_camera_calibration.web_service import ApiError
 
+APRILGRID_ADAPTIVE_DETECTION_WIDTH = 2200
+
 
 def recommended_views(
     board_center: Sequence[float], board_extent: float = 1.6
@@ -103,7 +105,7 @@ class IntrinsicCalibrationService:
         camera_info_topic: str = "",
         jpeg_quality: int = 80,
         sample_distance: float = intrinsic_solver.SAMPLE_DISTANCE,
-        maximum_detect_width: int = 3840,
+        maximum_detect_width: int = 960,
         display_width: int = 960,
         board_center: Sequence[float] = (2.0, 0.0, 2.2),
         references_dir: str = "",
@@ -145,6 +147,7 @@ class IntrinsicCalibrationService:
         self.maximum_detect_width = int(maximum_detect_width)
         self.display_width = int(display_width)
         self.lock = threading.RLock()
+        self._detection_condition = threading.Condition(self.lock)
         self._capture_lock = threading.Lock()
         self.samples: List[Tuple[float, float, float, float]] = []
         self.image_points: List[np.ndarray] = []
@@ -200,7 +203,7 @@ class IntrinsicCalibrationService:
         self._auto_run_thread: Optional[threading.Thread] = None
         self._auto_capture_thread: Optional[threading.Thread] = None
         self._auto_capture_stop = threading.Event()
-        self._auto_capture_interval = 0.5
+        self._auto_capture_interval = 0.0
         self._auto_capture_error: Optional[str] = None
         self._auto_capture_completed = False
         self._load_refs()
@@ -231,27 +234,22 @@ class IntrinsicCalibrationService:
             "coverage_complete": self._auto_capture_completed,
         }
 
-    def start_auto_capture(self, interval: float = 0.5) -> Dict[str, Any]:
-        """Continuously inspect physical-camera snapshots until coverage is full.
+    def start_auto_capture(self, interval: float = 0.0) -> Dict[str, Any]:
+        """Continuously inspect snapshots from either camera origin.
 
-        Frames are never persisted. ``process_frame`` replaces the one in-memory
-        preview, rejects invalid/blurred/duplicate views, and stores only corner
-        coordinates for accepted samples.
+        Live playback remains WebRTC. This lower-rate loop is the one shared
+        simulation/physical detection path: ``process_frame`` replaces the one
+        in-memory annotated preview and stores only corner coordinates for
+        accepted samples. Reaching full coverage stops sample growth, not live
+        detection; the result surface must continue to follow the moving camera.
         """
         interval = float(interval)
-        if not 0.1 <= interval <= 10.0:
+        if not 0.0 <= interval <= 10.0:
             raise ApiError(
                 HTTPStatus.UNPROCESSABLE_ENTITY,
-                "auto capture interval must be between 0.1 and 10 seconds",
+                "detection interval must be between 0 and 10 seconds",
             )
         with self.lock:
-            if self.camera is not None:
-                raise ApiError(
-                    HTTPStatus.CONFLICT,
-                    "Continuous auto capture is for a physical camera; use the simulation auto sweep",
-                )
-            if self.result is not None:
-                return {"ok": True, "auto_capture": self._auto_capture_document_locked()}
             if self.frame_capture is None:
                 raise ApiError(
                     HTTPStatus.SERVICE_UNAVAILABLE,
@@ -266,7 +264,7 @@ class IntrinsicCalibrationService:
             self._auto_capture_stop.clear()
             thread = threading.Thread(
                 target=self._run_auto_capture,
-                name="intrinsic-physical-auto-capture",
+                name="intrinsic-live-detection",
                 daemon=True,
             )
             self._auto_capture_thread = thread
@@ -278,27 +276,42 @@ class IntrinsicCalibrationService:
                 self._auto_capture_error = str(error) or "Could not start auto capture"
             raise ApiError(
                 HTTPStatus.INTERNAL_SERVER_ERROR,
-                "Could not start physical auto capture",
+                "Could not start continuous intrinsic detection",
             ) from error
         with self.lock:
             return {"ok": True, "auto_capture": self._auto_capture_document_locked()}
 
     def _run_auto_capture(self) -> None:
+        next_capture_at = time.monotonic()
         try:
             while not self._auto_capture_stop.is_set():
+                failed = False
                 try:
                     self._capture_frame()
                 except Exception as error:
+                    failed = True
                     with self.lock:
                         self._auto_capture_error = str(error) or error.__class__.__name__
                 else:
                     with self.lock:
                         self._auto_capture_error = None
                         guidance = intrinsic_solver.next_view_guidance(self.samples)
-                        if self.result is not None or guidance["complete"]:
-                            self._auto_capture_completed = bool(guidance["complete"])
-                            self._auto_capture_stop.set()
-                if self._auto_capture_stop.wait(self._auto_capture_interval):
+                        self._auto_capture_completed = bool(guidance["complete"])
+                if self._auto_capture_interval <= 0.0:
+                    # The source transaction (fresh camera frame) and detector
+                    # provide natural backpressure. Only failures get a small
+                    # retry backoff so a disconnected source cannot spin.
+                    if failed and self._auto_capture_stop.wait(0.1):
+                        break
+                    continue
+                next_capture_at += self._auto_capture_interval
+                wait = next_capture_at - time.monotonic()
+                if wait <= 0.0:
+                    # Never build a frame backlog. A slow detector immediately
+                    # consumes the newest snapshot and starts a fresh cadence.
+                    next_capture_at = time.monotonic()
+                    continue
+                if self._auto_capture_stop.wait(wait):
                     break
         finally:
             with self.lock:
@@ -600,16 +613,26 @@ class IntrinsicCalibrationService:
         bgr: np.ndarray,
         render_position: Optional[Sequence[float]] = None,
         render_orientation: Optional[Sequence[float]] = None,
+        source_image_size: Optional[Sequence[int]] = None,
+        source_jpeg: Optional[bytes] = None,
     ) -> None:
         """Ingest one decoded BGR frame: detect the board, auto-collect, annotate."""
         if bgr.ndim != 3 or bgr.shape[2] != 3:
             return
         height, width = bgr.shape[:2]
+        source_width = int(source_image_size[0]) if source_image_size is not None else width
+        source_height = int(source_image_size[1]) if source_image_size is not None else height
+        if source_width < width or source_height < height:
+            return
+        source_scale = np.asarray(
+            [float(source_width) / float(width), float(source_height) / float(height)],
+            dtype=np.float32,
+        )
         gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
         detection = intrinsic_solver.detect_board(
             gray,
             self.board_size,
-            self.maximum_detect_width,
+            width if self.board_type == "aprilgrid" else self.maximum_detect_width,
             board_type=self.board_type,
             square=self.square,
             tag_spacing=self.tag_spacing,
@@ -617,6 +640,35 @@ class IntrinsicCalibrationService:
             start_id=self.tag_start_id,
             min_tags=self.min_tags,
         )
+        if (
+            detection is None
+            and self.board_type == "aprilgrid"
+            and source_jpeg
+            and source_width > width
+            and intrinsic_solver.aprilgrid_has_candidate_evidence(
+                gray, self.tag_family, self.min_tags
+            )
+        ):
+            adaptive = self._decode_adaptive_aprilgrid_frame(source_jpeg, source_width)
+            if adaptive is not None and adaptive.shape[1] > width:
+                bgr = adaptive
+                height, width = bgr.shape[:2]
+                source_scale = np.asarray(
+                    [float(source_width) / float(width), float(source_height) / float(height)],
+                    dtype=np.float32,
+                )
+                gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+                detection = intrinsic_solver.detect_board(
+                    gray,
+                    self.board_size,
+                    width,
+                    board_type=self.board_type,
+                    square=self.square,
+                    tag_spacing=self.tag_spacing,
+                    tag_family=self.tag_family,
+                    start_id=self.tag_start_id,
+                    min_tags=self.min_tags,
+                )
 
         scale = 1.0
         if width > self.display_width:
@@ -626,7 +678,7 @@ class IntrinsicCalibrationService:
             display = bgr.copy()
 
         with self.lock:
-            self.image_size = (width, height)
+            self.image_size = (source_width, source_height)
             self._frame_sequence += 1
             accepted = False
             duplicate = False
@@ -638,6 +690,9 @@ class IntrinsicCalibrationService:
                     if detection.calibration_image_points is not None
                     else corners
                 )
+                calibration_corners = (
+                    np.asarray(calibration_corners, dtype=np.float32) * source_scale
+                ).astype(np.float32)
                 calibration_objects = (
                     detection.calibration_object_points
                     if detection.calibration_object_points is not None
@@ -660,6 +715,31 @@ class IntrinsicCalibrationService:
                     )
                     duplicate = not accepted
                     if accepted:
+                        if self.board_type == "aprilgrid" and source_jpeg:
+                            try:
+                                source_gray = cv2.imdecode(
+                                    np.frombuffer(source_jpeg, dtype=np.uint8),
+                                    cv2.IMREAD_GRAYSCALE,
+                                )
+                                if (
+                                    not isinstance(source_gray, np.ndarray)
+                                    or source_gray.shape[:2] != (source_height, source_width)
+                                ):
+                                    raise ValueError(
+                                        "source JPEG dimensions do not match snapshot metadata"
+                                    )
+                                calibration_corners = (
+                                    intrinsic_solver.refine_aprilgrid_calibration_centers(
+                                        source_gray,
+                                        np.asarray(corners, dtype=np.float32) * source_scale,
+                                    )
+                                )
+                            except Exception as error:
+                                # The bounded detection remains useful and the
+                                # source-coordinate fallback is still valid.
+                                # Surface refinement trouble without dropping
+                                # the operator's newest detection frame.
+                                self._recovery_error = str(error) or error.__class__.__name__
                         self.samples.append(params)
                         self.image_points.append(calibration_corners)
                         self.object_points.append(calibration_objects)
@@ -672,8 +752,8 @@ class IntrinsicCalibrationService:
                     "status": "detected",
                     "corner_count": int(len(corners)),
                     "expected_corner_count": self.latest_detection["expected_corner_count"],
-                    "frame_width": width,
-                    "frame_height": height,
+                    "frame_width": source_width,
+                    "frame_height": source_height,
                     "sequence": self._frame_sequence,
                     "metrics": [
                         {"label": label, "value": float(value)}
@@ -687,14 +767,39 @@ class IntrinsicCalibrationService:
                     "status": "not_detected",
                     "corner_count": 0,
                     "expected_corner_count": self.latest_detection["expected_corner_count"],
-                    "frame_width": width,
-                    "frame_height": height,
+                    "frame_width": source_width,
+                    "frame_height": source_height,
                     "sequence": self._frame_sequence,
                     "metrics": [],
                     "accepted": False,
                     "duplicate": False,
                 }
             self._display = display
+            self._detection_condition.notify_all()
+
+    @staticmethod
+    def _decode_adaptive_aprilgrid_frame(
+        source_jpeg: bytes,
+        source_width: int,
+    ) -> Optional[np.ndarray]:
+        encoded = np.frombuffer(source_jpeg, dtype=np.uint8)
+        target_width = min(APRILGRID_ADAPTIVE_DETECTION_WIDTH, source_width)
+        decode_flag = (
+            cv2.IMREAD_REDUCED_COLOR_2
+            if source_width >= int(target_width * 1.5)
+            else cv2.IMREAD_COLOR
+        )
+        image = cv2.imdecode(encoded, decode_flag)
+        if not isinstance(image, np.ndarray) or image.ndim != 3 or image.shape[2] != 3:
+            return None
+        if image.shape[1] != target_width:
+            scale = float(target_width) / float(image.shape[1])
+            image = cv2.resize(
+                image,
+                (max(1, int(image.shape[1] * scale)), max(1, int(image.shape[0] * scale))),
+                interpolation=cv2.INTER_CUBIC if scale > 1.0 else cv2.INTER_AREA,
+            )
+        return image
 
     def image_jpeg(self) -> bytes:
         with self.lock:
@@ -833,6 +938,9 @@ class IntrinsicCalibrationService:
                 ) from error
             render_position = getattr(frame, "render_position", None)
             render_orientation = getattr(frame, "render_orientation", None)
+            source_width = getattr(frame, "width", None)
+            source_height = getattr(frame, "height", None)
+            source_jpeg = getattr(frame, "jpeg", None)
             if not isinstance(frame, np.ndarray):
                 frame = getattr(frame, "bgr", None)
             if not isinstance(frame, np.ndarray):
@@ -840,7 +948,18 @@ class IntrinsicCalibrationService:
                     HTTPStatus.SERVICE_UNAVAILABLE,
                     "Calibration frame source returned no image",
                 )
-            self.process_frame(frame, render_position, render_orientation)
+            source_image_size = (
+                (int(source_width), int(source_height))
+                if isinstance(source_width, int) and isinstance(source_height, int)
+                else None
+            )
+            self.process_frame(
+                frame,
+                render_position,
+                render_orientation,
+                source_image_size=source_image_size,
+                source_jpeg=source_jpeg if isinstance(source_jpeg, bytes) else None,
+            )
         with self.lock:
             return {"ok": True, "samples": len(self.samples)}
 
@@ -871,7 +990,7 @@ class IntrinsicCalibrationService:
             camera.reset()
         return {"ok": True}
 
-    def auto_run(self, settle: float = 1.3) -> Dict[str, Any]:
+    def auto_run(self, settle: float = 1.3, detection_timeout: float = 2.0) -> Dict[str, Any]:
         """Start a background sweep through every recommended sample view.
 
         The HTTP transport remains responsive while the camera dwells at each
@@ -880,9 +999,17 @@ class IntrinsicCalibrationService:
         """
         if float(settle) < 0.0:
             raise ValueError("settle must be non-negative")
+        if float(detection_timeout) <= 0.0:
+            raise ValueError("detection_timeout must be positive")
         with self.lock:
             self._require_idle_locked()
             camera = self._require_camera()
+            detector = self._auto_capture_thread
+            if detector is None or not detector.is_alive() or self._auto_capture_stop.is_set():
+                raise ApiError(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    "Continuous intrinsic detection is not running",
+                )
             self._clear_session_locked()
             self.action = {
                 "name": "auto_run",
@@ -893,7 +1020,7 @@ class IntrinsicCalibrationService:
             }
             thread = threading.Thread(
                 target=self._run_auto_sweep,
-                args=(camera, float(settle)),
+                args=(camera, float(settle), float(detection_timeout)),
                 name="intrinsic-auto-run",
                 daemon=True,
             )
@@ -917,7 +1044,7 @@ class IntrinsicCalibrationService:
             ) from error
         return accepted
 
-    def _run_auto_sweep(self, camera: Any, settle: float) -> None:
+    def _run_auto_sweep(self, camera: Any, settle: float, detection_timeout: float) -> None:
         try:
             for index, view in enumerate(self.views):
                 with self.lock:
@@ -929,34 +1056,11 @@ class IntrinsicCalibrationService:
                     view["position"], view["yaw_offset"], view["pitch_offset"], view["roll"]
                 )
                 time.sleep(settle)
-                # Media Edge can still hold the frame from the previous pose
-                # immediately after Gazebo reports the model-state update. Use
-                # a small bounded retry window so every authored guide point is
-                # proven by a detected-board reference, rather than allowing a
-                # lucky subset of the sweep to satisfy only the coverage bars.
-                with self.lock:
-                    capture = self.frame_capture
-                if capture is not None:
-                    for attempt in range(4):
-                        self._capture_frame()
-                        with self.lock:
-                            detected_at_target = self.target_done[index]
-                        if detected_at_target:
-                            # The snapshot that proves this target also asks
-                            # the media source for an H264 keyframe. One more
-                            # same-pose capture drains the encoder's preceding
-                            # frame without adding a duplicate calibration
-                            # sample, so WebRTC and the annotated preview agree
-                            # before the sweep advances to the next target.
-                            self._capture_frame()
-                            break
-                        if attempt < 3:
-                            time.sleep(0.35)
-                    if not detected_at_target:
-                        raise CalibrationError(
-                            "automatic sweep could not detect the calibration board "
-                            "at target '{}'".format(view["name"])
-                        )
+                if not self._wait_for_target_detection(index, detection_timeout):
+                    raise CalibrationError(
+                        "continuous detection could not find the calibration board "
+                        "at target '{}'".format(view["name"])
+                    )
         except Exception as error:  # Camera-control failures are reported through state.
             with self.lock:
                 self.action = {
@@ -996,6 +1100,18 @@ class IntrinsicCalibrationService:
                     "error": str(error) or error.__class__.__name__,
                 }
                 self._auto_run_thread = None
+
+    def _wait_for_target_detection(self, index: int, timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
+        with self._detection_condition:
+            while not self.target_done[index]:
+                if self.action is None or self.action.get("status") != "running":
+                    return False
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    return False
+                self._detection_condition.wait(timeout=remaining)
+            return True
 
     def record_references(self, settle: float = 1.3) -> Dict[str, Any]:
         """One-off: fly to every view, snapshot the annotated frame as its

@@ -2,9 +2,10 @@
 """ROS1 pose-control adapter and Media Edge entrypoint for intrinsics.
 
 Live imagery belongs to the browser WebRTC session. Simulation requests an
-immutable RGB snapshot at each authored pose. Physical calibration runs a
-bounded snapshot loop that automatically accepts only sharp, detected and
-geometrically distinct views; frames themselves are never persisted.
+automatic camera pose; a person moves the physical camera. Both origins feed
+the same continuous, lower-rate Media Edge snapshot detection loop, which
+updates the annotated result and coverage independently from WebRTC FPS.
+Frames themselves are never persisted.
 """
 
 import sys
@@ -76,6 +77,7 @@ def main():
         # Simulation and physical use the same station AprilGrid contract:
         # 6x6 tag36h11, 88 mm tags, 26.4 mm gaps, ids 0..35. Gazebo renders an
         # official Kalibr export at those physical dimensions.
+        display_width = int(rospy.get_param("~display_width", 720))
         service = IntrinsicCalibrationService(
             board_size=(
                 int(rospy.get_param("~board_cols", 7)),
@@ -87,8 +89,8 @@ def main():
             camera_info_topic="snapshot metadata",
             media_source=snapshot_client.source_id,
             jpeg_quality=int(rospy.get_param("~jpeg_quality", 80)),
-            maximum_detect_width=int(rospy.get_param("~maximum_detect_width", 3840)),
-            display_width=int(rospy.get_param("~display_width", 720)),
+            maximum_detect_width=int(rospy.get_param("~maximum_detect_width", display_width)),
+            display_width=display_width,
             board_center=board_center,
             references_dir=str(
                 rospy.get_param("~references_dir", str(calibrations / "intrinsic_refs"))
@@ -102,15 +104,19 @@ def main():
         camera = maybe_camera_control(board_center)
         if camera is not None:
             service.attach_camera_control(camera)
-        service.attach_frame_capture(snapshot_client.capture)
-        automatic_physical_capture = bool(
-            rospy.get_param(
-                "~auto_capture", not bool(rospy.get_param("~camera_control", False))
+        if service.board_type == "aprilgrid":
+            detection_target_pixels = int(
+                rospy.get_param("~detection_target_pixels", 640 * 480)
             )
-        )
-        if automatic_physical_capture:
+            service.attach_frame_capture(
+                lambda: snapshot_client.capture_detection(detection_target_pixels)
+            )
+        else:
+            service.attach_frame_capture(snapshot_client.capture)
+        automatic_detection = bool(rospy.get_param("~auto_capture", True))
+        if automatic_detection:
             service.start_auto_capture(
-                float(rospy.get_param("~auto_capture_interval", 0.5))
+                float(rospy.get_param("~auto_capture_interval", 0.0))
             )
         bind_address = str(rospy.get_param("~bind_address", "127.0.0.1"))
         http_port = int(rospy.get_param("~http_port", 8766))
@@ -134,7 +140,10 @@ def main():
         return 1
 
     server_thread = threading.Thread(
-        target=server.serve_forever, name="intrinsic-calibration-http", daemon=True
+        target=server.serve_forever,
+        kwargs={"poll_interval": 0.05},
+        name="intrinsic-calibration-http",
+        daemon=True,
     )
     server_thread.start()
     rospy.loginfo(

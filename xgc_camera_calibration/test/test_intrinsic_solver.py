@@ -45,6 +45,19 @@ def _project_views():
 
 
 class IntrinsicSolverTest(unittest.TestCase):
+    def test_refines_only_accepted_aprilgrid_points_on_source_gray_plane(self):
+        gray = np.zeros((1080, 1920), np.uint8)
+        corners = np.asarray(
+            [[100, 100], [200, 100], [200, 200], [100, 200]],
+            dtype=np.float32,
+        ).reshape(-1, 1, 2)
+        refined = corners + np.asarray([2.0, 4.0], dtype=np.float32)
+        with mock.patch.object(cv2, "cornerSubPix", return_value=refined) as subpixel:
+            centers = solver.refine_aprilgrid_calibration_centers(gray, corners)
+        subpixel.assert_called_once()
+        self.assertEqual(subpixel.call_args.args[0].shape, (1080, 1920))
+        np.testing.assert_allclose(centers.reshape(-1, 2), [[152.0, 154.0]])
+
     def test_recovers_known_intrinsics(self):
         image_points, _ = _project_views()
         result = solver.calibrate_intrinsic(image_points, BOARD, SQUARE, (WIDTH, HEIGHT))
@@ -204,6 +217,60 @@ class IntrinsicSolverTest(unittest.TestCase):
         self.assertIsNotNone(detection)
         self.assertEqual(len(detection.image_points), 144)
         self.assertEqual(len(detection.object_points), 144)
+
+    def test_contour_fallback_stays_at_detection_width_and_restores_full_coordinates(self):
+        if not hasattr(cv2, "aruco") or not hasattr(cv2.aruco, "DICT_APRILTAG_36h11"):
+            self.skipTest("OpenCV AprilTag 36h11 dictionary is unavailable")
+        source = _render_aprilgrid((6, 6), tag_pixels=45, gap_pixels=14, border=40)
+        gray = cv2.resize(source, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_NEAREST)
+        fallback_widths = []
+        fallback = solver._aprilgrid_contour_fallback
+
+        def observed_fallback(image, *args, **kwargs):
+            fallback_widths.append(image.shape[1])
+            return fallback(image, *args, **kwargs)
+
+        with mock.patch.object(
+            solver, "_detect_aruco_markers", return_value=([], None, [])
+        ) as detect_markers, mock.patch.object(
+            solver, "_aprilgrid_contour_fallback", side_effect=observed_fallback
+        ):
+            detection = solver.detect_aprilgrid(
+                gray,
+                (6, 6),
+                square=0.088,
+                tag_spacing=0.0264,
+                min_tags=6,
+                maximum_width=960,
+            )
+        self.assertIsNotNone(detection)
+        self.assertEqual(fallback_widths, [960])
+        self.assertEqual(detect_markers.call_count, 1)
+        points = detection.image_points.reshape(-1, 2)
+        self.assertGreater(float(points[:, 0].max()), 960.0)
+        self.assertLessEqual(float(points[:, 0].max()), float(gray.shape[1]))
+        self.assertLessEqual(float(points[:, 1].max()), float(gray.shape[0]))
+
+    def test_board_absent_frame_does_not_run_large_recovery_pyramid(self):
+        if not hasattr(cv2, "aruco") or not hasattr(cv2.aruco, "DICT_APRILTAG_36h11"):
+            self.skipTest("OpenCV AprilTag 36h11 dictionary is unavailable")
+        gray = np.full((540, 960), 127, np.uint8)
+        with mock.patch.object(
+            solver, "_detect_aruco_markers", return_value=([], None, [])
+        ) as detect_markers, mock.patch.object(
+            solver, "_aprilgrid_contour_fallback", return_value=None
+        ) as fallback:
+            detection = solver.detect_aprilgrid(
+                gray,
+                (6, 6),
+                square=0.088,
+                tag_spacing=0.0264,
+                min_tags=6,
+                maximum_width=960,
+            )
+        self.assertIsNone(detection)
+        self.assertEqual(detect_markers.call_count, 1)
+        fallback.assert_called_once()
 
     def test_physical_station_tag_rotation_keeps_board_geometry_aligned(self):
         if not hasattr(cv2, "aruco") or not hasattr(cv2.aruco, "DICT_APRILTAG_36h11"):

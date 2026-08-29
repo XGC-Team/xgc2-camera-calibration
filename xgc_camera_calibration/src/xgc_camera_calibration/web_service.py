@@ -540,7 +540,7 @@ class CalibrationRequestHandler(BaseHTTPRequestHandler):
                 )
                 self.wfile.flush()
                 previous = payload
-            time.sleep(0.25)
+            time.sleep(0.1)
 
     def _send_error(self, error: ApiError) -> None:
         payload: Dict[str, Any] = {"error": error.message}
