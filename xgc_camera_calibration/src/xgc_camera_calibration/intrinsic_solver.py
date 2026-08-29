@@ -42,8 +42,13 @@ _APRILGRID_FALLBACK_MAX_PAYLOAD_ERRORS = 5
 _APRILGRID_FALLBACK_MAX_BORDER_ERRORS = 2
 APRILGRID_FEATURE_MODEL = "aprilgrid_tag_corners_v1"
 _APRILGRID_MIN_BORDER_DISTANCE = 6.0
-# Kalibr's AprilGrid default is expressed in squared source-image pixels.
-_APRILGRID_MAX_SUBPIX_DISPLACEMENT2 = 1.5
+_APRILGRID_MIN_EDGE_LENGTH_PX = 20.0
+_APRILGRID_EDGE_SEARCH_RADIUS_PX = 3.0
+_APRILGRID_EDGE_SAMPLE_STEP_PX = 0.5
+_APRILGRID_EDGE_MIN_PROFILE_GRADIENT = 6.0
+_APRILGRID_EDGE_MIN_MEDIAN_CONTRAST = 24.0
+_APRILGRID_EDGE_MAX_LINE_RMS_PX = 0.65
+_APRILGRID_EDGE_MAX_LINE_P90_PX = 0.75
 
 
 @dataclass(frozen=True)
@@ -197,35 +202,230 @@ def refine_aprilgrid_calibration_corners(
     if not bool(np.any(tag_mask)):
         raise CalibrationError("AprilGrid source frame has no refinable tag corners")
 
-    raw = corners[tag_mask].reshape(-1, 1, 2).copy()
-    refined = cv2.cornerSubPix(
-        source_gray, raw.copy(), (5, 5), (-1, -1), _SUBPIX_CRITERIA
-    )
-    refined_tags = np.asarray(refined, dtype=np.float32).reshape(-1, 4, 2)
-    raw_tags = raw.reshape(-1, 4, 2)
-    displacement2 = np.sum((refined_tags - raw_tags) ** 2, axis=2)
-    orientation_ok = np.asarray(
-        [
-            cv2.isContourConvex(tag.reshape(-1, 1, 2))
-            and np.sign(cv2.contourArea(before, oriented=True))
-            == np.sign(cv2.contourArea(tag, oriented=True))
-            for before, tag in zip(raw_tags, refined_tags)
-        ],
-        dtype=bool,
-    )
-    refinement_ok = np.all(
-        displacement2 <= _APRILGRID_MAX_SUBPIX_DISPLACEMENT2, axis=1
-    ) & orientation_ok
-    accepted_objects = objects[tag_mask]
-    image_points = refined_tags[refinement_ok].reshape(-1, 1, 2)
-    object_points = accepted_objects[refinement_ok].reshape(-1, 3)
-    if int(np.sum(refinement_ok)) < int(minimum_tags):
+    refined_tags = []
+    accepted_objects = []
+    for raw_tag, object_tag in zip(corners[tag_mask], objects[tag_mask]):
+        try:
+            refined_tag = _refine_aprilgrid_quad_edges(source_gray, raw_tag)
+        except (ValueError, np.linalg.LinAlgError, cv2.error):
+            continue
+        orientation_ok = (
+            cv2.isContourConvex(refined_tag.reshape(-1, 1, 2))
+            and np.sign(cv2.contourArea(raw_tag, oriented=True))
+            == np.sign(cv2.contourArea(refined_tag, oriented=True))
+        )
+        if not orientation_ok:
+            continue
+        refined_tags.append(refined_tag)
+        accepted_objects.append(object_tag)
+    if len(refined_tags) < int(minimum_tags):
         raise CalibrationError(
             "AprilGrid source refinement retained fewer than {} complete tags".format(
                 int(minimum_tags)
             )
         )
-    return image_points.astype(np.float32), object_points.astype(np.float32)
+    return (
+        np.asarray(refined_tags, dtype=np.float32).reshape(-1, 1, 2),
+        np.asarray(accepted_objects, dtype=np.float32).reshape(-1, 3),
+    )
+
+
+def _sample_gray_bilinear(gray: np.ndarray, points: np.ndarray) -> np.ndarray:
+    coordinates = np.asarray(points, dtype=np.float32).reshape(-1, 2)
+    return cv2.remap(
+        gray,
+        coordinates[:, 0].reshape(-1, 1),
+        coordinates[:, 1].reshape(-1, 1),
+        cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REPLICATE,
+    ).reshape(-1)
+
+
+def _fit_aprilgrid_edge(
+    gray: np.ndarray,
+    first: np.ndarray,
+    second: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    edge = np.asarray(second, dtype=np.float64) - np.asarray(first, dtype=np.float64)
+    length = float(np.linalg.norm(edge))
+    if length < _APRILGRID_MIN_EDGE_LENGTH_PX:
+        raise ValueError("AprilGrid edge is too short for line refinement")
+    tangent = edge / length
+    normal = np.asarray((-tangent[1], tangent[0]), dtype=np.float64)
+    count = max(10, min(64, int(length / 3.0)))
+    bases = np.asarray(first, dtype=np.float64)[None, :] + np.linspace(
+        0.12, 0.88, count
+    )[:, None] * edge[None, :]
+    offsets = np.arange(
+        -_APRILGRID_EDGE_SEARCH_RADIUS_PX,
+        _APRILGRID_EDGE_SEARCH_RADIUS_PX + 1e-6,
+        _APRILGRID_EDGE_SAMPLE_STEP_PX,
+        dtype=np.float64,
+    )
+    probes = bases[:, None, :] + offsets[None, :, None] * normal[None, None, :]
+    intensities = _sample_gray_bilinear(gray, probes).reshape(count, len(offsets)).astype(
+        np.float64
+    )
+    # All four ArUco corners are ordered around the tag, so ``normal`` crosses
+    # the same outer-border polarity along the edge. Estimate the two plateaus
+    # and interpolate their 50% crossing. This selects one physical transition
+    # instead of averaging an unrelated nearby texture, and avoids the
+    # quarter-pixel first-index bias of argmax on equal JPEG gradient bins.
+    outside = np.median(intensities[:, :3], axis=1)
+    inside = np.median(intensities[:, -3:], axis=1)
+    aggregate_contrast = float(np.median(outside - inside))
+    polarity = 1.0 if aggregate_contrast >= 0.0 else -1.0
+    profile_contrast = polarity * (outside - inside)
+    if float(np.median(profile_contrast)) < _APRILGRID_EDGE_MIN_MEDIAN_CONTRAST:
+        raise ValueError("AprilGrid edge contrast is too weak for line refinement")
+    oriented = polarity * intensities
+    targets = 0.5 * polarity * (outside + inside)
+    edge_offsets = []
+    edge_bases = []
+    for base, values, target, contrast in zip(bases, oriented, targets, profile_contrast):
+        if contrast < _APRILGRID_EDGE_MIN_MEDIAN_CONTRAST * 0.5:
+            continue
+        drops = values[:-1] - values[1:]
+        crossing = (
+            (values[:-1] >= target)
+            & (values[1:] <= target)
+            & (drops >= _APRILGRID_EDGE_MIN_PROFILE_GRADIENT)
+        )
+        # A transition touching the search boundary is not localized; the raw
+        # detector seed needs to be close enough that both plateaus are visible.
+        crossing[0] = False
+        crossing[-1] = False
+        candidates = np.flatnonzero(crossing)
+        if not len(candidates):
+            continue
+        index = int(candidates[np.argmax(drops[candidates])])
+        alpha = float((values[index] - target) / drops[index])
+        edge_offsets.append(offsets[index] + alpha * _APRILGRID_EDGE_SAMPLE_STEP_PX)
+        edge_bases.append(base)
+    if len(edge_offsets) < max(8, int(math.ceil(0.75 * count))):
+        raise ValueError("AprilGrid edge has too few consistent contrast profiles")
+    edge_points = (
+        np.asarray(edge_bases, dtype=np.float64)
+        + np.asarray(edge_offsets, dtype=np.float64)[:, None] * normal[None, :]
+    )
+    vx, vy, x0, y0 = cv2.fitLine(
+        edge_points.astype(np.float32), cv2.DIST_HUBER, 0.0, 0.01, 0.01
+    ).reshape(-1)
+    direction = np.asarray((vx, vy), dtype=np.float64)
+    direction_norm = float(np.linalg.norm(direction))
+    if direction_norm <= 1e-12:
+        raise ValueError("AprilGrid refined edge line is degenerate")
+    direction /= direction_norm
+    line_normal = np.asarray((-direction[1], direction[0]), dtype=np.float64)
+    residuals = np.matmul(
+        edge_points - np.asarray((x0, y0), dtype=np.float64), line_normal
+    )
+    line_rms = float(np.sqrt(np.mean(np.square(residuals))))
+    line_p90 = float(np.percentile(np.abs(residuals), 90.0))
+    if (
+        line_rms > _APRILGRID_EDGE_MAX_LINE_RMS_PX
+        or line_p90 > _APRILGRID_EDGE_MAX_LINE_P90_PX
+    ):
+        raise ValueError("AprilGrid edge is not straight enough for line refinement")
+    return np.asarray((x0, y0), dtype=np.float64), direction
+
+
+def _line_intersection(
+    first_point: np.ndarray,
+    first_direction: np.ndarray,
+    second_point: np.ndarray,
+    second_direction: np.ndarray,
+) -> np.ndarray:
+    system = np.column_stack((first_direction, -second_direction))
+    determinant = float(np.linalg.det(system))
+    if abs(determinant) <= 1e-6:
+        raise ValueError("AprilGrid refined edge lines are nearly parallel")
+    parameters = np.linalg.solve(system, second_point - first_point)
+    return first_point + first_direction * float(parameters[0])
+
+
+def _refine_aprilgrid_quad_edges(gray: np.ndarray, quad: np.ndarray) -> np.ndarray:
+    """Refine a tag as four gradient-fit lines and intersect adjacent edges.
+
+    Generic cornerSubPix is biased by the large binary AprilTag border. Fitting
+    each physical outer edge over its interior span uses many gradient samples,
+    stays projectively valid, and retains four independent correspondences.
+    """
+    corners = np.asarray(quad, dtype=np.float64).reshape(4, 2)
+    edge_lengths = np.asarray([
+        np.linalg.norm(corners[(index + 1) % 4] - corners[index])
+        for index in range(4)
+    ], dtype=np.float64)
+    minimum_edge_length = float(np.min(edge_lengths))
+    if minimum_edge_length < _APRILGRID_MIN_EDGE_LENGTH_PX:
+        raise ValueError("AprilGrid edge is too short for line refinement")
+    lines = [
+        _fit_aprilgrid_edge(gray, corners[index], corners[(index + 1) % 4])
+        for index in range(4)
+    ]
+    # Adjacent search bands must separate over at least one raw edge. This gives
+    # sin(theta) > 2r/L and prevents a numerically valid but ill-conditioned
+    # intersection from sending the corner far away.
+    minimum_adjacent_sine = min(
+        1.0,
+        2.0 * _APRILGRID_EDGE_SEARCH_RADIUS_PX / minimum_edge_length,
+    )
+    adjacent_cosines = []
+    for index in range(4):
+        previous_direction = lines[index - 1][1]
+        direction = lines[index][1]
+        adjacent_sine = abs(float(np.linalg.det(
+            np.stack((previous_direction, direction), axis=1)
+        )))
+        if adjacent_sine <= minimum_adjacent_sine:
+            raise ValueError("AprilGrid adjacent refined edges are too nearly parallel")
+        adjacent_cosines.append(abs(float(np.dot(previous_direction, direction))))
+    refined = np.asarray([
+        _line_intersection(*lines[index - 1], *lines[index])
+        for index in range(4)
+    ], dtype=np.float32)
+    if not bool(np.all(np.isfinite(refined))):
+        raise ValueError("AprilGrid edge refinement produced non-finite corners")
+    height, width = gray.shape[:2]
+    if not bool(np.all(
+        (refined[:, 0] >= 0.0)
+        & (refined[:, 0] <= float(width - 1))
+        & (refined[:, 1] >= 0.0)
+        & (refined[:, 1] <= float(height - 1))
+    )):
+        raise ValueError("AprilGrid refined corners leave the source image")
+    # Two fitted line offsets, each bounded by the normal search radius, move
+    # their intersection by at most ||A^-1|| * sqrt(2)r. For unit line normals,
+    # sigma_min(A)=sqrt(1-|cos(theta)|).
+    displacements = np.linalg.norm(refined.astype(np.float64) - corners, axis=1)
+    maximum_displacements = np.asarray([
+        math.sqrt(2.0) * _APRILGRID_EDGE_SEARCH_RADIUS_PX
+        / math.sqrt(max(np.finfo(np.float64).eps, 1.0 - cosine))
+        for cosine in adjacent_cosines
+    ])
+    if bool(np.any(displacements > maximum_displacements)):
+        raise ValueError("AprilGrid refined corner exceeds its search-band geometry")
+    raw_area = abs(float(cv2.contourArea(corners.astype(np.float32))))
+    refined_area = abs(float(cv2.contourArea(refined)))
+    if raw_area <= np.finfo(np.float64).eps:
+        raise ValueError("AprilGrid raw quad has degenerate area")
+    edge_band_fraction = (
+        2.0 * _APRILGRID_EDGE_SEARCH_RADIUS_PX / minimum_edge_length
+    )
+    area_ratio = refined_area / raw_area
+    if not (
+        (1.0 - edge_band_fraction) ** 2
+        <= area_ratio
+        <= (1.0 + edge_band_fraction) ** 2
+    ):
+        raise ValueError("AprilGrid refined quad area exceeds its edge-search band")
+    if (
+        not cv2.isContourConvex(refined.reshape(-1, 1, 2))
+        or np.sign(cv2.contourArea(corners.astype(np.float32), oriented=True))
+        != np.sign(cv2.contourArea(refined, oriented=True))
+    ):
+        raise ValueError("AprilGrid refined quad changed orientation")
+    return refined
 
 
 def _draw_aruco_marker(dictionary: Any, marker_id: int, size: int) -> np.ndarray:
@@ -842,7 +1042,8 @@ def coverage(
     minimum[2] = 0.0  # size / skew are rewarded by their maximum only
     minimum[3] = 0.0
     progress = [min(1.0, (hi - lo) / rng) for lo, hi, rng in zip(minimum, maximum, ranges)]
-    goodenough = (len(samples) >= 40) or all(value >= 1.0 for value in progress)
+    # Repeated observations never substitute for geometric diversity.
+    goodenough = all(value >= 1.0 for value in progress)
     bars = [{"label": name, "progress": float(value)} for name, value in zip(PARAM_NAMES, progress)]
     return bars, goodenough
 

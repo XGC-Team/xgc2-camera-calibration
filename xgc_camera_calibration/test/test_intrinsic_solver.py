@@ -55,13 +55,15 @@ class IntrinsicSolverTest(unittest.TestCase):
             [[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0]],
             dtype=np.float32,
         )
-        refined = corners + np.asarray([0.5, 0.5], dtype=np.float32)
-        with mock.patch.object(cv2, "cornerSubPix", return_value=refined) as subpixel:
+        refined = corners.reshape(4, 2) + np.asarray([0.5, 0.5], dtype=np.float32)
+        with mock.patch.object(
+            solver, "_refine_aprilgrid_quad_edges", return_value=refined
+        ) as edge_refinement:
             image_points, object_points = solver.refine_aprilgrid_calibration_corners(
                 gray, corners, objects
             )
-        subpixel.assert_called_once()
-        self.assertEqual(subpixel.call_args.args[0].shape, (1080, 1920))
+        edge_refinement.assert_called_once()
+        self.assertEqual(edge_refinement.call_args.args[0].shape, (1080, 1920))
         np.testing.assert_allclose(image_points.reshape(-1, 2), refined.reshape(-1, 2))
         np.testing.assert_allclose(object_points, objects)
 
@@ -75,9 +77,12 @@ class IntrinsicSolverTest(unittest.TestCase):
             dtype=np.float32,
         )
         objects = np.arange(24, dtype=np.float32).reshape(2, 4, 3)
-        refined = corners.reshape(-1, 1, 2).copy()
-        refined[5, 0] += np.asarray([2.0, 0.0], dtype=np.float32)
-        with mock.patch.object(cv2, "cornerSubPix", return_value=refined):
+        first_refined = corners[0] + np.asarray([0.5, 0.5], dtype=np.float32)
+        with mock.patch.object(
+            solver,
+            "_refine_aprilgrid_quad_edges",
+            side_effect=(first_refined, ValueError("second tag edge fit failed")),
+        ):
             image_points, object_points = solver.refine_aprilgrid_calibration_corners(
                 gray, corners, objects
             )
@@ -94,6 +99,37 @@ class IntrinsicSolverTest(unittest.TestCase):
         self.assertLess(result.rms_reprojection_error_px, 0.5)
         self.assertEqual(result.image_size, (WIDTH, HEIGHT))
 
+    def test_calibration_leaves_camera_matrix_and_distortion_free(self):
+        image_points, _params = _project_views()
+        returned_matrix = np.asarray(
+            ((901.0, 0.0, 639.0), (0.0, 899.0, 361.0), (0.0, 0.0, 1.0)),
+            dtype=np.float64,
+        )
+        returned_distortion = np.asarray(
+            (-0.12, 0.03, 0.001, -0.002, 0.004), dtype=np.float64
+        )
+        with mock.patch.object(
+            cv2,
+            "calibrateCamera",
+            return_value=(
+                0.25,
+                returned_matrix,
+                returned_distortion,
+                [],
+                [],
+            ),
+        ) as calibrate:
+            result = solver.calibrate_intrinsic(
+                image_points[:3], BOARD, SQUARE, (WIDTH, HEIGHT)
+            )
+
+        self.assertEqual(len(calibrate.call_args.args), 5)
+        self.assertIsNone(calibrate.call_args.args[3])
+        self.assertIsNone(calibrate.call_args.args[4])
+        self.assertEqual(calibrate.call_args.kwargs, {})
+        np.testing.assert_allclose(result.camera_matrix, returned_matrix)
+        np.testing.assert_allclose(result.distortion, returned_distortion)
+
     def test_coverage_and_new_sample(self):
         bars, goodenough = solver.coverage([])
         self.assertEqual([b["label"] for b in bars], ["X", "Y", "Size", "Skew"])
@@ -104,6 +140,12 @@ class IntrinsicSolverTest(unittest.TestCase):
         self.assertEqual(len(bars), 4)
         self.assertTrue(solver.is_new_sample((0.9, 0.1, 0.35, 0.2), params))
         self.assertFalse(solver.is_new_sample(params[0], params))
+
+    def test_repeated_samples_do_not_bypass_missing_geometry(self):
+        repeated = [(0.5, 0.5, 0.1, 0.1)] * 40
+        bars, goodenough = solver.coverage(repeated)
+        self.assertFalse(goodenough)
+        self.assertTrue(any(item["progress"] < 1.0 for item in bars))
 
     def test_aprilgrid_xy_coverage_uses_visible_board_extent(self):
         left = np.array([[10, 100], [310, 100], [310, 500], [10, 500]], np.float32)
@@ -229,12 +271,60 @@ class IntrinsicSolverTest(unittest.TestCase):
         if not hasattr(cv2, "aruco") or not hasattr(cv2.aruco, "DICT_APRILTAG_36h11"):
             self.skipTest("OpenCV AprilTag 36h11 dictionary is unavailable")
         # Kalibr's two-cell border plus 6x6 payload needs at least 2 pixels per
-        # logical cell; a 12 px marker cannot preserve ten binary cells.
+        # logical cell; a 16 px marker cannot preserve ten binary cells.
         gray = _render_aprilgrid((6, 6), tag_pixels=16, gap_pixels=5, border=20)
         detection = solver.detect_aprilgrid(
             gray, (6, 6), square=0.088, tag_spacing=0.0264, min_tags=6, maximum_width=960
         )
         self.assertIsNone(detection)
+
+    def test_edge_line_refinement_rejects_a_nonstraight_tag_boundary(self):
+        gray = np.full((160, 240), 255, dtype=np.uint8)
+        for x in range(gray.shape[1]):
+            boundary = 80 + (2 if (x // 5) % 2 else -2)
+            gray[boundary:, x] = 0
+        with self.assertRaisesRegex(ValueError, "not straight enough"):
+            solver._fit_aprilgrid_edge(
+                gray,
+                np.asarray((30.0, 80.0), dtype=np.float32),
+                np.asarray((210.0, 80.0), dtype=np.float32),
+            )
+
+    def test_edge_line_refinement_rejects_far_convex_intersections(self):
+        gray = np.zeros((240, 240), dtype=np.uint8)
+        raw = np.asarray(
+            ((50.0, 50.0), (150.0, 50.0), (150.0, 150.0), (50.0, 150.0)),
+            dtype=np.float32,
+        )
+        shifted_lines = (
+            (np.asarray((60.0, 60.0)), np.asarray((1.0, 0.0))),
+            (np.asarray((160.0, 60.0)), np.asarray((0.0, 1.0))),
+            (np.asarray((160.0, 160.0)), np.asarray((-1.0, 0.0))),
+            (np.asarray((60.0, 160.0)), np.asarray((0.0, -1.0))),
+        )
+        with mock.patch.object(
+            solver, "_fit_aprilgrid_edge", side_effect=shifted_lines
+        ), self.assertRaisesRegex(ValueError, "search-band geometry"):
+            solver._refine_aprilgrid_quad_edges(gray, raw)
+
+    def test_edge_line_refinement_rejects_nearly_parallel_adjacent_lines(self):
+        gray = np.zeros((240, 240), dtype=np.uint8)
+        raw = np.asarray(
+            ((50.0, 50.0), (150.0, 50.0), (150.0, 150.0), (50.0, 150.0)),
+            dtype=np.float32,
+        )
+        nearly_horizontal = np.asarray((1.0, 0.01), dtype=np.float64)
+        nearly_horizontal /= np.linalg.norm(nearly_horizontal)
+        ill_conditioned_lines = (
+            (np.asarray((50.0, 50.0)), np.asarray((1.0, 0.0))),
+            (np.asarray((150.0, 50.0)), nearly_horizontal),
+            (np.asarray((150.0, 150.0)), np.asarray((-1.0, 0.0))),
+            (np.asarray((50.0, 150.0)), np.asarray((0.0, -1.0))),
+        )
+        with mock.patch.object(
+            solver, "_fit_aprilgrid_edge", side_effect=ill_conditioned_lines
+        ), self.assertRaisesRegex(ValueError, "too nearly parallel"):
+            solver._refine_aprilgrid_quad_edges(gray, raw)
 
     def test_contour_fallback_supports_opencv_42_aprilgrid_detection(self):
         if not hasattr(cv2, "aruco") or not hasattr(cv2.aruco, "DICT_APRILTAG_36h11"):

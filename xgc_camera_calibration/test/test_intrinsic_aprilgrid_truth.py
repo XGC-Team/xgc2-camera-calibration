@@ -89,12 +89,13 @@ def _render_view(board, center_pixel, depth_m, rotation_vector):
     width, height = IMAGE_SIZE
     extent = TAG_SIZE_M + (BOARD_SIZE[0] - 1) * (TAG_SIZE_M + TAG_GAP_M)
     content_side = BOARD_SIZE[0] * TAG_PIXELS + (BOARD_SIZE[0] - 1) * GAP_PIXELS
-    # ArUco reports the raster corner coordinates themselves (the first marker
-    # spans margin..margin+TAG_PIXELS-1), so anchor exactly those coordinates to
-    # the physical outer-tag extent.  Mixing pixel-edge and detected-corner
-    # conventions here would manufacture a focal-scale error in the oracle.
-    lo = float(BOARD_MARGIN_PIXELS)
-    hi = lo + float(content_side - 1)
+    # The physical border lies on the white/black pixel boundaries, half a pixel
+    # outside the first/last black pixel centres. Its continuous raster span is
+    # therefore exactly ``content_side`` pixels. Mapping the physical extent to
+    # the black pixel centres would shorten the oracle by one pixel and
+    # manufacture a focal-scale error before the production detector runs.
+    lo = float(BOARD_MARGIN_PIXELS) - 0.5
+    hi = lo + float(content_side)
     source = np.asarray(
         ((lo, lo), (hi, lo), (hi, hi), (lo, hi)),
         dtype=np.float32,
@@ -232,13 +233,16 @@ class AprilGridProductionTruthTest(unittest.TestCase):
         principal_error_px = np.linalg.norm(
             result.camera_matrix[:2, 2] - TRUTH_K[:2, 2]
         )
-        self.assertLess(float(np.max(focal_relative_error)), 0.01)
+        self.assertLessEqual(float(np.max(focal_relative_error)), 0.005)
+        self.assertTrue(
+            np.all(np.abs(result.camera_matrix[:2, 2] - TRUTH_K[:2, 2]) <= 2.0)
+        )
         self.assertLess(float(principal_error_px), 1.0)
         self.assertLess(float(np.max(np.abs(result.distortion[:2]))), 0.01)
         self.assertLess(float(np.max(np.abs(result.distortion[2:4]))), 5e-4)
         if result.distortion.size > 4:
             self.assertLess(abs(float(result.distortion[4])), 0.01)
-        self.assertLess(result.rms_reprojection_error_px, 0.6)
+        self.assertLessEqual(result.rms_reprojection_error_px, 0.5)
 
 
 if __name__ == "__main__":

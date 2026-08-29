@@ -42,6 +42,116 @@ def render_board(cols_squares=8, rows_squares=6, square=40, border=40):
     return cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
 
 
+APRILGRID_TEST_SIZE = (4, 4)
+APRILGRID_TEST_TAG_SIZE = 0.088
+APRILGRID_TEST_TAG_GAP = 0.0264
+APRILGRID_TEST_IMAGE_SIZE = (1280, 720)
+APRILGRID_TEST_K = np.asarray(
+    ((900.0, 0.0, 639.5), (0.0, 900.0, 359.5), (0.0, 0.0, 1.0)),
+    dtype=np.float64,
+)
+
+
+def render_aprilgrid_view(center_pixel, depth_m, rotation_vector):
+    """Render a real tag36h11 image for process_frame-level pose admission."""
+    dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
+    tag_pixels = 100
+    gap_pixels = 30
+    margin = 48
+    pitch_pixels = tag_pixels + gap_pixels
+    content_width = (
+        APRILGRID_TEST_SIZE[0] * tag_pixels
+        + (APRILGRID_TEST_SIZE[0] - 1) * gap_pixels
+    )
+    content_height = (
+        APRILGRID_TEST_SIZE[1] * tag_pixels
+        + (APRILGRID_TEST_SIZE[1] - 1) * gap_pixels
+    )
+    board = np.full(
+        (content_height + 2 * margin, content_width + 2 * margin),
+        255,
+        dtype=np.uint8,
+    )
+    for row in range(APRILGRID_TEST_SIZE[1]):
+        for col in range(APRILGRID_TEST_SIZE[0]):
+            marker_id = row * APRILGRID_TEST_SIZE[0] + col
+            if hasattr(cv2.aruco, "generateImageMarker"):
+                marker = cv2.aruco.generateImageMarker(
+                    dictionary, marker_id, tag_pixels, None, 2
+                )
+            else:
+                marker = cv2.aruco.drawMarker(
+                    dictionary, marker_id, tag_pixels, borderBits=2
+                )
+            y0 = margin + row * pitch_pixels
+            x0 = margin + col * pitch_pixels
+            board[y0:y0 + tag_pixels, x0:x0 + tag_pixels] = marker
+
+    board_width = (
+        APRILGRID_TEST_TAG_SIZE
+        + (APRILGRID_TEST_SIZE[0] - 1)
+        * (APRILGRID_TEST_TAG_SIZE + APRILGRID_TEST_TAG_GAP)
+    )
+    board_height = (
+        APRILGRID_TEST_TAG_SIZE
+        + (APRILGRID_TEST_SIZE[1] - 1)
+        * (APRILGRID_TEST_TAG_SIZE + APRILGRID_TEST_TAG_GAP)
+    )
+    source = np.asarray(
+        (
+            (margin - 0.5, margin - 0.5),
+            (margin - 0.5 + content_width, margin - 0.5),
+            (margin - 0.5 + content_width, margin - 0.5 + content_height),
+            (margin - 0.5, margin - 0.5 + content_height),
+        ),
+        dtype=np.float32,
+    )
+    boundary = np.asarray(
+        (
+            (0.0, 0.0, 0.0),
+            (board_width, 0.0, 0.0),
+            (board_width, board_height, 0.0),
+            (0.0, board_height, 0.0),
+        ),
+        dtype=np.float32,
+    )
+    rotation_vector = np.asarray(rotation_vector, dtype=np.float64)
+    rotation = cv2.Rodrigues(rotation_vector)[0]
+    board_center = np.asarray((board_width / 2.0, board_height / 2.0, 0.0))
+    u, v = center_pixel
+    camera_center = np.asarray(
+        (
+            (float(u) - APRILGRID_TEST_K[0, 2]) * depth_m / APRILGRID_TEST_K[0, 0],
+            (float(v) - APRILGRID_TEST_K[1, 2]) * depth_m / APRILGRID_TEST_K[1, 1],
+            depth_m,
+        )
+    )
+    translation = camera_center - rotation.dot(board_center)
+    projected, _jacobian = cv2.projectPoints(
+        boundary,
+        rotation_vector,
+        translation,
+        APRILGRID_TEST_K,
+        np.zeros(5, dtype=np.float64),
+    )
+    transform = cv2.getPerspectiveTransform(
+        source, projected.reshape(4, 2).astype(np.float32)
+    )
+    gray = cv2.warpPerspective(
+        board,
+        transform,
+        APRILGRID_TEST_IMAGE_SIZE,
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=255,
+    )
+    encoded, jpeg = cv2.imencode(".jpg", gray, (cv2.IMWRITE_JPEG_QUALITY, 94))
+    if not encoded:
+        raise AssertionError("could not encode synthetic AprilGrid frame")
+    decoded = cv2.imdecode(jpeg, cv2.IMREAD_GRAYSCALE)
+    return cv2.cvtColor(decoded, cv2.COLOR_GRAY2BGR)
+
+
 def make_service(output_file):
     # 8x6 squares -> 7x5 interior corners.
     return IntrinsicCalibrationService(
@@ -218,7 +328,7 @@ class IntrinsicServiceTest(unittest.TestCase):
             service.process_frame(
                 frame,
                 render_position=first_target,
-                render_orientation=(0.0, 0.0, 1.0, 0.0),
+                render_orientation=(0.0, 0.0, 0.0, 1.0),
             )
             self.assertEqual(len(service.samples), 1)
             self.assertTrue(service.target_done[0])
@@ -229,6 +339,8 @@ class IntrinsicServiceTest(unittest.TestCase):
                 render_position=first_target,
                 render_orientation=(0.0, 0.0, 0.0, 1.0),
             )
+            # This is a valid pose from the previous target, not an artificial
+            # orientation failure. Target identity must reject the stale replay.
             self.assertEqual(len(service.samples), 1)
             self.assertFalse(service.target_done[1])
 
@@ -241,6 +353,56 @@ class IntrinsicServiceTest(unittest.TestCase):
             # Identical image-space coverage is still one sample per authored
             # mirror target in simulation.
             self.assertEqual(len(service.samples), 2)
+            self.assertTrue(service.target_done[1])
+            self.assertEqual(service.sample_target_ids, [0, 1])
+
+    def test_capture_started_before_next_goto_cannot_enter_the_new_target_epoch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = make_service(Path(directory) / "intrinsics.yaml")
+            camera = FakeCameraControl()
+            service.attach_camera_control(camera)
+            capture_started = threading.Event()
+            release_capture = threading.Event()
+
+            def delayed_capture():
+                capture_started.set()
+                self.assertTrue(release_capture.wait(timeout=1.0))
+                return SimpleNamespace(
+                    bgr=render_board(),
+                    # Return the new pose deliberately: even matching metadata
+                    # cannot make a transaction that began in the old epoch fresh.
+                    render_position=tuple(camera.current_position()),
+                    render_orientation=(0.0, 0.0, 0.0, 1.0),
+                )
+
+            service.goto(0)
+            service.attach_frame_capture(delayed_capture)
+            capture_errors = []
+
+            def run_delayed_capture():
+                try:
+                    service._capture_frame()
+                except Exception as error:
+                    capture_errors.append(error)
+
+            capture_thread = threading.Thread(target=run_delayed_capture)
+            capture_thread.start()
+            self.assertTrue(capture_started.wait(timeout=1.0))
+            service.goto(1)
+            release_capture.set()
+            capture_thread.join(timeout=1.0)
+            self.assertFalse(capture_thread.is_alive())
+            self.assertEqual(capture_errors, [])
+            self.assertEqual(service.samples, [])
+            self.assertFalse(any(service.target_done))
+
+            service.attach_frame_capture(lambda: SimpleNamespace(
+                bgr=render_board(),
+                render_position=tuple(camera.current_position()),
+                render_orientation=(0.0, 0.0, 0.0, 1.0),
+            ))
+            service._capture_frame()
+            self.assertEqual(service.sample_target_ids, [1])
             self.assertTrue(service.target_done[1])
 
     def test_reduced_detection_frame_keeps_source_calibration_coordinates(self):
@@ -353,6 +515,88 @@ class IntrinsicServiceTest(unittest.TestCase):
             )
             self.assertEqual(service.state()["detection"]["corner_count"], 4)
 
+    def test_source_jpeg_must_confirm_the_working_signed_pose_candidate(self):
+        if not hasattr(cv2, "aruco") or not hasattr(cv2.aruco, "DICT_APRILTAG_36h11"):
+            self.skipTest("OpenCV AprilTag 36h11 dictionary is unavailable")
+        with tempfile.TemporaryDirectory() as directory:
+            service = IntrinsicCalibrationService(
+                board_size=APRILGRID_TEST_SIZE,
+                square=APRILGRID_TEST_TAG_SIZE,
+                output_file=str(Path(directory) / "intrinsics.yaml"),
+                camera_name="usb_cam",
+                board_type="aprilgrid",
+                tag_spacing=APRILGRID_TEST_TAG_GAP,
+                min_tags=6,
+                display_width=640,
+            )
+            for center, depth, rotation in (
+                ((640, 360), 1.50, (0.00, 0.00, 0.00)),
+                ((300, 360), 1.50, (0.08, 0.00, 0.00)),
+                ((640, 180), 1.05, (0.00, 0.08, 0.00)),
+            ):
+                service.process_frame(render_aprilgrid_view(center, depth, rotation))
+            self.assertEqual(len(service.samples), 3)
+            self.assertEqual(service.state()["pose_coverage"]["status"], "ready")
+
+            frontal_source = render_aprilgrid_view(
+                (640, 360), 1.50, (0.00, 0.00, 0.00)
+            )
+            positive_x_source = render_aprilgrid_view(
+                (640, 360), 1.50, (0.00, 0.35, 0.00)
+            )
+            working_positive_x = cv2.resize(
+                positive_x_source,
+                (640, 360),
+                interpolation=cv2.INTER_AREA,
+            )
+            stale_ok, stale_jpeg = cv2.imencode(
+                ".jpg", frontal_source, (cv2.IMWRITE_JPEG_QUALITY, 94)
+            )
+            self.assertTrue(stale_ok)
+            baseline_lengths = (
+                len(service.samples),
+                len(service.image_points),
+                len(service.object_points),
+            )
+
+            service.process_frame(
+                working_positive_x,
+                source_image_size=APRILGRID_TEST_IMAGE_SIZE,
+                source_jpeg=stale_jpeg.tobytes(),
+            )
+            rejected = service.state()
+            self.assertEqual(
+                (
+                    len(service.samples),
+                    len(service.image_points),
+                    len(service.object_points),
+                ),
+                baseline_lengths,
+            )
+            self.assertFalse(rejected["detection"]["accepted"])
+            self.assertEqual(
+                rejected["recovery"]["last_error"],
+                "AprilGrid source correspondences do not fill a missing signed "
+                "plane-normal bin",
+            )
+
+            matching_ok, matching_jpeg = cv2.imencode(
+                ".jpg", positive_x_source, (cv2.IMWRITE_JPEG_QUALITY, 94)
+            )
+            self.assertTrue(matching_ok)
+            service.process_frame(
+                working_positive_x,
+                source_image_size=APRILGRID_TEST_IMAGE_SIZE,
+                source_jpeg=matching_jpeg.tobytes(),
+            )
+            accepted = service.state()
+            self.assertEqual(len(service.samples), baseline_lengths[0] + 1)
+            self.assertEqual(len(service.image_points), baseline_lengths[1] + 1)
+            self.assertEqual(len(service.object_points), baseline_lengths[2] + 1)
+            self.assertTrue(accepted["detection"]["accepted"])
+            self.assertTrue(accepted["pose_coverage"]["bins"]["x_positive"])
+            self.assertIsNone(accepted["recovery"]["last_error"])
+
     def test_repeated_board_frame_reports_geometric_duplicate(self):
         with tempfile.TemporaryDirectory() as directory:
             service = make_service(Path(directory) / "intrinsics.yaml")
@@ -364,6 +608,78 @@ class IntrinsicServiceTest(unittest.TestCase):
             self.assertEqual(state["detection"]["status"], "detected")
             self.assertFalse(state["detection"]["accepted"])
             self.assertTrue(state["detection"]["duplicate"])
+
+    def test_physical_aprilgrid_completion_requires_signed_plane_tilt(self):
+        if not hasattr(cv2, "aruco") or not hasattr(cv2.aruco, "DICT_APRILTAG_36h11"):
+            self.skipTest("OpenCV AprilTag 36h11 dictionary is unavailable")
+        with tempfile.TemporaryDirectory() as directory:
+            service = IntrinsicCalibrationService(
+                board_size=APRILGRID_TEST_SIZE,
+                square=APRILGRID_TEST_TAG_SIZE,
+                output_file=str(Path(directory) / "intrinsics.yaml"),
+                camera_name="usb_cam", board_type="aprilgrid",
+                tag_spacing=APRILGRID_TEST_TAG_GAP, min_tags=6,
+                display_width=640,
+            )
+            # Seed provisional K through ordinary image-plane novelty without
+            # filling any >=10 degree signed tilt bin.
+            seed_views = (
+                ((640, 360), 1.50, (0.00, 0.00, 0.00)),
+                ((300, 360), 1.50, (0.08, 0.00, 0.00)),
+                ((640, 180), 1.05, (0.00, 0.08, 0.00)),
+            )
+            for center, depth, rotation in seed_views:
+                service.process_frame(render_aprilgrid_view(center, depth, rotation))
+            self.assertEqual(len(service.samples), 3)
+            self.assertFalse(any(
+                service.state()["pose_coverage"]["bins"][name]
+                for name in ("x_negative", "x_positive", "y_negative", "y_positive")
+            ))
+
+            # All four production frames have nearly the same centre/depth and
+            # old 4D footprint, but each missing normal sign remains admissible.
+            service.process_frame(
+                render_aprilgrid_view((640, 360), 1.50, (0.00, 0.35, 0.00))
+            )
+            self.assertEqual(len(service.samples), 4)
+            self.assertLess(
+                sum(abs(a - b) for a, b in zip(service.samples[0], service.samples[3])),
+                service.sample_distance,
+            )
+
+            # A nearby observation in the already-covered x-positive bin is a
+            # genuine duplicate and must not receive the signed-bin override.
+            service.process_frame(
+                render_aprilgrid_view((640, 360), 1.50, (0.00, 0.36, 0.00))
+            )
+            self.assertEqual(len(service.samples), 4)
+            self.assertTrue(service.state()["detection"]["duplicate"])
+
+            for rotation in (
+                (0.00, -0.35, 0.00),
+                (0.35, 0.00, 0.00),
+                (-0.35, 0.00, 0.00),
+            ):
+                service.process_frame(
+                    render_aprilgrid_view((640, 360), 1.50, rotation)
+                )
+
+            state = service.state()
+            self.assertEqual(state["samples"], 7)
+            self.assertEqual(state["pose_coverage"]["status"], "ready")
+            self.assertTrue(state["pose_coverage"]["bins"]["complete"])
+            self.assertLess(
+                sum(abs(a - b) for a, b in zip(service.samples[3], service.samples[4])),
+                service.sample_distance,
+            )
+            self.assertLess(
+                sum(abs(a - b) for a, b in zip(service.samples[5], service.samples[6])),
+                service.sample_distance,
+            )
+            self.assertEqual(
+                next(item for item in state["coverage"] if item["label"] == "Skew")["progress"],
+                1.0,
+            )
 
     def test_non_board_frame_adds_no_sample(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -427,8 +743,28 @@ class IntrinsicServiceTest(unittest.TestCase):
             self.assertEqual(state["samples"], 1)
             self.assertEqual(len(restored.image_points), 1)
             self.assertEqual(len(restored.object_points), 1)
+            self.assertEqual(restored.sample_target_ids, [None])
             self.assertTrue(state["recovery"]["checkpoint_available"])
             self.assertFalse(state["result_restored"])
+
+    def test_checkpoint_restores_exact_simulation_target_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "intrinsics.yaml"
+            service = make_service(output)
+            camera = FakeCameraControl()
+            service.attach_camera_control(camera)
+            service.goto(3)
+            service.process_frame(
+                render_board(),
+                render_position=tuple(service.views[3]["position"]),
+                render_orientation=camera.current_optical_pose()["orientation"],
+            )
+            self.assertEqual(service.sample_target_ids, [3])
+
+            restored = make_service(output)
+            self.assertEqual(restored.sample_target_ids, [3])
+            self.assertTrue(restored.target_done[3])
+            self.assertEqual(sum(restored.target_done), 1)
 
     def test_center_feature_checkpoint_is_not_restored_as_full_corner_data(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -679,6 +1015,7 @@ class IntrinsicServiceTest(unittest.TestCase):
 
             service.attach_frame_capture(capture_at_current_pose)
             service.start_auto_capture(interval=0.1)
+            self.addCleanup(service.stop_auto_capture)
 
             with patch.object(
                 service, "_calibrate_locked", return_value={"output_file": str(Path(directory) / "intrinsics.yaml")}
@@ -700,12 +1037,14 @@ class IntrinsicServiceTest(unittest.TestCase):
                     self.assertEqual(caught.exception.status, int(HTTPStatus.CONFLICT))
                     self.assertIn("already running", caught.exception.message)
 
-                deadline = monotonic() + 4.0
-                while service.state()["action"]["status"] == "running" and monotonic() < deadline:
-                    sleep(0.01)
+                auto_thread = service._auto_run_thread
+                self.assertIsNotNone(auto_thread)
+                auto_thread.join(timeout=len(service.views) * 0.3 + 2.0)
+                self.assertFalse(auto_thread.is_alive())
             self.assertEqual(service.state()["action"]["status"], "succeeded")
             self.assertEqual(len(camera.positions), 15)
             self.assertEqual(len(service.samples), 15)
+            self.assertEqual(service.sample_target_ids, list(range(15)))
             self.assertTrue(all(target["done"] for target in service.state()["targets"]))
             service.stop_auto_capture()
             self.assertEqual(service.reset()["samples"], 0)

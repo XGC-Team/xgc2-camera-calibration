@@ -31,12 +31,19 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 import cv2
 import numpy as np
 
-from xgc_camera_calibration import intrinsic_solver, intrinsic_validation
+from xgc_camera_calibration import (
+    intrinsic_pose_coverage,
+    intrinsic_solver,
+    intrinsic_validation,
+)
 from xgc_camera_calibration.solver import CalibrationError
 from xgc_camera_calibration.web_service import ApiError
 
 APRILGRID_ADAPTIVE_DETECTION_WIDTH = 2200
 CAMERA_NAME_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9._-]{0,63}$")
+_TARGET_CAPTURE_TOKEN_UNSET = object()
+_SIM_TARGET_ANGLE_TOLERANCE_RAD = 0.04
+_PHYSICAL_APRILGRID_MIN_TILT_DEGREES = 10.0
 
 
 def intrinsic_calibration_directory(root: str, mode: str, camera_name: str) -> Path:
@@ -169,6 +176,8 @@ class IntrinsicCalibrationService:
         self.samples: List[Tuple[float, float, float, float]] = []
         self.image_points: List[np.ndarray] = []
         self.object_points: List[np.ndarray] = []
+        self.sample_target_ids: List[Optional[int]] = []
+        self._pose_coverage: Dict[str, Any] = self._empty_pose_coverage()
         self.image_size: Optional[Tuple[int, int]] = None
         self._display: Optional[np.ndarray] = None
         self.result: Optional[intrinsic_solver.IntrinsicResult] = None
@@ -209,6 +218,18 @@ class IntrinsicCalibrationService:
         self.views: List[Dict[str, Any]] = recommended_views(
             self.board_center, max(board_width, board_height)
         )
+        distinct_separations = [
+            sum(
+                (float(first["position"][axis]) - float(second["position"][axis])) ** 2
+                for axis in range(3)
+            ) ** 0.5
+            for first_index, first in enumerate(self.views)
+            for second in self.views[first_index + 1:]
+        ]
+        self._target_position_tolerance = max(
+            1e-4,
+            min(0.01, 0.25 * min(distinct_separations)),
+        )
         self.target_done: List[bool] = [False] * len(self.views)
         self.references_dir = str(Path(references_dir).expanduser()) if references_dir else ""
         self.refs: Dict[int, bytes] = {}
@@ -223,7 +244,9 @@ class IntrinsicCalibrationService:
         self.action: Optional[Dict[str, Any]] = None
         self._selected_target_index: Optional[int] = None
         self._target_capture_phase = "idle"
-        self._target_capture_baseline_sequence = 0
+        self._target_capture_epoch = 0
+        self._target_expected_pose: Optional[Dict[str, Tuple[float, ...]]] = None
+        self._target_pose_ack_enabled = False
         self._auto_run_thread: Optional[threading.Thread] = None
         self._auto_capture_thread: Optional[threading.Thread] = None
         self._auto_capture_stop = threading.Event()
@@ -243,6 +266,145 @@ class IntrinsicCalibrationService:
         """Attach an immutable Media Edge snapshot transaction."""
         with self.lock:
             self.frame_capture = capture
+
+    def _empty_pose_coverage(self) -> Dict[str, Any]:
+        return {
+            "status": "estimating" if self.board_type == "aprilgrid" else "not_applicable",
+            "minimum_tilt_degrees": _PHYSICAL_APRILGRID_MIN_TILT_DEGREES,
+            "view_count": 0,
+            "bins": {
+                "x_negative": False,
+                "x_positive": False,
+                "y_negative": False,
+                "y_positive": False,
+                "complete": False,
+            },
+            "views": [],
+            "error": None,
+        }
+
+    def _update_pose_coverage_locked(self) -> None:
+        if self.board_type != "aprilgrid":
+            self._pose_coverage = self._empty_pose_coverage()
+            return
+        if len(self.image_points) < 3 or self.image_size is None:
+            self._pose_coverage = self._empty_pose_coverage()
+            self._pose_coverage["view_count"] = len(self.image_points)
+            return
+        try:
+            provisional = intrinsic_pose_coverage.estimate_provisional_camera_matrix(
+                self.object_points,
+                self.image_points,
+                self.image_size,
+                aspect_ratio=1.0,
+            )
+            orientations = [
+                intrinsic_pose_coverage.estimate_plane_orientation(objects, image, provisional)
+                for image, objects in zip(self.image_points, self.object_points)
+            ]
+            bins = intrinsic_pose_coverage.signed_tilt_bins(
+                orientations, _PHYSICAL_APRILGRID_MIN_TILT_DEGREES
+            )
+            self._pose_coverage = {
+                "status": "ready",
+                "minimum_tilt_degrees": 10.0,
+                "view_count": len(orientations),
+                "bins": bins,
+                "views": [{
+                    "tilt_x_degrees": item.tilt_x_degrees,
+                    "tilt_y_degrees": item.tilt_y_degrees,
+                    "roll_degrees": item.roll_degrees,
+                    "homography_rms_px": item.homography_rms_px,
+                } for item in orientations],
+                "error": None,
+            }
+        except (ValueError, cv2.error, np.linalg.LinAlgError) as error:
+            self._pose_coverage = self._empty_pose_coverage()
+            self._pose_coverage.update({
+                "status": "unavailable",
+                "view_count": len(self.image_points),
+                "error": str(error) or error.__class__.__name__,
+            })
+
+    def _candidate_extends_pose_coverage_locked(
+        self,
+        image_points: np.ndarray,
+        object_points: np.ndarray,
+    ) -> bool:
+        """Return whether one physical AprilGrid view fills a missing signed bin.
+
+        The ordinary image-plane novelty gate remains authoritative for seed and
+        spatial coverage. Once provisional K is available, a near-identical 4D
+        footprint may still carry the missing sign of the board plane normal.
+        Both admission and final coverage use the same K initializer,
+        homography decomposition, tilt threshold, and bin classifier.
+        """
+        if (
+            self.board_type != "aprilgrid"
+            or self.image_size is None
+            or len(self.image_points) < 3
+            or self._pose_coverage.get("status") != "ready"
+        ):
+            return False
+        try:
+            provisional = intrinsic_pose_coverage.estimate_provisional_camera_matrix(
+                self.object_points,
+                self.image_points,
+                self.image_size,
+                aspect_ratio=1.0,
+            )
+            candidate = intrinsic_pose_coverage.estimate_plane_orientation(
+                object_points, image_points, provisional
+            )
+            candidate_bins = intrinsic_pose_coverage.signed_tilt_bins(
+                (candidate,), _PHYSICAL_APRILGRID_MIN_TILT_DEGREES
+            )
+        except (ValueError, cv2.error, np.linalg.LinAlgError):
+            return False
+        covered_bins = self._pose_coverage["bins"]
+        return any(
+            bool(candidate_bins[name]) and not bool(covered_bins[name])
+            for name in ("x_negative", "x_positive", "y_negative", "y_positive")
+        )
+
+    def _coverage_state_locked(self) -> Tuple[List[Dict[str, Any]], bool]:
+        bars, generic_complete = intrinsic_solver.coverage(self.samples)
+        if self.result is not None:
+            return bars, True
+        if self.camera is not None:
+            return bars, (
+                all(self.target_done)
+                and len(self.samples) == len(self.views)
+                and self._simulation_target_ids_complete_locked()
+            )
+        if self.board_type != "aprilgrid":
+            return bars, generic_complete
+        pose = self._pose_coverage
+        bins = pose["bins"]
+        tilt_progress = sum(bool(bins[key]) for key in (
+            "x_negative", "x_positive", "y_negative", "y_positive",
+        )) / 4.0
+        bars = [
+            {**bar, "progress": tilt_progress} if bar["label"] == "Skew" else bar
+            for bar in bars
+        ]
+        spatial_complete = all(
+            bar["progress"] >= 1.0 for bar in bars if bar["label"] != "Skew"
+        )
+        return bars, (
+            len(self.samples) >= 10
+            and pose["status"] == "ready"
+            and bool(bins["complete"])
+            and spatial_complete
+        )
+
+    def _simulation_target_ids_complete_locked(self) -> bool:
+        captured = [int(value) for value in self.sample_target_ids if value is not None]
+        return (
+            len(self.sample_target_ids) == len(self.views)
+            and len(captured) == len(self.views)
+            and sorted(captured) == list(range(len(self.views)))
+        )
 
     def _auto_capture_document_locked(self) -> Dict[str, Any]:
         thread = self._auto_capture_thread
@@ -319,8 +481,8 @@ class IntrinsicCalibrationService:
                 else:
                     with self.lock:
                         self._auto_capture_error = None
-                        guidance = intrinsic_solver.next_view_guidance(self.samples)
-                        self._auto_capture_completed = bool(guidance["complete"])
+                        _bars, complete = self._coverage_state_locked()
+                        self._auto_capture_completed = bool(complete)
                 if self._auto_capture_interval <= 0.0:
                     # The source transaction (fresh camera frame) and detector
                     # provide natural backpressure. Only failures get a small
@@ -367,7 +529,7 @@ class IntrinsicCalibrationService:
 
     def _recovery_fingerprint(self) -> Dict[str, Any]:
         return {
-            "schema": 2,
+            "schema": 3,
             "feature_model": (
                 intrinsic_solver.APRILGRID_FEATURE_MODEL
                 if self.board_type == "aprilgrid"
@@ -711,8 +873,17 @@ class IntrinsicCalibrationService:
                 return False
             samples = np.asarray(archive["samples"], dtype=np.float64)
             image_size_values = np.asarray(archive["image_size"], dtype=np.int64).reshape(-1)
+            target_ids = np.asarray(archive["sample_target_ids"], dtype=np.int64).reshape(-1)
             if samples.ndim != 2 or samples.shape[1] != 4 or len(image_size_values) != 2:
                 raise CalibrationError("calibration checkpoint shape is invalid")
+            if len(target_ids) != len(samples):
+                raise CalibrationError("calibration checkpoint target identities do not match")
+            simulation_ids = [int(value) for value in target_ids if int(value) >= 0]
+            if (
+                any(value >= len(self.views) for value in simulation_ids)
+                or len(simulation_ids) != len(set(simulation_ids))
+            ):
+                raise CalibrationError("calibration checkpoint target identities are invalid")
             image_points: List[np.ndarray] = []
             object_points: List[np.ndarray] = []
             for index in range(len(samples)):
@@ -725,7 +896,12 @@ class IntrinsicCalibrationService:
         self.samples = [tuple(float(value) for value in row) for row in samples]
         self.image_points = image_points
         self.object_points = object_points
+        self.sample_target_ids = [
+            None if int(value) < 0 else int(value) for value in target_ids
+        ]
+        self.target_done = [index in simulation_ids for index in range(len(self.views))]
         self.image_size = (int(image_size_values[0]), int(image_size_values[1]))
+        self._update_pose_coverage_locked()
         return bool(self.samples)
 
     def _load_recovery(self) -> None:
@@ -741,12 +917,18 @@ class IntrinsicCalibrationService:
     def _save_checkpoint_locked(self) -> None:
         if not self.samples or self.image_size is None or self.result is not None:
             return
+        if len(self.sample_target_ids) != len(self.samples):
+            raise CalibrationError("calibration sample target identities do not match")
         destination = Path(self.checkpoint_file)
         destination.parent.mkdir(parents=True, exist_ok=True)
         payload: Dict[str, Any] = {
             "fingerprint": np.asarray(json.dumps(self._recovery_fingerprint(), sort_keys=True)),
             "samples": np.asarray(self.samples, dtype=np.float64),
             "image_size": np.asarray(self.image_size, dtype=np.int64),
+            "sample_target_ids": np.asarray(
+                [-1 if value is None else int(value) for value in self.sample_target_ids],
+                dtype=np.int64,
+            ),
         }
         for index, (image, objects) in enumerate(zip(self.image_points, self.object_points)):
             payload["image_points_{:03d}".format(index)] = np.asarray(image, dtype=np.float32)
@@ -817,31 +999,88 @@ class IntrinsicCalibrationService:
                 return self._selected_target_index
         return None
 
+    def _begin_target_move_locked(self, index: int, *, allow_frame_ack: bool) -> None:
+        """Open a new authored-target epoch before issuing the camera command."""
+        self._selected_target_index = index
+        self._target_capture_epoch += 1
+        self._target_capture_phase = "moving"
+        self._target_expected_pose = None
+        self._target_pose_ack_enabled = bool(allow_frame_ack)
+
+    def _acknowledge_target_pose_locked(self, index: Optional[int] = None) -> bool:
+        """Snapshot the optical pose only after Gazebo reports the commanded target."""
+        if (
+            self._target_capture_phase != "moving"
+            or not self._target_pose_ack_enabled
+            or self.camera is None
+        ):
+            return False
+        target_index = self._explicit_target_index_locked() if index is None else index
+        if target_index is None:
+            return False
+        current_optical_pose = getattr(self.camera, "current_optical_pose", None)
+        if not callable(current_optical_pose):
+            return False
+        current = current_optical_pose()
+        if not isinstance(current, Mapping):
+            return False
+        try:
+            position = np.asarray(current["position"], dtype=np.float64).reshape(-1)
+            orientation = np.asarray(current["orientation"], dtype=np.float64).reshape(-1)
+        except (KeyError, TypeError, ValueError):
+            return False
+        if (
+            len(position) != 3
+            or len(orientation) != 4
+            or not bool(np.all(np.isfinite(position)))
+            or not bool(np.all(np.isfinite(orientation)))
+        ):
+            return False
+        target = np.asarray(self.views[target_index]["position"], dtype=np.float64)
+        if float(np.linalg.norm(position - target)) > self._target_position_tolerance:
+            return False
+        orientation_norm = float(np.linalg.norm(orientation))
+        if orientation_norm <= 1e-12:
+            return False
+        self._target_expected_pose = {
+            "position": tuple(float(value) for value in position),
+            "orientation": tuple(float(value) for value in orientation / orientation_norm),
+        }
+        self._target_capture_phase = "awaiting_detection"
+        self._target_pose_ack_enabled = False
+        return True
+
+    def _active_target_capture_token_locked(self) -> Optional[Tuple[int, int]]:
+        index = self._explicit_target_index_locked()
+        if (
+            self._target_capture_phase != "awaiting_detection"
+            or self._target_expected_pose is None
+            or index is None
+        ):
+            return None
+        return self._target_capture_epoch, index
+
     def _target_frame_is_admissible_locked(
         self,
         index: int,
         render_position: Optional[Sequence[float]],
         render_orientation: Optional[Sequence[float]],
+        capture_token: Optional[Tuple[int, int]],
     ) -> bool:
         """Accept only a post-command, pose-bound frame for one sim target."""
         if (
             self._recording
             or self.camera is None
             or self._target_capture_phase != "awaiting_detection"
-            or self._frame_sequence <= self._target_capture_baseline_sequence
+            or capture_token != (self._target_capture_epoch, index)
             or self.target_done[index]
             or render_position is None
             or render_orientation is None
         ):
             return False
-        if not self._render_pose_matches_camera(render_position, render_orientation):
-            return False
-        target = self.views[index]["position"]
-        distance = sum(
-            (float(render_position[axis]) - float(target[axis])) ** 2
-            for axis in range(3)
-        ) ** 0.5
-        return distance <= 0.12
+        return self._render_pose_matches_expected_locked(
+            render_position, render_orientation
+        )
 
     def _complete_target_sample_locked(
         self,
@@ -851,37 +1090,53 @@ class IntrinsicCalibrationService:
         """Atomically bind one stored solve sample and reference to a target."""
         if self.target_done[index]:
             return
+        if not self.sample_target_ids or self.sample_target_ids[-1] != index:
+            raise CalibrationError("calibration sample is not bound to the authored target")
         self.target_done[index] = True
         self._target_capture_phase = "idle"
+        self._target_expected_pose = None
+        self._target_pose_ack_enabled = False
         ok, encoded = cv2.imencode(
             ".jpg", display, [int(cv2.IMWRITE_JPEG_QUALITY), 75]
         )
         if ok:
             self._save_ref(index, encoded.tobytes())
 
-    def _render_pose_matches_camera(
+    def _render_pose_matches_expected_locked(
         self,
         render_position: Optional[Sequence[float]],
         render_orientation: Optional[Sequence[float]],
     ) -> bool:
-        if render_position is None or render_orientation is None or self.camera is None:
-            return True
-        current_optical_pose = getattr(self.camera, "current_optical_pose", None)
-        if not callable(current_optical_pose):
-            return True
-        current = current_optical_pose()
-        if current is None:
+        expected = self._target_expected_pose
+        if render_position is None or render_orientation is None or expected is None:
             return False
-        position_error = sum(
-            (float(render_position[index]) - float(current["position"][index])) ** 2
-            for index in range(3)
-        ) ** 0.5
-        dot = abs(sum(
-            float(render_orientation[index]) * float(current["orientation"][index])
-            for index in range(4)
+        try:
+            position = np.asarray(render_position, dtype=np.float64).reshape(-1)
+            orientation = np.asarray(render_orientation, dtype=np.float64).reshape(-1)
+        except (TypeError, ValueError):
+            return False
+        if (
+            len(position) != 3
+            or len(orientation) != 4
+            or not bool(np.all(np.isfinite(position)))
+            or not bool(np.all(np.isfinite(orientation)))
+        ):
+            return False
+        orientation_norm = float(np.linalg.norm(orientation))
+        if orientation_norm <= 1e-12:
+            return False
+        position_error = float(np.linalg.norm(
+            position - np.asarray(expected["position"], dtype=np.float64)
         ))
+        dot = abs(float(np.dot(
+            orientation / orientation_norm,
+            np.asarray(expected["orientation"], dtype=np.float64),
+        )))
         angle_error = 2.0 * math.acos(min(1.0, max(0.0, dot)))
-        return position_error <= 0.12 and angle_error <= 0.04
+        return (
+            position_error <= self._target_position_tolerance
+            and angle_error <= _SIM_TARGET_ANGLE_TOLERANCE_RAD
+        )
 
     def _encode_jpeg(self, image: np.ndarray) -> bytes:
         ok, encoded = cv2.imencode(".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality])
@@ -896,8 +1151,17 @@ class IntrinsicCalibrationService:
         render_orientation: Optional[Sequence[float]] = None,
         source_image_size: Optional[Sequence[int]] = None,
         source_jpeg: Optional[bytes] = None,
+        _target_capture_token: Any = _TARGET_CAPTURE_TOKEN_UNSET,
     ) -> None:
         """Ingest one decoded BGR frame: detect the board, auto-collect, annotate."""
+        if _target_capture_token is _TARGET_CAPTURE_TOKEN_UNSET:
+            # Direct synchronous callers begin their capture at method entry.
+            # ``_capture_frame`` supplies the token recorded before its external
+            # snapshot transaction, which is the race-sensitive production path.
+            with self.lock:
+                capture_token = self._active_target_capture_token_locked()
+        else:
+            capture_token = _target_capture_token
         if bgr.ndim != 3 or bgr.shape[2] != 3:
             return
         height, width = bgr.shape[:2]
@@ -961,8 +1225,13 @@ class IntrinsicCalibrationService:
         with self.lock:
             self.image_size = (source_width, source_height)
             self._frame_sequence += 1
+            # A frame that began while the camera was moving may acknowledge the
+            # new pose, but its missing capture token prevents that same frame
+            # from becoming solve evidence. Only the next transaction is fresh.
+            self._acknowledge_target_pose_locked()
             accepted = False
             duplicate = False
+            pose_coverage_override = False
             if detection is not None:
                 corners = detection.image_points
                 params = detection.coverage
@@ -987,14 +1256,14 @@ class IntrinsicCalibrationService:
                         )
                 else:
                     cv2.drawChessboardCorners(display, self.board_size, scaled, True)
-                pose_matches = self._render_pose_matches_camera(
-                    render_position, render_orientation
-                )
-                if self.result is None and pose_matches:
+                if self.result is None:
                     target_index = self._explicit_target_index_locked()
                     if target_index is not None:
                         accepted = self._target_frame_is_admissible_locked(
-                            target_index, render_position, render_orientation
+                            target_index,
+                            render_position,
+                            render_orientation,
+                            capture_token,
                         )
                         duplicate = self.target_done[target_index]
                     elif self.camera is not None:
@@ -1003,9 +1272,17 @@ class IntrinsicCalibrationService:
                         accepted = False
                         duplicate = False
                     else:
-                        accepted = intrinsic_solver.is_new_sample(
+                        image_plane_novel = intrinsic_solver.is_new_sample(
                             params, self.samples, self.sample_distance
                         )
+                        pose_coverage_override = (
+                            not image_plane_novel
+                            and self.board_type == "aprilgrid"
+                            and self._candidate_extends_pose_coverage_locked(
+                                calibration_corners, calibration_objects
+                            )
+                        )
+                        accepted = image_plane_novel or pose_coverage_override
                         duplicate = not accepted
                     if accepted:
                         if self.board_type == "aprilgrid" and source_jpeg:
@@ -1043,6 +1320,16 @@ class IntrinsicCalibrationService:
                                     raise CalibrationError(
                                         "AprilGrid source-resolution correspondences are missing"
                                     )
+                                if (
+                                    pose_coverage_override
+                                    and not self._candidate_extends_pose_coverage_locked(
+                                        calibration_corners, calibration_objects
+                                    )
+                                ):
+                                    raise CalibrationError(
+                                        "AprilGrid source correspondences do not fill a missing "
+                                        "signed plane-normal bin"
+                                    )
                             except Exception as error:
                                 # Keep the live detection, but never admit a
                                 # solve sample containing mixed refined/raw
@@ -1053,6 +1340,8 @@ class IntrinsicCalibrationService:
                             self.samples.append(params)
                             self.image_points.append(calibration_corners)
                             self.object_points.append(calibration_objects)
+                            self.sample_target_ids.append(target_index)
+                            self._update_pose_coverage_locked()
                             try:
                                 self._save_checkpoint_locked()
                             except Exception as error:
@@ -1151,7 +1440,7 @@ class IntrinsicCalibrationService:
 
     def state(self) -> Dict[str, Any]:
         with self.lock:
-            bars, sample_goodenough = intrinsic_solver.coverage(self.samples)
+            bars, sample_goodenough = self._coverage_state_locked()
             if not self.samples and self.restored_coverage:
                 bars = [dict(item) for item in self.restored_coverage]
             goodenough = self.result is not None or sample_goodenough
@@ -1169,7 +1458,13 @@ class IntrinsicCalibrationService:
                 "samples": len(self.samples) if self.samples else (
                     self.result.sample_count if self.result is not None else 0
                 ),
+                "sample_target_ids": list(self.sample_target_ids),
                 "coverage": bars,
+                "pose_coverage": {
+                    **self._pose_coverage,
+                    "bins": dict(self._pose_coverage["bins"]),
+                    "views": [dict(item) for item in self._pose_coverage["views"]],
+                },
                 "guidance": guidance,
                 "goodenough": bool(goodenough),
                 "calibrated": self.result is not None,
@@ -1217,6 +1512,8 @@ class IntrinsicCalibrationService:
         self.samples = []
         self.image_points = []
         self.object_points = []
+        self.sample_target_ids = []
+        self._pose_coverage = self._empty_pose_coverage()
         self.result = None
         self.result_payload = None
         self.result_restored = False
@@ -1226,7 +1523,9 @@ class IntrinsicCalibrationService:
         self.target_done = [False] * len(self.views)
         self._selected_target_index = None
         self._target_capture_phase = "idle"
-        self._target_capture_baseline_sequence = self._frame_sequence
+        self._target_capture_epoch += 1
+        self._target_expected_pose = None
+        self._target_pose_ack_enabled = False
         self._auto_capture_completed = False
 
     def _require_camera(self) -> Any:
@@ -1238,6 +1537,7 @@ class IntrinsicCalibrationService:
         with self._capture_lock:
             with self.lock:
                 capture = self.frame_capture
+                capture_token = self._active_target_capture_token_locked()
             if capture is None:
                 raise ApiError(
                     HTTPStatus.SERVICE_UNAVAILABLE,
@@ -1275,6 +1575,7 @@ class IntrinsicCalibrationService:
                 render_orientation,
                 source_image_size=source_image_size,
                 source_jpeg=source_jpeg if isinstance(source_jpeg, bytes) else None,
+                _target_capture_token=capture_token,
             )
         with self.lock:
             return {"ok": True, "samples": len(self.samples)}
@@ -1292,8 +1593,7 @@ class IntrinsicCalibrationService:
             if not 0 <= index < len(self.views):
                 raise ApiError(HTTPStatus.UNPROCESSABLE_ENTITY, "Unknown target index")
             view = self.views[index]
-            self._selected_target_index = index
-            self._target_capture_phase = "moving"
+            self._begin_target_move_locked(index, allow_frame_ack=True)
             # Keep admission and the short camera command atomic with respect
             # to an auto-run starting on another HTTP worker thread.
             try:
@@ -1302,9 +1602,10 @@ class IntrinsicCalibrationService:
                 )
             except Exception:
                 self._target_capture_phase = "idle"
+                self._target_expected_pose = None
+                self._target_pose_ack_enabled = False
                 raise
-            self._target_capture_baseline_sequence = self._frame_sequence
-            self._target_capture_phase = "awaiting_detection"
+            self._acknowledge_target_pose_locked(index)
         return {"ok": True, "name": view["name"]}
 
     def reset_pose(self) -> Dict[str, Any]:
@@ -1313,6 +1614,9 @@ class IntrinsicCalibrationService:
             camera = self._require_camera()
             self._selected_target_index = None
             self._target_capture_phase = "idle"
+            self._target_capture_epoch += 1
+            self._target_expected_pose = None
+            self._target_pose_ack_enabled = False
             camera.reset()
         return {"ok": True}
 
@@ -1378,8 +1682,7 @@ class IntrinsicCalibrationService:
                         return
                     self.action["target_index"] = index
                     self.action["target_name"] = view["name"]
-                    self._selected_target_index = index
-                    self._target_capture_phase = "moving"
+                    self._begin_target_move_locked(index, allow_frame_ack=False)
                 camera.goto(
                     view["position"], view["yaw_offset"], view["pitch_offset"], view["roll"]
                 )
@@ -1387,8 +1690,8 @@ class IntrinsicCalibrationService:
                 with self.lock:
                     if self.action is None or self.action.get("status") != "running":
                         return
-                    self._target_capture_baseline_sequence = self._frame_sequence
-                    self._target_capture_phase = "awaiting_detection"
+                    self._target_pose_ack_enabled = True
+                    self._acknowledge_target_pose_locked(index)
                 if not self._wait_for_target_detection(index, detection_timeout):
                     raise CalibrationError(
                         "continuous detection could not find the calibration board "
@@ -1405,12 +1708,19 @@ class IntrinsicCalibrationService:
                 }
                 self._auto_run_thread = None
                 self._target_capture_phase = "idle"
+                self._target_capture_epoch += 1
+                self._target_expected_pose = None
+                self._target_pose_ack_enabled = False
             return
         try:
             with self.lock:
-                if not all(self.target_done) or len(self.samples) != len(self.views):
+                if (
+                    not all(self.target_done)
+                    or len(self.samples) != len(self.views)
+                    or not self._simulation_target_ids_complete_locked()
+                ):
                     raise CalibrationError(
-                        "automatic sweep did not capture every authored target "
+                        "automatic sweep did not capture every authored target identity "
                         "({}/{} samples)".format(len(self.samples), len(self.views))
                     )
                 result = self._calibrate_locked()
@@ -1424,6 +1734,9 @@ class IntrinsicCalibrationService:
                 }
                 self._auto_run_thread = None
                 self._target_capture_phase = "idle"
+                self._target_capture_epoch += 1
+                self._target_expected_pose = None
+                self._target_pose_ack_enabled = False
         except Exception as error:
             with self.lock:
                 self.action = {
@@ -1435,6 +1748,9 @@ class IntrinsicCalibrationService:
                 }
                 self._auto_run_thread = None
                 self._target_capture_phase = "idle"
+                self._target_capture_epoch += 1
+                self._target_expected_pose = None
+                self._target_pose_ack_enabled = False
 
     def _wait_for_target_detection(self, index: int, timeout: float) -> bool:
         deadline = time.monotonic() + timeout
@@ -1516,6 +1832,7 @@ class IntrinsicCalibrationService:
                         else "checkerboard_corners_v1"
                     ),
                     "coverage": intrinsic_solver.coverage(self.samples)[0],
+                    "sample_target_ids": list(self.sample_target_ids),
                 },
                 board=self._board_document(),
             )
