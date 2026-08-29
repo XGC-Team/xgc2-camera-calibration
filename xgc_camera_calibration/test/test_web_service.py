@@ -20,14 +20,13 @@ from xgc_camera_calibration.web_service import (
     FrameSnapshot,
     MarkerObservation,
     image_message_to_bgr,
-    nearest_observation,
 )
 
 
 class FakeSource:
     image_topic = "/camera/image_raw"
     preview_image_topic = "/camera/image_raw/compressed"
-    intrinsic_file = "/camera/intrinsics.yaml"
+    intrinsic_file = "/camera/sim/usb_cam/intrinsics-20260830T010203.000000Z.yaml"
     pose_prefix = "/vrpn_client_node"
     preview_jpeg = b"\xff\xd8cached-compressed-preview\xff\xd9"
 
@@ -48,8 +47,8 @@ class FakeSource:
             "latest_image_stamp_sec": self.snapshot.stamp_sec,
         }
 
-    def freeze(self, parent_frame, maximum_marker_age):
-        if parent_frame != "map" or maximum_marker_age < 0.0:
+    def freeze(self, parent_frame):
+        if parent_frame != "map":
             raise AssertionError("unexpected freeze arguments")
         return self.snapshot
 
@@ -118,9 +117,7 @@ class WebCalibrationServiceTest(unittest.TestCase):
             "marker_{:02d}".format(index + 1): MarkerObservation(
                 name="marker_{:02d}".format(index + 1),
                 position=tuple(map(float, position)),
-                stamp_sec=12.34,
                 frame_id="map",
-                age_sec=0.002,
             )
             for index, position in enumerate(self.world)
         }
@@ -131,7 +128,6 @@ class WebCalibrationServiceTest(unittest.TestCase):
             camera_matrix=self.intrinsic,
             distortion=self.distortion,
             markers=markers,
-            stale_markers={},
         )
         self.temporary = tempfile.TemporaryDirectory()
         self.calibration_root = Path(self.temporary.name) / "calibrations"
@@ -218,19 +214,6 @@ class WebCalibrationServiceTest(unittest.TestCase):
         with self.assertRaises(ApiError) as context:
             self.service.solve(request)
         self.assertEqual(context.exception.status, 400)
-
-    def test_pose_history_selects_nearest_sample_and_rejects_stale(self):
-        history = [
-            MarkerObservation("marker", (0.0, 0.0, 0.0), 9.7, "map"),
-            MarkerObservation("marker", (1.0, 2.0, 3.0), 10.02, "map"),
-            MarkerObservation("marker", (4.0, 5.0, 6.0), 10.4, "map"),
-        ]
-        selected, age = nearest_observation(history, 10.0, 0.1)
-        self.assertEqual(selected.position, (1.0, 2.0, 3.0))
-        self.assertAlmostEqual(age, 0.02)
-        selected, age = nearest_observation(history, 11.0, 0.1)
-        self.assertIsNone(selected)
-        self.assertAlmostEqual(age, 0.6)
 
     def test_converts_padded_rgb_and_mono_images_without_cv_bridge(self):
         class Message:

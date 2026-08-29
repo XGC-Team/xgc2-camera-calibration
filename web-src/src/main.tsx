@@ -267,7 +267,7 @@ function ExtrinsicPage() {
               </div>
               <div className="calibration-viewer-meta">
                 <span id="frame-meta">No frame</span>
-                <span id="coordinate-hint">Freeze a synchronized frame before selecting points.</span>
+                <span id="coordinate-hint">Freeze a camera frame before selecting points.</span>
               </div>
             </Panel>
           )}
@@ -277,7 +277,7 @@ function ExtrinsicPage() {
                 <section className="calibration-control-section">
                   <SectionHeader title="1. Capture" />
                   <div className="calibration-actions">
-                    <Button id="freeze-button" className="calibration-action" tone="primary" appearance="solid">Freeze synchronized frame</Button>
+                    <Button id="freeze-button" className="calibration-action" tone="primary" appearance="solid">Freeze frame</Button>
                     <Button id="live-button" className="calibration-action">Live</Button>
                   </div>
                 </section>

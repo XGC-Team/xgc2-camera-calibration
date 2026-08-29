@@ -11,10 +11,8 @@
   <arg name="camera_name" />
   <arg name="parent_frame" default="map" />
   <arg name="child_frame" default="usb_cam_optical_frame" />
-  <arg name="maximum_marker_age" default="0.1" />
   <arg name="ransac_threshold_px" default="3.0" />
   <arg name="maximum_inlier_error_px" default="5.0" />
-  <arg name="pose_history_size" default="240" />
   <arg name="freeze_image_timeout" default="2.0" />
   <arg name="jpeg_quality" default="80" />
   <arg name="bind_address" default="127.0.0.1" />
@@ -38,10 +36,8 @@
     <param name="camera_name" value="$(arg camera_name)" />
     <param name="parent_frame" value="$(arg parent_frame)" />
     <param name="child_frame" value="$(arg child_frame)" />
-    <param name="maximum_marker_age" value="$(arg maximum_marker_age)" />
     <param name="ransac_threshold_px" value="$(arg ransac_threshold_px)" />
     <param name="maximum_inlier_error_px" value="$(arg maximum_inlier_error_px)" />
-    <param name="pose_history_size" value="$(arg pose_history_size)" />
     <param name="freeze_image_timeout" value="$(arg freeze_image_timeout)" />
     <param name="jpeg_quality" value="$(arg jpeg_quality)" />
     <param name="bind_address" value="$(arg bind_address)" />

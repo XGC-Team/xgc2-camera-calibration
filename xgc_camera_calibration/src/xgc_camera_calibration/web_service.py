@@ -41,9 +41,7 @@ class ApiError(RuntimeError):
 class MarkerObservation:
     name: str
     position: Tuple[float, float, float]
-    stamp_sec: float
     frame_id: str
-    age_sec: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -54,7 +52,6 @@ class FrameSnapshot:
     camera_matrix: np.ndarray
     distortion: np.ndarray
     markers: Mapping[str, MarkerObservation]
-    stale_markers: Mapping[str, float]
 
     @property
     def width(self) -> int:
@@ -63,19 +60,6 @@ class FrameSnapshot:
     @property
     def height(self) -> int:
         return int(self.image.shape[0])
-
-
-def nearest_observation(
-    history: Sequence[MarkerObservation], stamp_sec: float, maximum_age: float
-) -> Tuple[Optional[MarkerObservation], Optional[float]]:
-    """Return the closest pose sample and its age within the accepted window."""
-    if not history:
-        return None, None
-    observation = min(history, key=lambda item: abs(item.stamp_sec - stamp_sec))
-    age = abs(observation.stamp_sec - stamp_sec)
-    if age > maximum_age:
-        return None, age
-    return observation, age
 
 
 def image_message_to_bgr(message: Any) -> np.ndarray:
@@ -188,15 +172,12 @@ class CalibrationService:
         camera_name: str,
         parent_frame: str,
         child_frame: str,
-        maximum_marker_age: float = 0.1,
         ransac_threshold_px: float = 3.0,
         maximum_inlier_error_px: float = 5.0,
         jpeg_quality: int = 80,
     ):
         if not parent_frame or not child_frame:
             raise ValueError("parent_frame and child_frame must not be empty")
-        if maximum_marker_age < 0.0:
-            raise ValueError("maximum_marker_age must be non-negative")
         if not 1 <= int(jpeg_quality) <= 100:
             raise ValueError("jpeg_quality must be between 1 and 100")
         self.source = source
@@ -208,7 +189,6 @@ class CalibrationService:
         self.output_file: Optional[str] = None
         self.parent_frame = parent_frame
         self.child_frame = child_frame
-        self.maximum_marker_age = float(maximum_marker_age)
         self.ransac_threshold_px = float(ransac_threshold_px)
         self.maximum_inlier_error_px = float(maximum_inlier_error_px)
         self.jpeg_quality = int(jpeg_quality)
@@ -257,16 +237,13 @@ class CalibrationService:
                     {
                         "name": marker.name,
                         "position": list(marker.position),
-                        "stamp_sec": marker.stamp_sec,
-                        "age_sec": marker.age_sec,
                     }
                     for marker in sorted(frozen.markers.values(), key=lambda item: item.name)
                 ]
-                payload["stale_markers"] = dict(frozen.stale_markers)
             return payload
 
     def freeze(self) -> Dict[str, Any]:
-        snapshot = self.source.freeze(self.parent_frame, self.maximum_marker_age)
+        snapshot = self.source.freeze(self.parent_frame)
         if snapshot.image.ndim != 3 or snapshot.image.shape[2] != 3:
             raise ApiError(HTTPStatus.CONFLICT, "Camera frame is not a BGR color image")
         intrinsic = np.asarray(snapshot.camera_matrix, dtype=np.float64)
@@ -283,8 +260,7 @@ class CalibrationService:
         if not snapshot.markers:
             raise ApiError(
                 HTTPStatus.CONFLICT,
-                "No pose marker is time-matched to the current image",
-                details={"maximum_marker_age": self.maximum_marker_age},
+                "No pose marker is available",
             )
         encoded = self._encode_jpeg(snapshot.image)
         with self.lock:
@@ -319,7 +295,7 @@ class CalibrationService:
         with self.lock:
             snapshot = self.frozen
             if snapshot is None:
-                raise ApiError(HTTPStatus.CONFLICT, "Freeze a synchronized frame first")
+                raise ApiError(HTTPStatus.CONFLICT, "Freeze a camera frame first")
             try:
                 generation = int(request.get("generation"))
             except (TypeError, ValueError) as error:

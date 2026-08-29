@@ -216,10 +216,10 @@ function renderState(serverState) {
   ui.outputFile.textContent = serverState.output_file;
   if (serverState.frame) {
     ui.frameMeta.textContent = `${serverState.frame.width}×${serverState.frame.height} · t=${serverState.frame.stamp_sec.toFixed(3)}`;
-    ui.coordinateHint.textContent = `${serverState.markers.length} synchronized markers; select a marker and click its center.`;
+    ui.coordinateHint.textContent = `${serverState.markers.length} static markers; select a marker and click its center.`;
   } else {
     ui.frameMeta.textContent = source.image_ready ? "Live camera" : "No frame";
-    ui.coordinateHint.textContent = "Freeze a synchronized frame before selecting points.";
+    ui.coordinateHint.textContent = "Freeze a camera frame before selecting points.";
   }
   renderControls();
 }

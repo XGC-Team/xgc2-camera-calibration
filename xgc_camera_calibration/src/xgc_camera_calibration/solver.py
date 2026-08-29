@@ -18,6 +18,9 @@ import yaml
 
 
 CAMERA_NAME_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9._-]{0,63}$")
+INTRINSIC_FILENAME_PATTERN = re.compile(
+    r"^intrinsics-\d{8}T\d{6}\.\d{6}Z\.yaml$"
+)
 
 
 class CalibrationError(RuntimeError):
@@ -37,6 +40,34 @@ def extrinsic_calibration_directory(root: str, mode: str, camera_name: str) -> P
     if not CAMERA_NAME_PATTERN.fullmatch(identity):
         raise ValueError("camera name must be a stable identifier")
     return calibration_root / calibration_mode / identity
+
+
+def selected_intrinsic_path(
+    root: str, mode: str, camera_name: str, intrinsic_file: str
+) -> Path:
+    """Validate one immutable intrinsic asset in the selected camera partition."""
+
+    expected_directory = extrinsic_calibration_directory(root, mode, camera_name)
+    selected = Path(str(intrinsic_file).strip()).expanduser()
+    if not selected.is_absolute():
+        raise ValueError("intrinsic file must be absolute")
+    try:
+        canonical_root = Path(str(root)).expanduser().resolve(strict=True)
+        selected = selected.resolve(strict=True)
+    except OSError as error:
+        raise ValueError("intrinsic file must resolve to an existing file") from error
+    expected_directory = canonical_root / str(mode).strip() / str(camera_name).strip()
+    if (
+        selected.parent != expected_directory
+        or not selected.is_file()
+        or not INTRINSIC_FILENAME_PATTERN.fullmatch(selected.name)
+    ):
+        raise ValueError(
+            "intrinsic file must be a concrete intrinsics-UTC.yaml under {}/".format(
+                expected_directory
+            )
+        )
+    return selected
 
 
 def versioned_extrinsic_path(directory: os.PathLike) -> Path:

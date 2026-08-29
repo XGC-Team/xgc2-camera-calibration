@@ -56,7 +56,7 @@ then solves and persists `parent_T_camera_optical` using robust PnP.
 roslaunch xgc_camera_calibration extrinsic_calibrator.launch \
   image_topic:=/usb_cam/image_raw \
   preview_image_topic:=/usb_cam/image_raw/compressed \
-  intrinsic_file:=/absolute/path/to/intrinsics-UTC.yaml \
+  intrinsic_file:=/home/user/Documents/XGC/Calibration/camera/phy/usb_cam/intrinsics-20260830T010203.000000Z.yaml \
   pose_prefix:=/vrpn_client_node \
   calibration_root:=/home/user/Documents/XGC/Calibration/camera \
   calibration_mode:=phy camera_name:=usb_cam \
@@ -74,7 +74,7 @@ For a managed Gazebo world camera, use the snapshot mode instead:
 roslaunch xgc_camera_calibration extrinsic_calibrator.launch \
   media_edge_address:=http://127.0.0.1:18090 \
   media_source_id:=gazebo_world_camera \
-  intrinsic_file:=/absolute/path/to/intrinsics-UTC.yaml \
+  intrinsic_file:=/home/user/Documents/XGC/Calibration/camera/sim/usb_cam/intrinsics-20260830T010203.000000Z.yaml \
   pose_prefix:=/vrpn_client_node \
   calibration_root:=/home/user/Documents/XGC/Calibration/camera \
   calibration_mode:=sim camera_name:=usb_cam \
@@ -82,10 +82,12 @@ roslaunch xgc_camera_calibration extrinsic_calibrator.launch \
 ```
 
 The panel's live view remains direct WebRTC. Freeze captures one immutable
-Media Edge frame whose Gazebo timestamp, RGB pixels, frame ID, camera matrix,
-and distortion values come from the same render pass; marker histories are
-then interpolated at that timestamp before robust PnP. No ROS image publisher
-or calibration JPEG polling is required in this mode.
+Media Edge frame, then copies the latest pose of every discovered marker once
+before robust PnP. This contract deliberately has no pose history, timestamp
+interpolation, or marker-age gate: it applies only to the current extrinsic
+experiment, where the calibration camera and all markers remain static during
+capture. No ROS image publisher or calibration JPEG polling is required in
+this mode.
 
 When `media_edge_address` is empty, the compatibility path consumes the
 canonical JPEG-compressed ROS preview and subscribes to the raw image only

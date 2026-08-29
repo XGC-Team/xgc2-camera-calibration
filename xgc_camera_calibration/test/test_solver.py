@@ -7,7 +7,13 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from xgc_camera_calibration.solver import CalibrationError, load_extrinsic, save_extrinsic, solve_extrinsic
+from xgc_camera_calibration.solver import (
+    CalibrationError,
+    load_extrinsic,
+    save_extrinsic,
+    selected_intrinsic_path,
+    solve_extrinsic,
+)
 from xgc_camera_calibration.transforms import (
     link_to_optical_rotation,
     quaternion_to_rotation_matrix,
@@ -114,6 +120,45 @@ class ExtrinsicSolverTest(unittest.TestCase):
             output.write_text("translation: [0, 0, 0]\nquaternion_xyzw: [0, 0, 0, 1]\n")
             with self.assertRaises(CalibrationError):
                 load_extrinsic(output)
+
+    def test_selects_only_concrete_intrinsic_in_explicit_camera_partition(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "camera"
+            selected_directory = root / "phy" / "usb_cam"
+            other_directory = root / "phy" / "outside"
+            sim_directory = root / "sim" / "usb_cam"
+            for directory in (selected_directory, other_directory, sim_directory):
+                directory.mkdir(parents=True, exist_ok=True)
+            filename = "intrinsics-20260830T010203.000000Z.yaml"
+            selected_file = selected_directory / filename
+            selected_file.write_text("schema: xgc2.camera.intrinsic.v1\n", encoding="utf-8")
+            other_file = other_directory / filename
+            other_file.write_text("schema: xgc2.camera.intrinsic.v1\n", encoding="utf-8")
+            sim_file = sim_directory / filename
+            sim_file.write_text("schema: xgc2.camera.intrinsic.v1\n", encoding="utf-8")
+            outside_symlink = (
+                selected_directory / "intrinsics-20260830T020304.000000Z.yaml"
+            )
+            outside_symlink.symlink_to(other_file)
+
+            self.assertEqual(
+                selected_intrinsic_path(str(root), "phy", "usb_cam", str(selected_file)),
+                selected_file,
+            )
+            for invalid in (
+                selected_directory / "intrinsics.yaml",
+                sim_file,
+                other_file,
+                selected_directory / "../outside" / filename,
+                outside_symlink,
+            ):
+                with self.assertRaises(ValueError):
+                    selected_intrinsic_path(str(root), "phy", "usb_cam", str(invalid))
+            for invalid_camera_name in ("../outside", "usb/cam", "usb cam", ".usb_cam"):
+                with self.assertRaisesRegex(ValueError, "camera name"):
+                    selected_intrinsic_path(
+                        str(root), "phy", invalid_camera_name, str(selected_file)
+                    )
 
     def test_parent_link_optical_chain_recomposes_calibrated_optical_pose(self):
         result = solve_extrinsic(self.world, self.pixels, self.intrinsic)

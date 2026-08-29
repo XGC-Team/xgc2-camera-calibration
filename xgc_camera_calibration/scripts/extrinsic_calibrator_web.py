@@ -4,7 +4,6 @@
 import re
 import sys
 import threading
-from collections import deque
 from pathlib import Path
 
 import cv2
@@ -20,11 +19,11 @@ from xgc_camera_calibration.web_service import (
     FrameSnapshot,
     MarkerObservation,
     image_message_to_bgr,
-    nearest_observation,
 )
 from xgc_camera_calibration.intrinsic_solver import load_intrinsic
 from xgc_camera_calibration.intrinsic_validation import intrinsic_parameters
 from xgc_camera_calibration.media_snapshot import MediaSnapshotClient, MediaSnapshotError
+from xgc_camera_calibration.solver import selected_intrinsic_path
 
 
 def normalize_topic(value):
@@ -33,15 +32,26 @@ def normalize_topic(value):
 
 
 class RosCalibrationSource:
-    """Thread-safe latest camera frame and timestamped pose-marker history."""
+    """Thread-safe camera frame and latest static pose-marker snapshot."""
 
-    def __init__(self, intrinsic_file, snapshot_client=None):
+    def __init__(
+        self,
+        intrinsic_file,
+        calibration_root,
+        calibration_mode,
+        camera_name,
+        snapshot_client=None,
+    ):
         self.lock = threading.RLock()
         self.snapshot_client = snapshot_client
-        self.intrinsic_file = Path(str(intrinsic_file).strip()).expanduser()
-        if not self.intrinsic_file.is_absolute():
-            raise ValueError("~intrinsic_file must be an absolute YAML file path")
+        self.intrinsic_file = selected_intrinsic_path(
+            calibration_root, calibration_mode, camera_name, intrinsic_file
+        )
         intrinsic_document = load_intrinsic(self.intrinsic_file)
+        if str(intrinsic_document.get("camera_name", "")).strip() != camera_name:
+            raise ValueError(
+                "selected intrinsic camera_name does not match ~camera_name"
+            )
         (
             self.intrinsic_matrix,
             self.intrinsic_distortion,
@@ -70,13 +80,9 @@ class RosCalibrationSource:
             self.tracker_filter = {
                 item.strip() for item in str(tracker_value).split(",") if item.strip()
             }
-        self.pose_history_size = int(rospy.get_param("~pose_history_size", 240))
-        if self.pose_history_size < 2:
-            raise ValueError("~pose_history_size must be at least 2")
         self.preview_jpeg = None
         self.preview_stamp_sec = None
         self.marker_latest = {}
-        self.marker_history = {}
         self.marker_subscribers = {}
         self.marker_topics = {}
         self.preview_subscriber = None
@@ -135,13 +141,9 @@ class RosCalibrationSource:
                 removed_name = self.marker_topics.pop(topic, "")
                 if removed_name and removed_name not in desired.values():
                     self.marker_latest.pop(removed_name, None)
-                    self.marker_history.pop(removed_name, None)
             for topic, name in desired.items():
                 if topic in self.marker_subscribers:
                     continue
-                self.marker_history.setdefault(
-                    name, deque(maxlen=self.pose_history_size)
-                )
                 self.marker_topics[topic] = name
                 self.marker_subscribers[topic] = rospy.Subscriber(
                     topic, PoseStamped, self._marker_callback(name), queue_size=20
@@ -149,23 +151,13 @@ class RosCalibrationSource:
 
     def _marker_callback(self, name):
         def callback(message):
-            stamp = message.header.stamp
-            if stamp.is_zero():
-                stamp = rospy.Time.now()
             position = message.pose.position
             observation = MarkerObservation(
                 name=name,
                 position=(float(position.x), float(position.y), float(position.z)),
-                stamp_sec=float(stamp.to_sec()),
                 frame_id=message.header.frame_id,
             )
             with self.lock:
-                history = self.marker_history.setdefault(
-                    name, deque(maxlen=self.pose_history_size)
-                )
-                if history and observation.stamp_sec < history[-1].stamp_sec:
-                    history.clear()
-                history.append(observation)
                 self.marker_latest[name] = observation
 
         return callback
@@ -184,9 +176,7 @@ class RosCalibrationSource:
         with self.lock:
             snapshot_ready = self.snapshot_client is not None
             preview_ready = snapshot_ready or self.preview_jpeg is not None
-            marker_names = sorted(
-                name for name, history in self.marker_history.items() if history
-            )
+            marker_names = sorted(self.marker_latest)
             return {
                 "image_topic": (
                     "media:{}".format(self.snapshot_client.source_id)
@@ -204,7 +194,7 @@ class RosCalibrationSource:
                 "latest_image_stamp_sec": self.preview_stamp_sec,
             }
 
-    def freeze(self, parent_frame, maximum_marker_age):
+    def freeze(self, parent_frame):
         if self.snapshot_client is not None:
             try:
                 snapshot = self.snapshot_client.capture()
@@ -218,7 +208,6 @@ class RosCalibrationSource:
                 stamp_sec,
                 snapshot.frame_id,
                 parent_frame,
-                maximum_marker_age,
             )
         try:
             image_message = rospy.wait_for_message(
@@ -243,7 +232,6 @@ class RosCalibrationSource:
             stamp_sec,
             image_message.header.frame_id,
             parent_frame,
-            maximum_marker_age,
         )
 
     def _frame_snapshot(
@@ -252,7 +240,6 @@ class RosCalibrationSource:
         stamp_sec,
         frame_id,
         parent_frame,
-        maximum_marker_age,
     ):
         image_size = (int(image.shape[1]), int(image.shape[0]))
         if image_size != self.intrinsic_size:
@@ -266,32 +253,17 @@ class RosCalibrationSource:
                 ),
             )
         with self.lock:
-            histories = {
-                name: tuple(history) for name, history in self.marker_history.items()
-            }
+            observations = dict(self.marker_latest)
         markers = {}
-        stale = {}
         wrong_frames = []
-        for name, history in histories.items():
-            if not history:
-                continue
-            observation, age = nearest_observation(
-                history, stamp_sec, maximum_marker_age
-            )
-            if observation is None:
-                if age is None:
-                    continue
-                stale[name] = age
-                continue
+        for name, observation in observations.items():
             if observation.frame_id and observation.frame_id != parent_frame:
                 wrong_frames.append(name)
                 continue
             markers[name] = MarkerObservation(
                 name=observation.name,
                 position=observation.position,
-                stamp_sec=observation.stamp_sec,
                 frame_id=observation.frame_id,
-                age_sec=age,
             )
         if wrong_frames:
             raise ApiError(
@@ -307,7 +279,6 @@ class RosCalibrationSource:
             camera_matrix=self.intrinsic_matrix.copy(),
             distortion=self.intrinsic_distortion.copy(),
             markers=markers,
-            stale_markers=stale,
         )
 
 
@@ -329,15 +300,18 @@ def main():
                 float(rospy.get_param("~snapshot_timeout", 5.0)),
             )
             snapshot_client.health()
+        calibration_root = str(rospy.get_param("~calibration_root")).strip()
+        calibration_mode = str(rospy.get_param("~calibration_mode")).strip()
+        camera_name = str(rospy.get_param("~camera_name")).strip()
         source = RosCalibrationSource(
             rospy.get_param("~intrinsic_file"),
+            calibration_root,
+            calibration_mode,
+            camera_name,
             snapshot_client=snapshot_client,
         )
         package_root = Path(rospkg.RosPack().get_path("xgc_camera_calibration"))
         web_root = Path(rospy.get_param("~web_root", str(package_root / "web" / "extrinsic")))
-        calibration_root = str(rospy.get_param("~calibration_root")).strip()
-        calibration_mode = str(rospy.get_param("~calibration_mode")).strip()
-        camera_name = str(rospy.get_param("~camera_name")).strip()
         service = CalibrationService(
             source,
             calibration_root=calibration_root,
@@ -345,7 +319,6 @@ def main():
             camera_name=camera_name,
             parent_frame=rospy.get_param("~parent_frame", "map"),
             child_frame=rospy.get_param("~child_frame", "usb_cam_optical_frame"),
-            maximum_marker_age=float(rospy.get_param("~maximum_marker_age", 0.1)),
             ransac_threshold_px=float(rospy.get_param("~ransac_threshold_px", 3.0)),
             maximum_inlier_error_px=float(
                 rospy.get_param("~maximum_inlier_error_px", 5.0)
