@@ -52,7 +52,9 @@ roslaunch --files xgc_camera_calibration extrinsic_calibrator.launch \
 roslaunch --files xgc_camera_calibration intrinsic_calibrator.launch \
   calibration_root:="${CALIBRATION_ROOT}" calibration_mode:=sim \
   camera_name:=package_smoke >/dev/null
-roslaunch --files xgc_camera_calibration extrinsic_tf.launch >/dev/null
+roslaunch --files xgc_camera_calibration extrinsic_tf.launch \
+  calibration_root:="${CALIBRATION_ROOT}" calibration_mode:=sim \
+  camera_name:="${CAMERA_NAME}" >/dev/null
 
 ROSCORE_PID=""
 EXTRINSIC_PID=""
