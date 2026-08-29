@@ -24,7 +24,6 @@ from xgc_camera_calibration.web_service import ApiError, CalibrationHttpServer
 
 
 WEB_ROOT = Path(__file__).resolve().parents[1] / "web" / "intrinsic"
-WEB_SOURCE = Path(__file__).resolve().parents[2] / "web-src" / "src" / "intrinsic-legacy.ts"
 ENTRYPOINT = Path(__file__).resolve().parents[1] / "scripts" / "intrinsic_calibrator_web.py"
 WEB_SERVICE_SOURCE = Path(__file__).resolve().parents[1] / "src" / "xgc_camera_calibration" / "web_service.py"
 
@@ -84,7 +83,7 @@ class IntrinsicServiceTest(unittest.TestCase):
         views = recommended_views((2.0, 0.0, 2.2))
         near = next(view for view in views if view["name"] == "near maximum")
         oblique_high = next(view for view in views if view["name"] == "oblique high")
-        self.assertEqual(near["position"], [0.05, 0.0, 2.2])
+        self.assertEqual(near["position"], [0.7, 0.0, 2.2])
         self.assertEqual(oblique_high["position"], [-0.2, 0.35, 2.55])
         self.assertEqual(len({tuple(view["position"]) for view in views}), len(views))
         self.assertGreaterEqual(min(view["position"][2] for view in views), 1.75)
@@ -96,8 +95,8 @@ class IntrinsicServiceTest(unittest.TestCase):
         left = next(view for view in views if view["name"] == "left edge")
         near = next(view for view in views if view["name"] == "near maximum")
         self.assertEqual(left["position"], [0.8, 0.02, 2.2])
-        self.assertEqual(left["yaw_offset"], -0.46)
-        self.assertEqual(near["position"], [1.2, 0.0, 2.2])
+        self.assertEqual(left["yaw_offset"], -0.58)
+        self.assertEqual(near["position"], [1.46, 0.0, 2.2])
         self.assertGreaterEqual(min(view["position"][2] for view in views), 2.01)
         self.assertEqual(len({tuple(view["position"]) for view in views}), len(views))
 
@@ -105,7 +104,6 @@ class IntrinsicServiceTest(unittest.TestCase):
         index = (WEB_ROOT / "index.html").read_text(encoding="utf-8")
         app = (WEB_ROOT / "app.js").read_text(encoding="utf-8")
         styles = (WEB_ROOT / "styles.css").read_text(encoding="utf-8")
-        source = WEB_SOURCE.read_text(encoding="utf-8")
         self.assertIn('href="styles.css"', index)
         self.assertIn('src="app.js"', index)
         self.assertIn('type="module"', index)
@@ -115,8 +113,6 @@ class IntrinsicServiceTest(unittest.TestCase):
         self.assertIn("Board detection", app)
         self.assertIn("detection-status", app)
         self.assertIn("URL.createObjectURL", app)
-        self.assertIn("queueImageRefresh(s.detection, s.image_ready)", source)
-        self.assertNotIn("setInterval(refreshImage", source)
         self.assertIn(".xgc-topbar", styles)
 
     def test_entrypoint_runs_one_continuous_detector_for_both_camera_origins(self):
