@@ -12,7 +12,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 import cv2
 import numpy as np
@@ -586,15 +586,37 @@ class CalibrationRequestHandler(BaseHTTPRequestHandler):
             raise ApiError(HTTPStatus.NOT_FOUND, "No reference image for that target")
         return jpeg
 
-    def _intrinsic_validation_image(self, path: str) -> bytes:
+    def _intrinsic_validation_image(self, path: str, query: str) -> bytes:
         prefix = "/api/v1/intrinsic/validation/image/"
         token = path[len(prefix):]
         if not token.endswith(".jpg"):
             raise ApiError(HTTPStatus.NOT_FOUND, "Intrinsic validation image must be JPEG")
-        return self._intrinsic().validation_image(token[:-4])
+        parameters = parse_qs(query, keep_blank_values=True)
+        generation_values = parameters.get("generation")
+        generation = None
+        if generation_values is not None:
+            if len(generation_values) != 1:
+                raise ApiError(
+                    HTTPStatus.BAD_REQUEST,
+                    "Intrinsic validation generation must appear once",
+                )
+            try:
+                generation = int(generation_values[0])
+            except ValueError as error:
+                raise ApiError(
+                    HTTPStatus.BAD_REQUEST,
+                    "Intrinsic validation generation must be a positive integer",
+                ) from error
+            if generation <= 0:
+                raise ApiError(
+                    HTTPStatus.BAD_REQUEST,
+                    "Intrinsic validation generation must be a positive integer",
+                )
+        return self._intrinsic().validation_image(token[:-4], generation)
 
     def _dispatch(self) -> None:
-        path = urlsplit(self.path).path
+        request_url = urlsplit(self.path)
+        path = request_url.path
         if self.command in ("GET", "HEAD"):
             if path == "/healthz":
                 payload: Dict[str, Any] = {"status": "ok"}
@@ -634,7 +656,7 @@ class CalibrationRequestHandler(BaseHTTPRequestHandler):
                 self._send_bytes(
                     HTTPStatus.OK,
                     "image/jpeg",
-                    self._intrinsic_validation_image(path),
+                    self._intrinsic_validation_image(path, request_url.query),
                 )
                 return
             if path.startswith("/api/v1/intrinsic/ref/"):
@@ -683,16 +705,15 @@ class CalibrationRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(HTTPStatus.OK, self._intrinsic().capture())
                 return
             if path == "/api/v1/intrinsic/validation":
-                calibration_id = request.get("calibration_id") if isinstance(request, dict) else None
-                if not isinstance(calibration_id, str):
+                if not isinstance(request, dict) or set(request) != {"reference", "comparison"}:
                     raise ApiError(
                         HTTPStatus.BAD_REQUEST,
-                        "Intrinsic validation requires string calibration_id",
+                        "Intrinsic validation requires reference and comparison objects",
                     )
-                self._send_json(
-                    HTTPStatus.OK,
-                    self._intrinsic().validate_intrinsic(calibration_id),
+                result = self._intrinsic().validate_intrinsic(
+                    request["reference"], request["comparison"]
                 )
+                self._send_json(HTTPStatus.OK, result)
                 return
             if path == "/api/v1/intrinsic/auto_capture/start":
                 if request not in ({}, None):

@@ -26,7 +26,7 @@ import time
 from datetime import datetime, timezone
 from http import HTTPStatus
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -215,6 +215,7 @@ class IntrinsicCalibrationService:
         self._validation_generation = 0
         self._validation_report: Optional[Dict[str, Any]] = None
         self._validation_images: Dict[str, bytes] = {}
+        self._validation_lock = threading.Lock()
         self.align_threshold = float(align_threshold)
         self.camera: Optional[Any] = None
         self.frame_capture: Optional[Callable[[], np.ndarray]] = None
@@ -436,10 +437,18 @@ class IntrinsicCalibrationService:
         base = Path(self.output_file_base)
         if not base.parent.is_dir():
             return []
-        return [
-            path for path in base.parent.glob("{}-*{}".format(base.stem, base.suffix))
-            if path.is_file()
-        ]
+        parent = base.parent.resolve()
+        candidates = []
+        for path in base.parent.glob("{}-*{}".format(base.stem, base.suffix)):
+            if path.is_symlink():
+                continue
+            try:
+                resolved = path.resolve(strict=True)
+            except OSError:
+                continue
+            if resolved.parent == parent and resolved.is_file():
+                candidates.append(resolved)
+        return candidates
 
     def calibration_history(self) -> Dict[str, Any]:
         items = []
@@ -527,18 +536,73 @@ class IntrinsicCalibrationService:
                 )
             return image
 
-    def validate_intrinsic(self, calibration_id: str) -> Dict[str, Any]:
-        path, document = self._calibration_document(calibration_id)
-        image = self._capture_validation_frame()
-        try:
-            validation = intrinsic_validation.generate_intrinsic_validation(
-                image,
-                document,
-                calibration_id=path.name,
-                jpeg_quality=self.jpeg_quality,
+    def validate_intrinsic(
+        self,
+        reference: Mapping[str, Any],
+        comparison: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        """Capture once and apply both selected configurations to that frame."""
+        with self._validation_lock:
+            reference_id, reference_document = self._validation_configuration(
+                reference, "reference"
             )
-        except (ValueError, CalibrationError, cv2.error) as error:
-            raise ApiError(HTTPStatus.UNPROCESSABLE_ENTITY, str(error)) from error
+            if reference == comparison:
+                comparison_id, comparison_document = reference_id, reference_document
+            else:
+                comparison_id, comparison_document = self._validation_configuration(
+                    comparison, "comparison"
+                )
+            image = self._capture_validation_frame()
+            try:
+                validation = intrinsic_validation.generate_intrinsic_comparison(
+                    image,
+                    reference_document,
+                    comparison_document,
+                    reference_calibration_id=reference_id,
+                    comparison_calibration_id=comparison_id,
+                    jpeg_quality=self.jpeg_quality,
+                )
+            except (ValueError, CalibrationError, cv2.error) as error:
+                raise ApiError(HTTPStatus.UNPROCESSABLE_ENTITY, str(error)) from error
+            return self._publish_validation(validation)
+
+    def _validation_configuration(
+        self,
+        configuration: Mapping[str, Any],
+        name: str,
+    ) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+        if not isinstance(configuration, Mapping):
+            raise ApiError(
+                HTTPStatus.BAD_REQUEST,
+                "Intrinsic validation {} must be an object".format(name),
+            )
+        kind = configuration.get("kind")
+        if kind == "raw":
+            if set(configuration) != {"kind"}:
+                raise ApiError(
+                    HTTPStatus.BAD_REQUEST,
+                    "Intrinsic validation raw {} accepts only kind".format(name),
+                )
+            return None, None
+        if kind == "calibration":
+            if set(configuration) != {"kind", "calibration_id"}:
+                raise ApiError(
+                    HTTPStatus.BAD_REQUEST,
+                    "Intrinsic validation calibration {} requires only kind and calibration_id".format(name),
+                )
+            path, document = self._calibration_document(
+                configuration.get("calibration_id")
+            )
+            return path.name, document
+        raise ApiError(
+            HTTPStatus.BAD_REQUEST,
+            "Intrinsic validation {} kind must be raw or calibration".format(name),
+        )
+
+    def _publish_validation(
+        self,
+        validation: intrinsic_validation.IntrinsicValidationResult,
+    ) -> Dict[str, Any]:
         with self.lock:
             self._validation_generation += 1
             self._validation_images = dict(validation.images)
@@ -548,8 +612,18 @@ class IntrinsicCalibrationService:
             }
             return dict(self._validation_report)
 
-    def validation_image(self, view_id: str) -> bytes:
+    def validation_image(
+        self,
+        view_id: str,
+        generation: Optional[int] = None,
+    ) -> bytes:
         with self.lock:
+            current_generation = self._validation_generation
+            if generation is not None and generation != current_generation:
+                raise ApiError(
+                    HTTPStatus.CONFLICT,
+                    "Intrinsic validation generation is no longer available",
+                )
             image = self._validation_images.get(view_id)
         if image is None:
             raise ApiError(HTTPStatus.NOT_FOUND, "Intrinsic validation image is unavailable")

@@ -127,6 +127,11 @@ for required_arg in calibration_root calibration_mode camera_name; do
   grep -q "<arg name=\"${required_arg}\" />" \
     xgc_camera_calibration/launch/intrinsic_calibrator.launch
 done
+if grep -R -E 'intrinsic-validation\.v1|generate_intrinsic_validation|validate_intrinsic_comparison' \
+  xgc_camera_calibration/src xgc_camera_calibration/scripts; then
+  echo "intrinsic validation retained the removed v1 compatibility contract" >&2
+  exit 1
+fi
 grep -q 'CompressedImage' xgc_camera_calibration/scripts/extrinsic_calibrator_web.py
 grep -q 'wait_for_message' xgc_camera_calibration/scripts/extrinsic_calibrator_web.py
 if grep -q 'Subscriber(.*self.image_topic' \

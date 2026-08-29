@@ -15,7 +15,7 @@ from unittest.mock import patch
 import cv2
 import numpy as np
 
-from xgc_camera_calibration import intrinsic_solver
+from xgc_camera_calibration import intrinsic_solver, intrinsic_validation
 from xgc_camera_calibration.intrinsic_service import (
     IntrinsicCalibrationService,
     intrinsic_calibration_directory,
@@ -668,6 +668,125 @@ class IntrinsicServiceTest(unittest.TestCase):
             self.assertEqual(service.reset()["samples"], 0)
             self.assertIsNone(service.state()["action"])
 
+    def test_validation_v2_captures_once_and_keeps_generation_atomic(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory) / "intrinsics.yaml"
+            calibration = Path(directory) / "intrinsics-20260830T120000.000000Z.yaml"
+            intrinsic_solver.save_intrinsic(
+                calibration,
+                intrinsic_solver.IntrinsicResult(
+                    camera_matrix=np.array([
+                        [638.0, 0.0, 200.0],
+                        [0.0, 637.0, 160.0],
+                        [0.0, 0.0, 1.0],
+                    ]),
+                    distortion=np.array([-0.18, 0.04, 0.0, 0.0, 0.0]),
+                    image_size=(400, 320),
+                    rms_reprojection_error_px=0.7,
+                    sample_count=40,
+                ),
+                camera_name="usb_cam",
+                board_size=(7, 5),
+                square=0.20,
+            )
+            service = make_service(base)
+            captures = []
+
+            def capture():
+                captures.append(len(captures) + 1)
+                frame = render_board()
+                frame[0, 0] = captures[-1]
+                return frame
+
+            service.attach_frame_capture(capture)
+            first = service.validate_intrinsic(
+                {"kind": "raw"},
+                {"kind": "calibration", "calibration_id": calibration.name},
+            )
+            self.assertEqual(captures, [1])
+            self.assertEqual(first["schema"], "xgc2.camera.intrinsic-validation.v2")
+            self.assertEqual(first["configurations"]["reference"], {"kind": "raw"})
+            self.assertEqual(
+                first["configurations"]["comparison"]["calibration_id"], calibration.name
+            )
+            self.assertEqual(first["source_image_size"], [400, 320])
+            self.assertEqual(first["analysis_image_size"], [400, 320])
+            self.assertEqual(
+                [view["id"] for view in first["views"][-2:]],
+                ["reference", "comparison"],
+            )
+            self.assertTrue(service.validation_image("reference", first["generation"]).startswith(b"\xff\xd8"))
+
+            same = service.validate_intrinsic(
+                {"kind": "calibration", "calibration_id": calibration.name},
+                {"kind": "calibration", "calibration_id": calibration.name},
+            )
+            self.assertEqual(captures, [1, 2])
+            self.assertEqual(same["remap_delta_px"], {"mean": 0.0, "maximum": 0.0})
+            with self.assertRaises(ApiError) as stale:
+                service.validation_image("reference", first["generation"])
+            self.assertEqual(stale.exception.status, int(HTTPStatus.CONFLICT))
+
+            raw = service.validate_intrinsic(
+                {"kind": "raw"}, {"kind": "raw"}
+            )
+            self.assertEqual(captures, [1, 2, 3])
+            self.assertEqual(raw["remap_delta_px"], {"mean": 0.0, "maximum": 0.0})
+
+            with self.assertRaises(ApiError) as unsafe:
+                service.validate_intrinsic(
+                    {"kind": "raw"},
+                    {"kind": "calibration", "calibration_id": "../intrinsics.yaml"},
+                )
+            self.assertEqual(unsafe.exception.status, int(HTTPStatus.BAD_REQUEST))
+            self.assertEqual(captures, [1, 2, 3])
+
+    def test_validation_generation_is_serialized_to_bound_4k_work(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = make_service(Path(directory) / "intrinsics.yaml")
+            service.attach_frame_capture(
+                lambda: np.full((64, 96, 3), 127, dtype=np.uint8)
+            )
+            original = intrinsic_validation.generate_intrinsic_comparison
+            active = 0
+            maximum_active = 0
+            observation_lock = threading.Lock()
+            errors = []
+
+            def observed(*args, **kwargs):
+                nonlocal active, maximum_active
+                with observation_lock:
+                    active += 1
+                    maximum_active = max(maximum_active, active)
+                try:
+                    sleep(0.05)
+                    return original(*args, **kwargs)
+                finally:
+                    with observation_lock:
+                        active -= 1
+
+            def validate():
+                try:
+                    service.validate_intrinsic(
+                        {"kind": "raw"}, {"kind": "raw"}
+                    )
+                except Exception as error:  # pragma: no cover - asserted below
+                    errors.append(error)
+
+            with patch(
+                "xgc_camera_calibration.intrinsic_service.intrinsic_validation.generate_intrinsic_comparison",
+                side_effect=observed,
+            ):
+                workers = [threading.Thread(target=validate) for _ in range(2)]
+                for worker in workers:
+                    worker.start()
+                for worker in workers:
+                    worker.join(timeout=2.0)
+
+            self.assertFalse(errors)
+            self.assertEqual(maximum_active, 1)
+            self.assertEqual(service._validation_generation, 2)
+
     def test_transport_routes_intrinsic_and_gates_when_absent(self):
         with tempfile.TemporaryDirectory() as directory:
             service = make_service(Path(directory) / "intrinsics.yaml")
@@ -730,35 +849,80 @@ class IntrinsicServiceTest(unittest.TestCase):
                 self.assertEqual(history["selected"], calibration_path.name)
                 self.assertTrue(history["items"][0]["latest"])
 
+                validation_captures = []
+
+                def capture_validation():
+                    validation_captures.append(len(validation_captures) + 1)
+                    return render_board()
+
+                service.attach_frame_capture(capture_validation)
                 samples_before_validation = service.state()["samples"]
                 request = urllib.request.Request(
+                    base + "/api/v1/intrinsic/validation",
+                    data=json.dumps({
+                        "reference": {"kind": "raw"},
+                        "comparison": {
+                            "kind": "calibration",
+                            "calibration_id": calibration_path.name,
+                        },
+                    }).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(request) as response:
+                    comparison = json.loads(response.read())
+                self.assertEqual(validation_captures, [1])
+                self.assertEqual(comparison["schema"], "xgc2.camera.intrinsic-validation.v2")
+                self.assertEqual(comparison["configurations"]["reference"], {"kind": "raw"})
+                self.assertEqual(
+                    comparison["configurations"]["comparison"]["calibration_id"],
+                    calibration_path.name,
+                )
+                self.assertEqual(
+                    [view["id"] for view in comparison["views"][-2:]],
+                    ["reference", "comparison"],
+                )
+                with urllib.request.urlopen(
+                    base + "/api/v1/intrinsic/validation/image/reference.jpg?generation={}".format(
+                        comparison["generation"]
+                    )
+                ) as response:
+                    self.assertTrue(response.read().startswith(b"\xff\xd8"))
+                second_request = urllib.request.Request(
+                    base + "/api/v1/intrinsic/validation",
+                    data=json.dumps({
+                        "reference": {"kind": "raw"},
+                        "comparison": {"kind": "raw"},
+                    }).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(second_request) as response:
+                    second = json.loads(response.read())
+                self.assertEqual(validation_captures, [1, 2])
+                with self.assertRaises(urllib.error.HTTPError) as stale:
+                    urllib.request.urlopen(
+                        base + "/api/v1/intrinsic/validation/image/reference.jpg?generation={}".format(
+                            comparison["generation"]
+                        )
+                    )
+                self.assertEqual(stale.exception.code, int(HTTPStatus.CONFLICT))
+                with self.assertRaises(urllib.error.HTTPError) as malformed:
+                    urllib.request.urlopen(
+                        base + "/api/v1/intrinsic/validation/image/reference.jpg?generation=not-an-integer"
+                    )
+                self.assertEqual(malformed.exception.code, int(HTTPStatus.BAD_REQUEST))
+                legacy_request = urllib.request.Request(
                     base + "/api/v1/intrinsic/validation",
                     data=json.dumps({"calibration_id": calibration_path.name}).encode("utf-8"),
                     headers={"Content-Type": "application/json"},
                     method="POST",
                 )
-                with urllib.request.urlopen(request) as response:
-                    validation = json.loads(response.read())
-                self.assertEqual(validation["schema"], "xgc2.camera.intrinsic-validation.v1")
-                self.assertEqual(validation["calibration_id"], calibration_path.name)
-                self.assertEqual(validation["default_view"], "overlay_checker")
-                self.assertEqual(
-                    [view["id"] for view in validation["views"][:5]],
-                    [
-                        "overlay_checker",
-                        "overlay_redcyan",
-                        "overlay_corner_zoom",
-                        "overlay_diff",
-                        "displacement",
-                    ],
-                )
-                self.assertGreater(validation["remap_px"]["maximum"], 0.0)
+                with self.assertRaises(urllib.error.HTTPError) as legacy:
+                    urllib.request.urlopen(legacy_request)
+                self.assertEqual(legacy.exception.code, int(HTTPStatus.BAD_REQUEST))
+                self.assertEqual(second["generation"], comparison["generation"] + 1)
                 self.assertEqual(service.state()["samples"], samples_before_validation)
-                with urllib.request.urlopen(
-                    base + "/api/v1/intrinsic/validation/image/displacement.jpg"
-                ) as response:
-                    self.assertEqual(response.headers.get_content_type(), "image/jpeg")
-                    self.assertTrue(response.read().startswith(b"\xff\xd8"))
 
                 service.attach_camera_control(FakeCameraControl())
                 service.auto_run = lambda: {
