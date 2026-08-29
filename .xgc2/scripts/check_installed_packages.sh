@@ -18,7 +18,10 @@ for page in extrinsic intrinsic; do
 done
 python3 -c 'from xgc_camera_calibration.extrinsic_file_watcher import ExtrinsicDirectoryWatcher; from xgc_camera_calibration.intrinsic_solver import calibrate_intrinsic; from xgc_camera_calibration.media_snapshot import MediaSnapshotClient; from xgc_camera_calibration.solver import solve_extrinsic; from xgc_camera_calibration.transforms import split_parent_to_optical_pose'
 RUNTIME="$(mktemp -d)"
-INTRINSIC_FILE="${RUNTIME}/intrinsics.yaml"
+CALIBRATION_ROOT="${RUNTIME}/calibrations"
+CAMERA_NAME="package_smoke"
+INTRINSIC_FILE="${CALIBRATION_ROOT}/sim/${CAMERA_NAME}/intrinsics-20260101T000000.000000Z.yaml"
+mkdir -p "$(dirname "${INTRINSIC_FILE}")"
 cat >"${INTRINSIC_FILE}" <<'YAML'
 schema: xgc2.camera.intrinsic.v1
 created_at: '2026-01-01T00:00:00Z'
@@ -44,9 +47,10 @@ projection_matrix:
   data: [500.0, 0.0, 319.5, 0.0, 0.0, 500.0, 239.5, 0.0, 0.0, 0.0, 1.0, 0.0]
 YAML
 roslaunch --files xgc_camera_calibration extrinsic_calibrator.launch \
-  intrinsic_file:="${INTRINSIC_FILE}" >/dev/null
+  calibration_root:="${CALIBRATION_ROOT}" calibration_mode:=sim \
+  camera_name:="${CAMERA_NAME}" intrinsic_file:="${INTRINSIC_FILE}" >/dev/null
 roslaunch --files xgc_camera_calibration intrinsic_calibrator.launch \
-  calibration_root:="${RUNTIME}/calibrations" calibration_mode:=sim \
+  calibration_root:="${CALIBRATION_ROOT}" calibration_mode:=sim \
   camera_name:=package_smoke >/dev/null
 roslaunch --files xgc_camera_calibration extrinsic_tf.launch >/dev/null
 
@@ -117,7 +121,8 @@ wait_http 18790 "${MEDIA_EDGE_PID}"
   __name:=xgc_camera_extrinsic_calibrator_web \
   _image_topic:=/not_installed_by_this_product/image_raw \
   _intrinsic_file:="${INTRINSIC_FILE}" \
-  _http_port:=18765 _output_file:="${RUNTIME}/extrinsics.yaml" \
+  _calibration_root:="${CALIBRATION_ROOT}" _calibration_mode:=sim \
+  _camera_name:="${CAMERA_NAME}" _http_port:=18765 \
   >"${RUNTIME}/extrinsic.log" 2>&1 &
 EXTRINSIC_PID="$!"
 "${PREFIX}/lib/xgc_camera_calibration/intrinsic_calibrator_web.py" \
