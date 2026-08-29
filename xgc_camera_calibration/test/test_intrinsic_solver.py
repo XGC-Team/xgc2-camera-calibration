@@ -45,18 +45,45 @@ def _project_views():
 
 
 class IntrinsicSolverTest(unittest.TestCase):
-    def test_refines_only_accepted_aprilgrid_points_on_source_gray_plane(self):
+    def test_refines_paired_aprilgrid_corners_on_source_gray_plane(self):
         gray = np.zeros((1080, 1920), np.uint8)
         corners = np.asarray(
             [[100, 100], [200, 100], [200, 200], [100, 200]],
             dtype=np.float32,
         ).reshape(-1, 1, 2)
-        refined = corners + np.asarray([2.0, 4.0], dtype=np.float32)
+        objects = np.asarray(
+            [[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0]],
+            dtype=np.float32,
+        )
+        refined = corners + np.asarray([0.5, 0.5], dtype=np.float32)
         with mock.patch.object(cv2, "cornerSubPix", return_value=refined) as subpixel:
-            centers = solver.refine_aprilgrid_calibration_centers(gray, corners)
+            image_points, object_points = solver.refine_aprilgrid_calibration_corners(
+                gray, corners, objects
+            )
         subpixel.assert_called_once()
         self.assertEqual(subpixel.call_args.args[0].shape, (1080, 1920))
-        np.testing.assert_allclose(centers.reshape(-1, 2), [[152.0, 154.0]])
+        np.testing.assert_allclose(image_points.reshape(-1, 2), refined.reshape(-1, 2))
+        np.testing.assert_allclose(object_points, objects)
+
+    def test_source_refinement_applies_one_complete_tag_mask_to_both_sides(self):
+        gray = np.zeros((1080, 1920), np.uint8)
+        corners = np.asarray(
+            [
+                [[100, 100], [200, 100], [200, 200], [100, 200]],
+                [[300, 100], [400, 100], [400, 200], [300, 200]],
+            ],
+            dtype=np.float32,
+        )
+        objects = np.arange(24, dtype=np.float32).reshape(2, 4, 3)
+        refined = corners.reshape(-1, 1, 2).copy()
+        refined[5, 0] += np.asarray([2.0, 0.0], dtype=np.float32)
+        with mock.patch.object(cv2, "cornerSubPix", return_value=refined):
+            image_points, object_points = solver.refine_aprilgrid_calibration_corners(
+                gray, corners, objects
+            )
+        self.assertEqual(len(image_points), 4)
+        self.assertEqual(len(object_points), 4)
+        np.testing.assert_allclose(object_points, objects[0])
 
     def test_recovers_known_intrinsics(self):
         image_points, _ = _project_views()
@@ -161,13 +188,13 @@ class IntrinsicSolverTest(unittest.TestCase):
         self.assertIsNotNone(detection.calibration_image_points)
         self.assertIsNotNone(detection.calibration_object_points)
         self.assertEqual(
-            len(detection.calibration_image_points), len(detection.image_points) // 4
+            len(detection.calibration_image_points),
+            len(detection.calibration_object_points),
         )
-        np.testing.assert_allclose(
-            detection.calibration_image_points.reshape(-1, 2),
-            detection.image_points.reshape(-1, 4, 2).mean(axis=1),
-            atol=1e-5,
+        self.assertGreaterEqual(
+            len(detection.calibration_image_points), len(detection.image_points) - 4
         )
+        self.assertGreater(len(detection.calibration_image_points), len(detection.image_points) // 4)
         image_points = []
         object_points = []
         obj = np.concatenate(
@@ -198,7 +225,7 @@ class IntrinsicSolverTest(unittest.TestCase):
         self.assertAlmostEqual(result.camera_matrix[0, 0], 2288.17, delta=2.0)
         self.assertLess(result.rms_reprojection_error_px, 0.5)
 
-    def test_retries_small_physical_aprilgrid_at_bounded_resolution(self):
+    def test_rejects_tags_too_small_for_full_corner_refinement(self):
         if not hasattr(cv2, "aruco") or not hasattr(cv2.aruco, "DICT_APRILTAG_36h11"):
             self.skipTest("OpenCV AprilTag 36h11 dictionary is unavailable")
         # Kalibr's two-cell border plus 6x6 payload needs at least 2 pixels per
@@ -207,12 +234,7 @@ class IntrinsicSolverTest(unittest.TestCase):
         detection = solver.detect_aprilgrid(
             gray, (6, 6), square=0.088, tag_spacing=0.0264, min_tags=6, maximum_width=960
         )
-        self.assertIsNotNone(detection)
-        self.assertGreaterEqual(len(detection.image_points), 24)
-        points = detection.image_points.reshape(-1, 2)
-        self.assertGreaterEqual(float(points.min()), 0.0)
-        self.assertLessEqual(float(points[:, 0].max()), float(gray.shape[1]))
-        self.assertLessEqual(float(points[:, 1].max()), float(gray.shape[0]))
+        self.assertIsNone(detection)
 
     def test_contour_fallback_supports_opencv_42_aprilgrid_detection(self):
         if not hasattr(cv2, "aruco") or not hasattr(cv2.aruco, "DICT_APRILTAG_36h11"):

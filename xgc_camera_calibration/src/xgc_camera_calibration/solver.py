@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import tempfile
 from itertools import chain, combinations, islice
 from dataclasses import dataclass
@@ -16,8 +17,39 @@ import numpy as np
 import yaml
 
 
+CAMERA_NAME_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9._-]{0,63}$")
+
+
 class CalibrationError(RuntimeError):
     """Raised when the correspondence set cannot yield a trustworthy pose."""
+
+
+def extrinsic_calibration_directory(root: str, mode: str, camera_name: str) -> Path:
+    """Resolve the explicit storage identity shared by solver and TF consumer."""
+
+    calibration_root = Path(str(root)).expanduser()
+    calibration_mode = str(mode).strip()
+    identity = str(camera_name).strip()
+    if not calibration_root.is_absolute():
+        raise ValueError("calibration root must be absolute")
+    if calibration_mode not in ("sim", "phy"):
+        raise ValueError("calibration mode must be sim or phy")
+    if not CAMERA_NAME_PATTERN.fullmatch(identity):
+        raise ValueError("camera name must be a stable identifier")
+    return calibration_root / calibration_mode / identity
+
+
+def versioned_extrinsic_path(directory: os.PathLike) -> Path:
+    """Allocate a concrete UTC-named result path without creating an alias."""
+
+    destination = Path(directory).expanduser()
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    candidate = destination / "extrinsics-{}.yaml".format(timestamp)
+    sequence = 1
+    while candidate.exists():
+        candidate = destination / "extrinsics-{}-{:02d}.yaml".format(timestamp, sequence)
+        sequence += 1
+    return candidate
 
 
 @dataclass(frozen=True)
@@ -301,11 +333,17 @@ def solve_extrinsic(
 def result_document(
     result: ExtrinsicResult,
     *,
+    calibration_mode: str,
+    camera_name: str,
     parent_frame: str,
     child_frame: str,
     points: Optional[Sequence[Dict[str, Any]]] = None,
     metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    if calibration_mode not in ("sim", "phy"):
+        raise CalibrationError("calibration_mode must be sim or phy")
+    if not CAMERA_NAME_PATTERN.fullmatch(str(camera_name).strip()):
+        raise CalibrationError("camera_name must be a stable identifier")
     if not isinstance(parent_frame, str) or not parent_frame.strip():
         raise CalibrationError("parent_frame must be a non-empty string")
     if not isinstance(child_frame, str) or not child_frame.strip():
@@ -313,6 +351,8 @@ def result_document(
     document: Dict[str, Any] = {
         "schema": "xgc2.camera.extrinsic.v1",
         "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "calibration_mode": calibration_mode,
+        "camera_name": str(camera_name).strip(),
         "frame_convention": "parent_T_camera_optical",
         "parent_frame": parent_frame,
         "child_frame": child_frame,
@@ -334,6 +374,8 @@ def save_extrinsic(
     path: os.PathLike,
     result: ExtrinsicResult,
     *,
+    calibration_mode: str,
+    camera_name: str,
     parent_frame: str,
     child_frame: str,
     points: Optional[Sequence[Dict[str, Any]]] = None,
@@ -345,6 +387,8 @@ def save_extrinsic(
     destination.parent.mkdir(parents=True, exist_ok=True)
     document = result_document(
         result,
+        calibration_mode=calibration_mode,
+        camera_name=camera_name,
         parent_frame=parent_frame,
         child_frame=child_frame,
         points=points,
@@ -393,6 +437,10 @@ def load_extrinsic(path: os.PathLike) -> Dict[str, Any]:
         raise CalibrationError("extrinsic document must be a mapping")
     if document.get("schema") != "xgc2.camera.extrinsic.v1":
         raise CalibrationError("unsupported or missing extrinsic schema")
+    if document.get("calibration_mode") not in ("sim", "phy"):
+        raise CalibrationError("unsupported or missing calibration mode")
+    if not CAMERA_NAME_PATTERN.fullmatch(str(document.get("camera_name", "")).strip()):
+        raise CalibrationError("unsupported or missing camera name")
     if document.get("frame_convention") != "parent_T_camera_optical":
         raise CalibrationError("unsupported or missing extrinsic frame convention")
     for field in ("parent_frame", "child_frame"):

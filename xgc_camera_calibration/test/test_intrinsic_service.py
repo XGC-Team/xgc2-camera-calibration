@@ -238,16 +238,17 @@ class IntrinsicServiceTest(unittest.TestCase):
                 image_points=corners,
                 object_points=np.zeros((4, 3), np.float32),
                 coverage=(0.2, 0.3, 0.4, 0.5),
-                calibration_image_points=np.asarray([[[30, 30]]], np.float32),
-                calibration_object_points=np.zeros((1, 3), np.float32),
+                calibration_image_points=corners,
+                calibration_object_points=np.zeros((4, 3), np.float32),
             )
-            refined = np.asarray([[[123.0, 234.0]]], np.float32)
+            refined = corners * 4.0 + np.asarray([0.25, 0.5], np.float32)
+            refined_objects = np.arange(12, dtype=np.float32).reshape(4, 3)
             with patch.object(
                 intrinsic_solver, "detect_board", return_value=detection
             ) as detect, patch.object(
                 intrinsic_solver,
-                "refine_aprilgrid_calibration_centers",
-                return_value=refined,
+                "refine_aprilgrid_calibration_corners",
+                return_value=(refined, refined_objects),
             ) as refine:
                 service.process_frame(
                     reduced,
@@ -260,7 +261,9 @@ class IntrinsicServiceTest(unittest.TestCase):
                 refine.call_args.args[1].reshape(-1, 2),
                 corners.reshape(-1, 2) * 4.0,
             )
+            np.testing.assert_allclose(refine.call_args.args[2], detection.object_points)
             np.testing.assert_allclose(service.image_points[0], refined)
+            np.testing.assert_allclose(service.object_points[0], refined_objects)
 
     def test_aprilgrid_candidate_redecodes_original_jpeg_for_adaptive_search(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -282,16 +285,16 @@ class IntrinsicServiceTest(unittest.TestCase):
                 image_points=corners,
                 object_points=np.zeros((4, 3), np.float32),
                 coverage=(0.2, 0.3, 0.4, 0.5),
-                calibration_image_points=np.asarray([[[120, 120]]], np.float32),
-                calibration_object_points=np.zeros((1, 3), np.float32),
+                calibration_image_points=corners,
+                calibration_object_points=np.zeros((4, 3), np.float32),
             )
             with patch.object(
                 intrinsic_solver, "detect_board", side_effect=[None, detection]
             ) as detect, patch.object(
                 intrinsic_solver, "aprilgrid_has_candidate_evidence", return_value=True
             ), patch.object(
-                intrinsic_solver, "refine_aprilgrid_calibration_centers",
-                return_value=np.asarray([[[180, 180]]], np.float32),
+                intrinsic_solver, "refine_aprilgrid_calibration_corners",
+                return_value=(corners * 4.0, np.zeros((4, 3), np.float32)),
             ):
                 service.process_frame(
                     reduced,
@@ -377,6 +380,45 @@ class IntrinsicServiceTest(unittest.TestCase):
             self.assertEqual(len(restored.object_points), 1)
             self.assertTrue(state["recovery"]["checkpoint_available"])
             self.assertFalse(state["result_restored"])
+
+    def test_center_feature_checkpoint_is_not_restored_as_full_corner_data(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "intrinsics.yaml"
+            service = IntrinsicCalibrationService(
+                board_size=(2, 2),
+                square=0.088,
+                output_file=str(output),
+                camera_name="usb_cam",
+                board_type="aprilgrid",
+                tag_spacing=0.0264,
+                min_tags=4,
+            )
+            old_fingerprint = service._recovery_fingerprint()
+            old_fingerprint.pop("feature_model")
+            old_fingerprint["schema"] = 1
+            checkpoint = Path(service.checkpoint_file)
+            np.savez_compressed(
+                str(checkpoint),
+                fingerprint=np.asarray(json.dumps(old_fingerprint, sort_keys=True)),
+                samples=np.asarray([[0.2, 0.3, 0.4, 0.5]], dtype=np.float64),
+                image_size=np.asarray([640, 480], dtype=np.int64),
+                image_points_000=np.zeros((4, 1, 2), dtype=np.float32),
+                object_points_000=np.zeros((4, 3), dtype=np.float32),
+            )
+
+            restored = IntrinsicCalibrationService(
+                board_size=(2, 2),
+                square=0.088,
+                output_file=str(output),
+                camera_name="usb_cam",
+                board_type="aprilgrid",
+                tag_spacing=0.0264,
+                min_tags=4,
+            )
+            state = restored.state()
+            self.assertEqual(state["samples"], 0)
+            self.assertIn("incompatible observation feature model", state["recovery"]["last_error"])
+            self.assertTrue(state["recovery"]["checkpoint_available"])
 
     def test_saved_result_restores_without_recollecting_samples(self):
         with tempfile.TemporaryDirectory() as directory:

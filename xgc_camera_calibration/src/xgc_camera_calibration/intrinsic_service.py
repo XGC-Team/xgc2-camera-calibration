@@ -365,7 +365,12 @@ class IntrinsicCalibrationService:
 
     def _recovery_fingerprint(self) -> Dict[str, Any]:
         return {
-            "schema": 1,
+            "schema": 2,
+            "feature_model": (
+                intrinsic_solver.APRILGRID_FEATURE_MODEL
+                if self.board_type == "aprilgrid"
+                else "checkerboard_corners_v1"
+            ),
             "board_type": self.board_type,
             "board_size": list(self.board_size),
             "square": self.square,
@@ -697,6 +702,10 @@ class IntrinsicCalibrationService:
         with np.load(str(path), allow_pickle=False) as archive:
             fingerprint = json.loads(str(archive["fingerprint"].item()))
             if fingerprint != self._recovery_fingerprint():
+                self._recovery_error = (
+                    "Calibration checkpoint uses an incompatible observation "
+                    "feature model; recapture samples"
+                )
                 return False
             samples = np.asarray(archive["samples"], dtype=np.float64)
             image_size_values = np.asarray(archive["image_size"], dtype=np.int64).reshape(-1)
@@ -986,25 +995,28 @@ class IntrinsicCalibrationService:
                                     raise ValueError(
                                         "source JPEG dimensions do not match snapshot metadata"
                                     )
-                                calibration_corners = (
-                                    intrinsic_solver.refine_aprilgrid_calibration_centers(
+                                calibration_corners, calibration_objects = (
+                                    intrinsic_solver.refine_aprilgrid_calibration_corners(
                                         source_gray,
                                         np.asarray(corners, dtype=np.float32) * source_scale,
+                                        detection.object_points,
+                                        minimum_tags=self.min_tags,
                                     )
                                 )
                             except Exception as error:
-                                # The bounded detection remains useful and the
-                                # source-coordinate fallback is still valid.
-                                # Surface refinement trouble without dropping
-                                # the operator's newest detection frame.
+                                # Keep the live detection, but never admit a
+                                # solve sample containing mixed refined/raw
+                                # AprilGrid corners.
                                 self._recovery_error = str(error) or error.__class__.__name__
-                        self.samples.append(params)
-                        self.image_points.append(calibration_corners)
-                        self.object_points.append(calibration_objects)
-                        try:
-                            self._save_checkpoint_locked()
-                        except Exception as error:
-                            self._recovery_error = str(error) or error.__class__.__name__
+                                accepted = False
+                        if accepted:
+                            self.samples.append(params)
+                            self.image_points.append(calibration_corners)
+                            self.object_points.append(calibration_objects)
+                            try:
+                                self._save_checkpoint_locked()
+                            except Exception as error:
+                                self._recovery_error = str(error) or error.__class__.__name__
                 self._mark_aligned(display, render_position, render_orientation)
                 self.latest_detection = {
                     "status": "detected",
@@ -1439,6 +1451,11 @@ class IntrinsicCalibrationService:
                     "media_source": self.media_source,
                     "camera_name": self.camera_name,
                     "web_calibrator": True,
+                    "feature_model": (
+                        intrinsic_solver.APRILGRID_FEATURE_MODEL
+                        if self.board_type == "aprilgrid"
+                        else "checkerboard_corners_v1"
+                    ),
                     "coverage": intrinsic_solver.coverage(self.samples)[0],
                 },
                 board=self._board_document(),

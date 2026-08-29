@@ -335,15 +335,14 @@ def main():
         )
         package_root = Path(rospkg.RosPack().get_path("xgc_camera_calibration"))
         web_root = Path(rospy.get_param("~web_root", str(package_root / "web" / "extrinsic")))
+        calibration_root = str(rospy.get_param("~calibration_root")).strip()
+        calibration_mode = str(rospy.get_param("~calibration_mode")).strip()
+        camera_name = str(rospy.get_param("~camera_name")).strip()
         service = CalibrationService(
             source,
-            output_file=rospy.get_param(
-                "~output_file",
-                str(
-                    Path.home()
-                    / ".local/state/xgc2/camera/calibrations/usb_cam/extrinsics.yaml"
-                ),
-            ),
+            calibration_root=calibration_root,
+            calibration_mode=calibration_mode,
+            camera_name=camera_name,
             parent_frame=rospy.get_param("~parent_frame", "map"),
             child_frame=rospy.get_param("~child_frame", "usb_cam_optical_frame"),
             maximum_marker_age=float(rospy.get_param("~maximum_marker_age", 0.1)),
@@ -396,6 +395,12 @@ def main():
     rospy.loginfo(
         "Camera extrinsic calibration uses intrinsics from %s",
         source.intrinsic_file,
+    )
+    rospy.loginfo(
+        "Camera extrinsic results will be saved under %s (%s/%s)",
+        calibration_root,
+        calibration_mode,
+        camera_name,
     )
     try:
         rospy.spin()

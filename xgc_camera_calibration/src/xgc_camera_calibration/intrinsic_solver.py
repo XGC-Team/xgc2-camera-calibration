@@ -40,6 +40,10 @@ _APRILGRID_FALLBACK_MIN_SHARPNESS = 160.0
 _APRILGRID_FALLBACK_MARKER_PIXELS = 100
 _APRILGRID_FALLBACK_MAX_PAYLOAD_ERRORS = 5
 _APRILGRID_FALLBACK_MAX_BORDER_ERRORS = 2
+APRILGRID_FEATURE_MODEL = "aprilgrid_tag_corners_v1"
+_APRILGRID_MIN_BORDER_DISTANCE = 6.0
+# Kalibr's AprilGrid default is expressed in squared source-image pixels.
+_APRILGRID_MAX_SUBPIX_DISPLACEMENT2 = 1.5
 
 
 @dataclass(frozen=True)
@@ -47,9 +51,9 @@ class BoardDetection:
     image_points: np.ndarray
     object_points: np.ndarray
     coverage: Tuple[float, float, float, float]
-    # Kalibr t36h11 uses two black border cells. Keep every decoded outer corner
-    # for annotation and coverage, while calibration may use refined tag
-    # centres to avoid border-edge interpolation bias.
+    # Keep every decoded outer corner for annotation and coverage. Calibration
+    # points may be a quality-gated subset, but image/object arrays always use
+    # the same per-corner mask and ordering.
     calibration_image_points: Optional[np.ndarray] = None
     calibration_object_points: Optional[np.ndarray] = None
 
@@ -153,36 +157,75 @@ def aprilgrid_has_candidate_evidence(
     return decoded >= minimum_quads or rejected_count >= minimum_quads
 
 
-def refine_aprilgrid_calibration_centers(
+def refine_aprilgrid_calibration_corners(
     source_gray: np.ndarray,
     source_tag_corners: np.ndarray,
-) -> np.ndarray:
-    """Refine accepted tag corners locally on the source image, then center them.
+    source_tag_objects: np.ndarray,
+    minimum_tags: int = 1,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Return paired, full-resolution AprilGrid corner correspondences.
 
     Continuous detection stays on the small search plane. Only a geometrically
-    distinct sample pays for this source-resolution grayscale refinement.
+    distinct sample pays for this source-resolution grayscale refinement. A
+    single validity mask is applied to image and object coordinates; an
+    unrefined or ambiguously ordered point is never mixed into a solve sample.
     """
     if source_gray.ndim != 2:
         raise ValueError("AprilGrid source refinement expects a grayscale image")
+    if int(minimum_tags) < 1:
+        raise ValueError("AprilGrid source refinement needs a positive minimum tag count")
     corners = np.asarray(source_tag_corners, dtype=np.float32).reshape(-1, 4, 2)
-    pixels = corners.reshape(-1, 1, 2).copy()
+    objects = np.asarray(source_tag_objects, dtype=np.float32).reshape(-1, 4, 3)
+    if len(corners) != len(objects) or not len(corners):
+        raise ValueError("AprilGrid image/object tag correspondences do not match")
     height, width = source_gray.shape[:2]
-    flat = pixels.reshape(-1, 2)
-    valid = (
-        (flat[:, 0] >= 6.0)
-        & (flat[:, 0] < float(width - 6))
-        & (flat[:, 1] >= 6.0)
-        & (flat[:, 1] < float(height - 6))
+    flat = corners.reshape(-1, 2)
+    finite = np.all(np.isfinite(corners), axis=(1, 2)) & np.all(
+        np.isfinite(objects), axis=(1, 2)
     )
-    if bool(np.any(valid)):
-        pixels[valid] = cv2.cornerSubPix(
-            source_gray,
-            pixels[valid].copy(),
-            (5, 5),
-            (-1, -1),
-            _SUBPIX_CRITERIA,
+    inside = (
+        (flat[:, 0] >= _APRILGRID_MIN_BORDER_DISTANCE)
+        & (flat[:, 0] < float(width) - _APRILGRID_MIN_BORDER_DISTANCE)
+        & (flat[:, 1] >= _APRILGRID_MIN_BORDER_DISTANCE)
+        & (flat[:, 1] < float(height) - _APRILGRID_MIN_BORDER_DISTANCE)
+    ).reshape(-1, 4).all(axis=1)
+    convex = np.asarray(
+        [cv2.isContourConvex(tag.reshape(-1, 1, 2)) for tag in corners],
+        dtype=bool,
+    )
+    tag_mask = finite & inside & convex
+    if not bool(np.any(tag_mask)):
+        raise CalibrationError("AprilGrid source frame has no refinable tag corners")
+
+    raw = corners[tag_mask].reshape(-1, 1, 2).copy()
+    refined = cv2.cornerSubPix(
+        source_gray, raw.copy(), (5, 5), (-1, -1), _SUBPIX_CRITERIA
+    )
+    refined_tags = np.asarray(refined, dtype=np.float32).reshape(-1, 4, 2)
+    raw_tags = raw.reshape(-1, 4, 2)
+    displacement2 = np.sum((refined_tags - raw_tags) ** 2, axis=2)
+    orientation_ok = np.asarray(
+        [
+            cv2.isContourConvex(tag.reshape(-1, 1, 2))
+            and np.sign(cv2.contourArea(before, oriented=True))
+            == np.sign(cv2.contourArea(tag, oriented=True))
+            for before, tag in zip(raw_tags, refined_tags)
+        ],
+        dtype=bool,
+    )
+    refinement_ok = np.all(
+        displacement2 <= _APRILGRID_MAX_SUBPIX_DISPLACEMENT2, axis=1
+    ) & orientation_ok
+    accepted_objects = objects[tag_mask]
+    image_points = refined_tags[refinement_ok].reshape(-1, 1, 2)
+    object_points = accepted_objects[refinement_ok].reshape(-1, 3)
+    if int(np.sum(refinement_ok)) < int(minimum_tags):
+        raise CalibrationError(
+            "AprilGrid source refinement retained fewer than {} complete tags".format(
+                int(minimum_tags)
+            )
         )
-    return np.mean(pixels.reshape(-1, 4, 2), axis=1).reshape(-1, 1, 2).astype(np.float32)
+    return image_points.astype(np.float32), object_points.astype(np.float32)
 
 
 def _draw_aruco_marker(dictionary: Any, marker_id: int, size: int) -> np.ndarray:
@@ -655,9 +698,18 @@ def detect_aprilgrid(
     )
     tag_image_points = np.asarray(image_points, dtype=np.float32).reshape(-1, 4, 2)
     tag_object_points = np.asarray(object_points, dtype=np.float32).reshape(-1, 4, 3)
-    pixels = tag_image_points.reshape(-1, 1, 2)
-    refined = pixels.copy()
-    flat = pixels.reshape(-1, 2)
+    raw_pixels = tag_image_points.reshape(-1, 1, 2)
+    objects = tag_object_points.reshape(-1, 3)
+    try:
+        calibration_pixels, calibration_objects = refine_aprilgrid_calibration_corners(
+            gray, tag_image_points, tag_object_points, minimum_tags=min_tags
+        )
+    except CalibrationError:
+        return None
+    # Keep the complete refined detection for annotation and coverage. The
+    # calibration arrays above remain the separately quality-gated paired set.
+    pixels = raw_pixels.copy()
+    flat = raw_pixels.reshape(-1, 2)
     valid = (
         (flat[:, 0] >= 4.0)
         & (flat[:, 0] < float(width - 4))
@@ -665,11 +717,9 @@ def detect_aprilgrid(
         & (flat[:, 1] < float(height - 4))
     )
     if bool(np.any(valid)):
-        refined[valid] = cv2.cornerSubPix(
-            gray, pixels[valid].copy(), (3, 3), (-1, -1), _SUBPIX_CRITERIA
+        pixels[valid] = cv2.cornerSubPix(
+            gray, raw_pixels[valid].copy(), (3, 3), (-1, -1), _SUBPIX_CRITERIA
         )
-    pixels = refined
-    objects = tag_object_points.reshape(-1, 3)
     return BoardDetection(
         image_points=pixels,
         object_points=objects,
@@ -682,12 +732,8 @@ def detect_aprilgrid(
             width,
             height,
         ),
-        calibration_image_points=np.mean(pixels.reshape(-1, 4, 2), axis=1)
-        .reshape(-1, 1, 2)
-        .astype(np.float32),
-        calibration_object_points=np.mean(tag_object_points, axis=1)
-        .reshape(-1, 3)
-        .astype(np.float32),
+        calibration_image_points=calibration_pixels,
+        calibration_object_points=calibration_objects,
     )
 
 

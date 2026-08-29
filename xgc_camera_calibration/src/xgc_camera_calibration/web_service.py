@@ -20,8 +20,10 @@ import numpy as np
 from xgc_camera_calibration.solver import (
     CalibrationError,
     ExtrinsicResult,
+    extrinsic_calibration_directory,
     save_extrinsic,
     solve_extrinsic,
+    versioned_extrinsic_path,
 )
 
 
@@ -181,7 +183,9 @@ class CalibrationService:
         self,
         source: Any,
         *,
-        output_file: str,
+        calibration_root: str,
+        calibration_mode: str,
+        camera_name: str,
         parent_frame: str,
         child_frame: str,
         maximum_marker_age: float = 0.1,
@@ -189,8 +193,6 @@ class CalibrationService:
         maximum_inlier_error_px: float = 5.0,
         jpeg_quality: int = 80,
     ):
-        if not output_file:
-            raise ValueError("output_file must not be empty")
         if not parent_frame or not child_frame:
             raise ValueError("parent_frame and child_frame must not be empty")
         if maximum_marker_age < 0.0:
@@ -198,7 +200,12 @@ class CalibrationService:
         if not 1 <= int(jpeg_quality) <= 100:
             raise ValueError("jpeg_quality must be between 1 and 100")
         self.source = source
-        self.output_file = str(Path(output_file).expanduser())
+        self.output_directory = extrinsic_calibration_directory(
+            calibration_root, calibration_mode, camera_name
+        )
+        self.calibration_mode = str(calibration_mode).strip()
+        self.camera_name = str(camera_name).strip()
+        self.output_file: Optional[str] = None
         self.parent_frame = parent_frame
         self.child_frame = child_frame
         self.maximum_marker_age = float(maximum_marker_age)
@@ -229,6 +236,8 @@ class CalibrationService:
                 "mode": "frozen" if frozen is not None else "live",
                 "generation": self.generation,
                 "output_file": self.output_file,
+                "calibration_mode": self.calibration_mode,
+                "camera_name": self.camera_name,
                 "parent_frame": self.parent_frame,
                 "child_frame": self.child_frame,
                 "source": source_state,
@@ -386,9 +395,12 @@ class CalibrationService:
                     }
                 )
             try:
+                output_file = versioned_extrinsic_path(self.output_directory)
                 save_extrinsic(
-                    self.output_file,
+                    output_file,
                     result,
+                    calibration_mode=self.calibration_mode,
+                    camera_name=self.camera_name,
                     parent_frame=self.parent_frame,
                     child_frame=self.child_frame,
                     points=persisted_points,
@@ -419,6 +431,7 @@ class CalibrationService:
                 np.asarray(snapshot.distortion, dtype=np.float64),
             )
             payload["points"] = persisted_points
+            self.output_file = str(output_file)
             payload["output_file"] = self.output_file
             self.result = result
             self.result_payload = payload

@@ -94,10 +94,19 @@ class ExtrinsicSolverTest(unittest.TestCase):
     def test_persists_versioned_result_atomically(self):
         result = solve_extrinsic(self.world, self.pixels, self.intrinsic)
         with tempfile.TemporaryDirectory() as directory:
-            output = Path(directory) / "nested" / "extrinsics.yaml"
-            save_extrinsic(output, result, parent_frame="map", child_frame="usb_cam_optical_frame")
+            output = Path(directory) / "nested" / "extrinsics-20260830T010000.000000Z.yaml"
+            save_extrinsic(
+                output,
+                result,
+                calibration_mode="phy",
+                camera_name="usb_cam",
+                parent_frame="map",
+                child_frame="usb_cam_optical_frame",
+            )
             loaded = load_extrinsic(output)
             self.assertEqual(loaded["schema"], "xgc2.camera.extrinsic.v1")
+            self.assertEqual(loaded["calibration_mode"], "phy")
+            self.assertEqual(loaded["camera_name"], "usb_cam")
             self.assertEqual(loaded["parent_frame"], "map")
             self.assertEqual(loaded["child_frame"], "usb_cam_optical_frame")
             np.testing.assert_allclose(loaded["translation_array"], result.translation)

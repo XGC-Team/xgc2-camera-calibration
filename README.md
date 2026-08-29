@@ -20,6 +20,8 @@ in a world frame.
 roslaunch xgc_camera_calibration intrinsic_calibrator.launch \
   media_edge_address:=http://127.0.0.1:18090 \
   media_source_id:=usb_cam snapshot_timeout:=5.0 \
+  calibration_root:=/home/user/Documents/XGC/Calibration/camera \
+  calibration_mode:=phy camera_name:=usb_cam \
   board_cols:=7 board_rows:=5 square_size:=0.20 \
   bind_address:=127.0.0.1 http_port:=8766
 ```
@@ -56,6 +58,8 @@ roslaunch xgc_camera_calibration extrinsic_calibrator.launch \
   preview_image_topic:=/usb_cam/image_raw/compressed \
   intrinsic_file:=/absolute/path/to/intrinsics-UTC.yaml \
   pose_prefix:=/vrpn_client_node \
+  calibration_root:=/home/user/Documents/XGC/Calibration/camera \
+  calibration_mode:=phy camera_name:=usb_cam \
   bind_address:=127.0.0.1 http_port:=8765
 ```
 
@@ -70,7 +74,10 @@ For a managed Gazebo world camera, use the snapshot mode instead:
 roslaunch xgc_camera_calibration extrinsic_calibrator.launch \
   media_edge_address:=http://127.0.0.1:18090 \
   media_source_id:=gazebo_world_camera \
+  intrinsic_file:=/absolute/path/to/intrinsics-UTC.yaml \
   pose_prefix:=/vrpn_client_node \
+  calibration_root:=/home/user/Documents/XGC/Calibration/camera \
+  calibration_mode:=sim camera_name:=usb_cam \
   bind_address:=127.0.0.1 http_port:=8765
 ```
 
@@ -89,7 +96,8 @@ Publish a solved fixed-camera transform with:
 
 ```bash
 roslaunch xgc_camera_calibration extrinsic_tf.launch \
-  extrinsic_file:=/var/lib/xgc2/camera/calibrations/usb_cam/extrinsics.yaml
+  calibration_root:=/home/user/Documents/XGC/Calibration/camera \
+  calibration_mode:=phy camera_name:=usb_cam
 ```
 
 An Automation can start the publisher before the operator solves the camera and
@@ -97,13 +105,19 @@ activate the new result without restarting any process:
 
 ```bash
 roslaunch xgc_camera_calibration extrinsic_tf.launch \
-  extrinsic_file:=/tmp/xgc2/camera/calibrations/usb_cam/extrinsics.yaml \
+  calibration_root:=/home/user/Documents/XGC/Calibration/camera \
+  calibration_mode:=phy camera_name:=usb_cam \
   wait_for_file:=true require_file_update:=true watch_file:=true
 ```
 
-`require_file_update` ignores a stale file that existed when the node started;
-the calibrator's atomic save then activates exactly the result from the current
-run. `watch_file` also applies later re-solves while the workflow remains open.
+The calibrator writes exactly one immutable
+`<root>/<sim|phy>/<cameraName>/extrinsics-<UTC>.yaml` per solve. It does not
+create or update an `extrinsics.yaml` alias. `require_file_update` ignores every
+timestamped result that existed when the node started; the directory watcher
+then activates the concrete result from the current run. `watch_file` also
+applies later re-solves while the workflow remains open, and the publisher
+exposes the active absolute path as its private `active_extrinsic_file` ROS
+parameter.
 
 The stable REP-103 chain is:
 
@@ -133,9 +147,9 @@ process-definition IDs for this product:
 
 Both WebUIs bind to loopback by default and require no desktop session or
 `DISPLAY`. Media Edge snapshot mode accepts only a loopback Edge address.
-Managed definitions write runtime calibration assets outside the package share
-directory under `/tmp/xgc2/camera/calibrations`. This product package does not
-ship or own XGC2 process definitions.
+Managed definitions pass an explicit Documents calibration root, `sim` or
+`phy`, and the stable camera name. The media source ID is not a storage
+identity. This product package does not ship or own XGC2 process definitions.
 
 ## Build and test
 

@@ -58,6 +58,21 @@ class FakeSource:
 
 
 class WebCalibrationServiceTest(unittest.TestCase):
+    def test_ros_entrypoints_require_the_shared_storage_identity(self):
+        package = Path(__file__).resolve().parents[1]
+        calibrator = (package / "scripts" / "extrinsic_calibrator_web.py").read_text(
+            encoding="utf-8"
+        )
+        publisher = (package / "scripts" / "extrinsic_tf_publisher.py").read_text(
+            encoding="utf-8"
+        )
+        for source in (calibrator, publisher):
+            self.assertIn('rospy.get_param("~calibration_root")', source)
+            self.assertIn('rospy.get_param("~calibration_mode")', source)
+            self.assertIn('rospy.get_param("~camera_name")', source)
+        self.assertNotIn('rospy.get_param("~output_file"', calibrator)
+        self.assertNotIn('rospy.get_param("~extrinsic_file"', publisher)
+
     def test_web_assets_use_proxy_safe_relative_urls(self):
         web_root = Path(__file__).resolve().parents[1] / "web" / "extrinsic"
         index = (web_root / "index.html").read_text(encoding="utf-8")
@@ -119,10 +134,13 @@ class WebCalibrationServiceTest(unittest.TestCase):
             stale_markers={},
         )
         self.temporary = tempfile.TemporaryDirectory()
-        self.output = Path(self.temporary.name) / "calibrations" / "extrinsics.yaml"
+        self.calibration_root = Path(self.temporary.name) / "calibrations"
+        self.output_directory = self.calibration_root / "sim" / "usb_cam"
         self.service = CalibrationService(
             FakeSource(self.snapshot),
-            output_file=str(self.output),
+            calibration_root=str(self.calibration_root),
+            calibration_mode="sim",
+            camera_name="usb_cam",
             parent_frame="map",
             child_frame="camera_optical_frame",
             maximum_inlier_error_px=1.0,
@@ -148,10 +166,33 @@ class WebCalibrationServiceTest(unittest.TestCase):
         result = self.service.solve(self.point_request())
         self.assertLess(result["max_reprojection_error_px"], 1e-3)
         self.assertEqual(len(result["projections"]), 6)
-        self.assertTrue(self.output.is_file())
-        document = load_extrinsic(self.output)
+        output = Path(result["output_file"])
+        self.assertEqual(output.parent, self.output_directory)
+        self.assertRegex(
+            output.name,
+            r"^extrinsics-\d{8}T\d{6}\.\d{6}Z(?:-\d{2})?\.yaml$",
+        )
+        self.assertTrue(output.is_file())
+        self.assertFalse((self.output_directory / "extrinsics.yaml").exists())
+        self.assertEqual(self.service.state()["output_file"], str(output))
+        document = load_extrinsic(output)
+        self.assertEqual(document["calibration_mode"], "sim")
+        self.assertEqual(document["camera_name"], "usb_cam")
         self.assertTrue(document["metadata"]["web_calibrator"])
         self.assertEqual(document["metadata"]["image_topic"], FakeSource.image_topic)
+
+    def test_state_has_no_fabricated_output_alias_before_solve(self):
+        state = self.service.state()
+        self.assertIsNone(state["output_file"])
+        self.assertEqual(state["calibration_mode"], "sim")
+        self.assertEqual(state["camera_name"], "usb_cam")
+
+    def test_each_solve_creates_a_new_concrete_result(self):
+        self.service.freeze()
+        first = self.service.solve(self.point_request())
+        second = self.service.solve(self.point_request())
+        self.assertNotEqual(first["output_file"], second["output_file"])
+        self.assertEqual(len(list(self.output_directory.glob("extrinsics-*.yaml"))), 2)
 
     def test_live_preview_reuses_compressed_jpeg_without_reencoding(self):
         with patch.object(

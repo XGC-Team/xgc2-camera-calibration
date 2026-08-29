@@ -1,5 +1,7 @@
 <launch>
-  <arg name="extrinsic_file" default="$(env HOME)/.local/state/xgc2/camera/calibrations/usb_cam/extrinsics.yaml" />
+  <arg name="calibration_root" />
+  <arg name="calibration_mode" />
+  <arg name="camera_name" />
   <arg name="parent_frame" default="map" />
   <arg name="camera_link_frame" default="usb_cam_link" />
   <arg name="optical_frame" default="usb_cam_optical_frame" />
@@ -14,7 +16,9 @@
         type="extrinsic_tf_publisher.py"
         name="xgc_camera_extrinsic_tf"
         output="screen">
-    <param name="extrinsic_file" value="$(arg extrinsic_file)" />
+    <param name="calibration_root" value="$(arg calibration_root)" />
+    <param name="calibration_mode" value="$(arg calibration_mode)" />
+    <param name="camera_name" value="$(arg camera_name)" />
     <param name="parent_frame" value="$(arg parent_frame)" />
     <param name="camera_link_frame" value="$(arg camera_link_frame)" />
     <param name="optical_frame" value="$(arg optical_frame)" />

@@ -6,7 +6,9 @@
   <arg name="media_source_id" default="usb_cam" />
   <arg name="snapshot_timeout" default="5.0" />
   <arg name="pose_prefix" default="/vrpn_client_node" />
-  <arg name="output_file" default="$(env HOME)/.local/state/xgc2/camera/calibrations/usb_cam/extrinsics.yaml" />
+  <arg name="calibration_root" />
+  <arg name="calibration_mode" />
+  <arg name="camera_name" />
   <arg name="parent_frame" default="map" />
   <arg name="child_frame" default="usb_cam_optical_frame" />
   <arg name="maximum_marker_age" default="0.1" />
@@ -31,7 +33,9 @@
     <param name="media_source_id" value="$(arg media_source_id)" />
     <param name="snapshot_timeout" value="$(arg snapshot_timeout)" />
     <param name="pose_prefix" value="$(arg pose_prefix)" />
-    <param name="output_file" value="$(arg output_file)" />
+    <param name="calibration_root" value="$(arg calibration_root)" />
+    <param name="calibration_mode" value="$(arg calibration_mode)" />
+    <param name="camera_name" value="$(arg camera_name)" />
     <param name="parent_frame" value="$(arg parent_frame)" />
     <param name="child_frame" value="$(arg child_frame)" />
     <param name="maximum_marker_age" value="$(arg maximum_marker_age)" />
