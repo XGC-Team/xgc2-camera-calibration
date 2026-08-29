@@ -22,17 +22,26 @@ class IntrinsicValidationTest(unittest.TestCase):
         validation = generate_intrinsic_validation(
             raw, document, calibration_id="intrinsics-neutral.yaml", jpeg_quality=100
         )
-        checker = cv2.imdecode(
-            np.frombuffer(validation.images["overlay_checker"], dtype=np.uint8),
-            cv2.IMREAD_COLOR,
-        )
-        label_region = checker[8:52, 20:360].astype(np.int16)
-        red_dominance = label_region[:, :, 2] - np.maximum(
-            label_region[:, :, 0], label_region[:, :, 1]
-        )
+        for view_id in (
+            "overlay_checker",
+            "overlay_redcyan",
+            "overlay_corner_zoom",
+            "overlay_diff",
+            "displacement",
+            "compare",
+        ):
+            rendered = cv2.imdecode(
+                np.frombuffer(validation.images[view_id], dtype=np.uint8),
+                cv2.IMREAD_COLOR,
+            )
+            label_region = rendered[8:52, 20:360].astype(np.int16)
+            red_dominance = label_region[:, :, 2] - np.maximum(
+                label_region[:, :, 0], label_region[:, :, 1]
+            )
 
-        self.assertLess(int(np.percentile(red_dominance, 99.5)), 20)
-        self.assertLess(float(checker[16:42, 20:360].mean()), 120.0)
+            with self.subTest(view_id=view_id):
+                self.assertLess(int(np.percentile(red_dominance, 99.5)), 20)
+                self.assertLess(float(rendered[16:42, 20:360].mean()), 120.0)
 
     def test_preserves_source_native_4k_without_analysis_downscaling(self):
         width, height = 3840, 2160
