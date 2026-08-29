@@ -169,7 +169,7 @@ class IntrinsicServiceTest(unittest.TestCase):
             camera = FakeCameraControl()
             service.attach_camera_control(camera)
             target = service.views[0]["position"]
-            camera.current_pose = {"position": list(target)}
+            service.goto(0)
             service.attach_frame_capture(lambda: SimpleNamespace(
                 bgr=render_board(), render_position=(99.0, 99.0, 99.0),
                 render_orientation=(0.0, 0.0, 0.0, 1.0),
@@ -193,8 +193,54 @@ class IntrinsicServiceTest(unittest.TestCase):
             service.views[0]["position"] = [0.0, 0.0, 0.0]
             service.views[1]["position"] = [0.0, 0.01, 0.0]
             service.goto(1)
-            service.process_frame(render_board())
+            service.process_frame(
+                render_board(),
+                render_position=tuple(service.views[1]["position"]),
+                render_orientation=(0.0, 0.0, 0.0, 1.0),
+            )
             self.assertFalse(service.target_done[0])
+            self.assertTrue(service.target_done[1])
+            self.assertEqual(len(service.samples), 1)
+
+    def test_simulation_target_requires_fresh_pose_metadata_and_keeps_mirror_samples(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = make_service(Path(directory) / "intrinsics.yaml")
+            camera = FakeCameraControl()
+            service.attach_camera_control(camera)
+            frame = render_board()
+
+            service.goto(0)
+            service.process_frame(frame)
+            self.assertEqual(len(service.samples), 0)
+            self.assertFalse(service.target_done[0])
+
+            first_target = tuple(service.views[0]["position"])
+            service.process_frame(
+                frame,
+                render_position=first_target,
+                render_orientation=(0.0, 0.0, 1.0, 0.0),
+            )
+            self.assertEqual(len(service.samples), 1)
+            self.assertTrue(service.target_done[0])
+
+            service.goto(1)
+            service.process_frame(
+                frame,
+                render_position=first_target,
+                render_orientation=(0.0, 0.0, 0.0, 1.0),
+            )
+            self.assertEqual(len(service.samples), 1)
+            self.assertFalse(service.target_done[1])
+
+            second_target = tuple(service.views[1]["position"])
+            service.process_frame(
+                frame,
+                render_position=second_target,
+                render_orientation=(0.0, 0.0, 0.0, 1.0),
+            )
+            # Identical image-space coverage is still one sample per authored
+            # mirror target in simulation.
+            self.assertEqual(len(service.samples), 2)
             self.assertTrue(service.target_done[1])
 
     def test_reduced_detection_frame_keeps_source_calibration_coordinates(self):
@@ -243,25 +289,27 @@ class IntrinsicServiceTest(unittest.TestCase):
             )
             refined = corners * 4.0 + np.asarray([0.25, 0.5], np.float32)
             refined_objects = np.arange(12, dtype=np.float32).reshape(4, 3)
+            source_detection = intrinsic_solver.BoardDetection(
+                image_points=refined,
+                object_points=refined_objects,
+                coverage=detection.coverage,
+                calibration_image_points=refined,
+                calibration_object_points=refined_objects,
+            )
             with patch.object(
-                intrinsic_solver, "detect_board", return_value=detection
-            ) as detect, patch.object(
                 intrinsic_solver,
-                "refine_aprilgrid_calibration_corners",
-                return_value=(refined, refined_objects),
-            ) as refine:
+                "detect_board",
+                side_effect=[detection, source_detection],
+            ) as detect:
                 service.process_frame(
                     reduced,
                     source_image_size=(640, 480),
                     source_jpeg=encoded.tobytes(),
                 )
-            self.assertEqual(detect.call_args.args[2], 160)
-            self.assertEqual(refine.call_args.args[0].shape, (480, 640))
-            np.testing.assert_allclose(
-                refine.call_args.args[1].reshape(-1, 2),
-                corners.reshape(-1, 2) * 4.0,
+            self.assertEqual(
+                [call.args[2] for call in detect.call_args_list], [160, 640]
             )
-            np.testing.assert_allclose(refine.call_args.args[2], detection.object_points)
+            self.assertEqual(detect.call_args.args[0].shape, (480, 640))
             np.testing.assert_allclose(service.image_points[0], refined)
             np.testing.assert_allclose(service.object_points[0], refined_objects)
 
@@ -289,19 +337,20 @@ class IntrinsicServiceTest(unittest.TestCase):
                 calibration_object_points=np.zeros((4, 3), np.float32),
             )
             with patch.object(
-                intrinsic_solver, "detect_board", side_effect=[None, detection]
+                intrinsic_solver,
+                "detect_board",
+                side_effect=[None, detection, detection],
             ) as detect, patch.object(
                 intrinsic_solver, "aprilgrid_has_candidate_evidence", return_value=True
-            ), patch.object(
-                intrinsic_solver, "refine_aprilgrid_calibration_corners",
-                return_value=(corners * 4.0, np.zeros((4, 3), np.float32)),
             ):
                 service.process_frame(
                     reduced,
                     source_image_size=(1920, 1080),
                     source_jpeg=encoded.tobytes(),
                 )
-            self.assertEqual([call.args[2] for call in detect.call_args_list], [480, 1920])
+            self.assertEqual(
+                [call.args[2] for call in detect.call_args_list], [480, 1920, 1920]
+            )
             self.assertEqual(service.state()["detection"]["corner_count"], 4)
 
     def test_repeated_board_frame_reports_geometric_duplicate(self):
@@ -619,14 +668,19 @@ class IntrinsicServiceTest(unittest.TestCase):
             service = make_service(Path(directory) / "intrinsics.yaml")
             camera = FakeCameraControl()
             service.attach_camera_control(camera)
-            service.attach_frame_capture(lambda: render_board())
+
+            def capture_at_current_pose():
+                position = camera.current_position()
+                return SimpleNamespace(
+                    bgr=render_board(),
+                    render_position=tuple(position) if position is not None else None,
+                    render_orientation=(0.0, 0.0, 0.0, 1.0),
+                )
+
+            service.attach_frame_capture(capture_at_current_pose)
             service.start_auto_capture(interval=0.1)
 
-            bars = [{"label": label, "progress": 1.0} for label in ("X", "Y", "Size", "Skew")]
-            with patch(
-                "xgc_camera_calibration.intrinsic_service.intrinsic_solver.coverage",
-                return_value=(bars, True),
-            ), patch.object(
+            with patch.object(
                 service, "_calibrate_locked", return_value={"output_file": str(Path(directory) / "intrinsics.yaml")}
             ):
                 started = monotonic()
@@ -651,6 +705,7 @@ class IntrinsicServiceTest(unittest.TestCase):
                     sleep(0.01)
             self.assertEqual(service.state()["action"]["status"], "succeeded")
             self.assertEqual(len(camera.positions), 15)
+            self.assertEqual(len(service.samples), 15)
             self.assertTrue(all(target["done"] for target in service.state()["targets"]))
             service.stop_auto_capture()
             self.assertEqual(service.reset()["samples"], 0)

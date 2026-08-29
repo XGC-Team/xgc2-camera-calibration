@@ -11,12 +11,15 @@ snapshot, runs ``detect_aprilgrid``, and calibrates only from the detector's
 production ``calibration_*`` outputs.
 """
 
+import tempfile
 import unittest
+from pathlib import Path
 
 import cv2
 import numpy as np
 
 from xgc_camera_calibration import intrinsic_solver as solver
+from xgc_camera_calibration.intrinsic_service import IntrinsicCalibrationService
 
 
 IMAGE_SIZE = (1920, 1080)
@@ -139,6 +142,46 @@ def _render_view(board, center_pixel, depth_m, rotation_vector):
     "OpenCV AprilTag 36h11 dictionary is unavailable",
 )
 class AprilGridProductionTruthTest(unittest.TestCase):
+    def test_reduced_working_frame_admits_source_jpeg_correspondences(self):
+        board = _render_station_aprilgrid()
+        source_gray = _render_view(board, *VIEW_SPECS[9])
+        encoded, source_jpeg = cv2.imencode(
+            ".jpg", source_gray, (cv2.IMWRITE_JPEG_QUALITY, 94)
+        )
+        self.assertTrue(encoded)
+        reduced_gray = cv2.resize(
+            source_gray, (640, 360), interpolation=cv2.INTER_AREA
+        )
+        reduced_bgr = cv2.cvtColor(reduced_gray, cv2.COLOR_GRAY2BGR)
+
+        with tempfile.TemporaryDirectory() as directory:
+            service = IntrinsicCalibrationService(
+                board_size=BOARD_SIZE,
+                square=TAG_SIZE_M,
+                output_file=str(Path(directory) / "intrinsics.yaml"),
+                camera_name="sim_truth_camera",
+                board_type="aprilgrid",
+                tag_spacing=TAG_GAP_M,
+                min_tags=6,
+                display_width=640,
+            )
+            service.process_frame(
+                reduced_bgr,
+                source_image_size=IMAGE_SIZE,
+                source_jpeg=source_jpeg.tobytes(),
+            )
+
+            self.assertEqual(len(service.image_points), 1)
+            self.assertEqual(len(service.object_points), 1)
+            self.assertEqual(len(service.image_points[0]), len(service.object_points[0]))
+            self.assertEqual(len(service.image_points[0]) % 4, 0)
+            self.assertGreaterEqual(len(service.image_points[0]), 108)
+            # Stored solve coordinates come from a fresh full-source detection,
+            # not a VGA observation multiplied by a scale factor.
+            stored = service.image_points[0].reshape(-1, 2)
+            self.assertGreater(float(np.max(stored[:, 0])), 640.0)
+            self.assertEqual(service.image_size, IMAGE_SIZE)
+
     def test_image_detection_chain_recovers_zero_distortion_camera_truth(self):
         board = _render_station_aprilgrid()
         image_points = []
@@ -159,9 +202,9 @@ class AprilGridProductionTruthTest(unittest.TestCase):
             self.assertIsNotNone(detection, "view {} was not detected".format(view_index))
             self.assertIsNotNone(detection.calibration_image_points)
             self.assertIsNotNone(detection.calibration_object_points)
-            # AprilGrid calibration must preserve every independent tag corner.
-            # Compressing four projective observations to an arithmetic centre
-            # is not a pinhole-preserving operation and is the regression this
+            # AprilGrid calibration preserves four independent corners for
+            # every retained tag. Compressing them to one arithmetic centre is
+            # not a pinhole-preserving operation and is the regression this
             # end-to-end fixture is intended to catch.
             self.assertEqual(
                 len(detection.calibration_image_points),

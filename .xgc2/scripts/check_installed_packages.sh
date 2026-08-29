@@ -16,7 +16,7 @@ for page in extrinsic intrinsic; do
   test -f "${PREFIX}/share/xgc_camera_calibration/web/${page}/app.js"
   test -f "${PREFIX}/share/xgc_camera_calibration/web/${page}/styles.css"
 done
-python3 -c 'from xgc_camera_calibration.extrinsic_file_watcher import ExtrinsicFileWatcher; from xgc_camera_calibration.intrinsic_solver import calibrate_intrinsic; from xgc_camera_calibration.media_snapshot import MediaSnapshotClient; from xgc_camera_calibration.solver import solve_extrinsic; from xgc_camera_calibration.transforms import split_parent_to_optical_pose'
+python3 -c 'from xgc_camera_calibration.extrinsic_file_watcher import ExtrinsicDirectoryWatcher; from xgc_camera_calibration.intrinsic_solver import calibrate_intrinsic; from xgc_camera_calibration.media_snapshot import MediaSnapshotClient; from xgc_camera_calibration.solver import solve_extrinsic; from xgc_camera_calibration.transforms import split_parent_to_optical_pose'
 RUNTIME="$(mktemp -d)"
 INTRINSIC_FILE="${RUNTIME}/intrinsics.yaml"
 cat >"${INTRINSIC_FILE}" <<'YAML'

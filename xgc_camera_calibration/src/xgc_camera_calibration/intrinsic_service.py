@@ -222,6 +222,8 @@ class IntrinsicCalibrationService:
         self._recording = False
         self.action: Optional[Dict[str, Any]] = None
         self._selected_target_index: Optional[int] = None
+        self._target_capture_phase = "idle"
+        self._target_capture_baseline_sequence = 0
         self._auto_run_thread: Optional[threading.Thread] = None
         self._auto_capture_thread: Optional[threading.Thread] = None
         self._auto_capture_stop = threading.Event()
@@ -803,42 +805,54 @@ class IntrinsicCalibrationService:
                 best_distance, best_index = distance, index
         return best_index, best_distance
 
-    def _mark_aligned(
-        self,
-        display: np.ndarray,
-        render_position: Optional[Sequence[float]] = None,
-        render_orientation: Optional[Sequence[float]] = None,
-    ) -> None:
-        """Green the nearest target once the camera aligns to it and the board is
-        visible this frame -- independent of whether this frame became a *new*
-        sample (is_new_sample de-duplicates similar views, so a
-        redundant-but-valid pose would otherwise stay grey).  Requires the sim
-        camera adapter for the live pose; a no-op for a real camera.
-        """
-        if self._recording or self.camera is None:
-            return
-        if not self._render_pose_matches_camera(render_position, render_orientation):
-            return
-        position = tuple(render_position) if render_position is not None else self.camera.current_position()
-        if position is None:
-            return
-        index = None
+    def _explicit_target_index_locked(self) -> Optional[int]:
+        if self.camera is None:
+            return None
         if self.action is not None and self.action.get("status") == "running":
             candidate = self.action.get("target_index")
             if isinstance(candidate, int) and 0 <= candidate < len(self.views):
-                index = candidate
-        if index is None and self._selected_target_index is not None:
+                return candidate
+        if self._selected_target_index is not None:
             if 0 <= self._selected_target_index < len(self.views):
-                index = self._selected_target_index
-        if index is None:
-            index, _ = self._nearest_target(position)
-        if index is None or self.target_done[index]:
-            return
+                return self._selected_target_index
+        return None
+
+    def _target_frame_is_admissible_locked(
+        self,
+        index: int,
+        render_position: Optional[Sequence[float]],
+        render_orientation: Optional[Sequence[float]],
+    ) -> bool:
+        """Accept only a post-command, pose-bound frame for one sim target."""
+        if (
+            self._recording
+            or self.camera is None
+            or self._target_capture_phase != "awaiting_detection"
+            or self._frame_sequence <= self._target_capture_baseline_sequence
+            or self.target_done[index]
+            or render_position is None
+            or render_orientation is None
+        ):
+            return False
+        if not self._render_pose_matches_camera(render_position, render_orientation):
+            return False
         target = self.views[index]["position"]
-        distance = sum((position[axis] - target[axis]) ** 2 for axis in range(3)) ** 0.5
-        if distance > self.align_threshold:
+        distance = sum(
+            (float(render_position[axis]) - float(target[axis])) ** 2
+            for axis in range(3)
+        ) ** 0.5
+        return distance <= 0.12
+
+    def _complete_target_sample_locked(
+        self,
+        index: int,
+        display: np.ndarray,
+    ) -> None:
+        """Atomically bind one stored solve sample and reference to a target."""
+        if self.target_done[index]:
             return
         self.target_done[index] = True
+        self._target_capture_phase = "idle"
         ok, encoded = cv2.imencode(
             ".jpg", display, [int(cv2.IMWRITE_JPEG_QUALITY), 75]
         )
@@ -977,10 +991,22 @@ class IntrinsicCalibrationService:
                     render_position, render_orientation
                 )
                 if self.result is None and pose_matches:
-                    accepted = intrinsic_solver.is_new_sample(
-                        params, self.samples, self.sample_distance
-                    )
-                    duplicate = not accepted
+                    target_index = self._explicit_target_index_locked()
+                    if target_index is not None:
+                        accepted = self._target_frame_is_admissible_locked(
+                            target_index, render_position, render_orientation
+                        )
+                        duplicate = self.target_done[target_index]
+                    elif self.camera is not None:
+                        # Simulation samples belong to authored target identity;
+                        # an arbitrary visible pose is not calibration evidence.
+                        accepted = False
+                        duplicate = False
+                    else:
+                        accepted = intrinsic_solver.is_new_sample(
+                            params, self.samples, self.sample_distance
+                        )
+                        duplicate = not accepted
                     if accepted:
                         if self.board_type == "aprilgrid" and source_jpeg:
                             try:
@@ -995,14 +1021,28 @@ class IntrinsicCalibrationService:
                                     raise ValueError(
                                         "source JPEG dimensions do not match snapshot metadata"
                                     )
-                                calibration_corners, calibration_objects = (
-                                    intrinsic_solver.refine_aprilgrid_calibration_corners(
-                                        source_gray,
-                                        np.asarray(corners, dtype=np.float32) * source_scale,
-                                        detection.object_points,
-                                        minimum_tags=self.min_tags,
-                                    )
+                                source_detection = intrinsic_solver.detect_board(
+                                    source_gray,
+                                    self.board_size,
+                                    source_width,
+                                    board_type=self.board_type,
+                                    square=self.square,
+                                    tag_spacing=self.tag_spacing,
+                                    tag_family=self.tag_family,
+                                    start_id=self.tag_start_id,
+                                    min_tags=self.min_tags,
                                 )
+                                if source_detection is None:
+                                    raise CalibrationError(
+                                        "AprilGrid source-resolution refinement "
+                                        "did not retain enough complete tags"
+                                    )
+                                calibration_corners = source_detection.calibration_image_points
+                                calibration_objects = source_detection.calibration_object_points
+                                if calibration_corners is None or calibration_objects is None:
+                                    raise CalibrationError(
+                                        "AprilGrid source-resolution correspondences are missing"
+                                    )
                             except Exception as error:
                                 # Keep the live detection, but never admit a
                                 # solve sample containing mixed refined/raw
@@ -1017,7 +1057,8 @@ class IntrinsicCalibrationService:
                                 self._save_checkpoint_locked()
                             except Exception as error:
                                 self._recovery_error = str(error) or error.__class__.__name__
-                self._mark_aligned(display, render_position, render_orientation)
+                            if target_index is not None:
+                                self._complete_target_sample_locked(target_index, display)
                 self.latest_detection = {
                     "status": "detected",
                     "corner_count": int(len(corners)),
@@ -1184,6 +1225,8 @@ class IntrinsicCalibrationService:
         self.refs = {}
         self.target_done = [False] * len(self.views)
         self._selected_target_index = None
+        self._target_capture_phase = "idle"
+        self._target_capture_baseline_sequence = self._frame_sequence
         self._auto_capture_completed = False
 
     def _require_camera(self) -> Any:
@@ -1250,11 +1293,18 @@ class IntrinsicCalibrationService:
                 raise ApiError(HTTPStatus.UNPROCESSABLE_ENTITY, "Unknown target index")
             view = self.views[index]
             self._selected_target_index = index
+            self._target_capture_phase = "moving"
             # Keep admission and the short camera command atomic with respect
             # to an auto-run starting on another HTTP worker thread.
-            camera.goto(
-                view["position"], view["yaw_offset"], view["pitch_offset"], view["roll"]
-            )
+            try:
+                camera.goto(
+                    view["position"], view["yaw_offset"], view["pitch_offset"], view["roll"]
+                )
+            except Exception:
+                self._target_capture_phase = "idle"
+                raise
+            self._target_capture_baseline_sequence = self._frame_sequence
+            self._target_capture_phase = "awaiting_detection"
         return {"ok": True, "name": view["name"]}
 
     def reset_pose(self) -> Dict[str, Any]:
@@ -1262,6 +1312,7 @@ class IntrinsicCalibrationService:
             self._require_idle_locked()
             camera = self._require_camera()
             self._selected_target_index = None
+            self._target_capture_phase = "idle"
             camera.reset()
         return {"ok": True}
 
@@ -1328,10 +1379,16 @@ class IntrinsicCalibrationService:
                     self.action["target_index"] = index
                     self.action["target_name"] = view["name"]
                     self._selected_target_index = index
+                    self._target_capture_phase = "moving"
                 camera.goto(
                     view["position"], view["yaw_offset"], view["pitch_offset"], view["roll"]
                 )
                 time.sleep(settle)
+                with self.lock:
+                    if self.action is None or self.action.get("status") != "running":
+                        return
+                    self._target_capture_baseline_sequence = self._frame_sequence
+                    self._target_capture_phase = "awaiting_detection"
                 if not self._wait_for_target_detection(index, detection_timeout):
                     raise CalibrationError(
                         "continuous detection could not find the calibration board "
@@ -1347,14 +1404,14 @@ class IntrinsicCalibrationService:
                     "error": str(error) or error.__class__.__name__,
                 }
                 self._auto_run_thread = None
+                self._target_capture_phase = "idle"
             return
         try:
             with self.lock:
-                _bars, goodenough = intrinsic_solver.coverage(self.samples)
-                if not goodenough:
+                if not all(self.target_done) or len(self.samples) != len(self.views):
                     raise CalibrationError(
-                        "automatic sweep did not reach full X/Y/Size/Skew coverage "
-                        "({} distinct samples)".format(len(self.samples))
+                        "automatic sweep did not capture every authored target "
+                        "({}/{} samples)".format(len(self.samples), len(self.views))
                     )
                 result = self._calibrate_locked()
                 self.action = {
@@ -1366,6 +1423,7 @@ class IntrinsicCalibrationService:
                     "result": dict(result),
                 }
                 self._auto_run_thread = None
+                self._target_capture_phase = "idle"
         except Exception as error:
             with self.lock:
                 self.action = {
@@ -1376,6 +1434,7 @@ class IntrinsicCalibrationService:
                     "error": str(error) or error.__class__.__name__,
                 }
                 self._auto_run_thread = None
+                self._target_capture_phase = "idle"
 
     def _wait_for_target_detection(self, index: int, timeout: float) -> bool:
         deadline = time.monotonic() + timeout
