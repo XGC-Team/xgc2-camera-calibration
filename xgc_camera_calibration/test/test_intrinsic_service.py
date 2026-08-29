@@ -24,6 +24,7 @@ from xgc_camera_calibration.web_service import ApiError, CalibrationHttpServer
 
 
 WEB_ROOT = Path(__file__).resolve().parents[1] / "web" / "intrinsic"
+WEB_SOURCE = Path(__file__).resolve().parents[2] / "web-src" / "src" / "intrinsic-legacy.ts"
 
 
 def render_board(cols_squares=8, rows_squares=6, square=40, border=40):
@@ -102,6 +103,7 @@ class IntrinsicServiceTest(unittest.TestCase):
         index = (WEB_ROOT / "index.html").read_text(encoding="utf-8")
         app = (WEB_ROOT / "app.js").read_text(encoding="utf-8")
         styles = (WEB_ROOT / "styles.css").read_text(encoding="utf-8")
+        source = WEB_SOURCE.read_text(encoding="utf-8")
         self.assertIn('href="styles.css"', index)
         self.assertIn('src="app.js"', index)
         self.assertIn('type="module"', index)
@@ -110,6 +112,9 @@ class IntrinsicServiceTest(unittest.TestCase):
         self.assertIn("xgc-app-shell", app)
         self.assertIn("Board detection", app)
         self.assertIn("detection-status", app)
+        self.assertIn("URL.createObjectURL", app)
+        self.assertIn("queueImageRefresh(s.detection, s.image_ready)", source)
+        self.assertNotIn("setInterval(refreshImage", source)
         self.assertIn(".xgc-topbar", styles)
 
     def test_process_frame_collects_a_board_sample(self):

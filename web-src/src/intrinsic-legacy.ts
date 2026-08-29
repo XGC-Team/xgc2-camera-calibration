@@ -3,6 +3,11 @@
 
 const el = (id) => document.getElementById(id);
 let autoRunning = false;
+let pollInFlight = false;
+let displayedImageSequence = 0;
+let pendingImageSequence = 0;
+let imageRefreshInFlight = false;
+let displayedImageUrl = "";
 
 async function postJSON(path, body) {
   try {
@@ -119,6 +124,7 @@ function applyState(s) {
   renderResult(s.result);
   renderPose(s.pose);
   renderDetection(s.detection, s.board);
+  queueImageRefresh(s.detection, s.image_ready);
 
   scene.control = !!s.camera_control;
   el("btn-reset-pose").disabled = !scene.control || autoRunning;
@@ -131,17 +137,50 @@ function applyState(s) {
 }
 
 async function poll() {
+  if (pollInFlight) return;
+  pollInFlight = true;
   try {
     const res = await fetch("api/v1/intrinsic/state", { cache: "no-store" });
     applyState(await res.json());
   } catch (err) {
     el("conn").textContent = "disconnected";
     el("conn").className = "legacy-state-source pill pill-off";
+  } finally {
+    pollInFlight = false;
   }
 }
 
-function refreshImage() {
-  el("stream").src = "api/v1/intrinsic/image.jpg?t=" + Date.now();
+function queueImageRefresh(detection, imageReady) {
+  const sequence = Number(detection && detection.sequence);
+  if (!imageReady || !Number.isInteger(sequence) || sequence <= 0) return;
+  pendingImageSequence = Math.max(pendingImageSequence, sequence);
+  void refreshImage();
+}
+
+async function refreshImage() {
+  if (imageRefreshInFlight || pendingImageSequence <= displayedImageSequence) return;
+  const sequence = pendingImageSequence;
+  let updated = false;
+  imageRefreshInFlight = true;
+  try {
+    const response = await fetch(
+      `api/v1/intrinsic/image.jpg?sequence=${sequence}`,
+      { cache: "no-store" },
+    );
+    if (!response.ok) return;
+    const nextUrl = URL.createObjectURL(await response.blob());
+    const previousUrl = displayedImageUrl;
+    el("stream").src = nextUrl;
+    displayedImageUrl = nextUrl;
+    displayedImageSequence = sequence;
+    updated = true;
+    if (previousUrl) URL.revokeObjectURL(previousUrl);
+  } catch (err) {
+    // Keep the last complete detection frame visible and retry on the next poll.
+  } finally {
+    imageRefreshInFlight = false;
+    if (updated && pendingImageSequence > displayedImageSequence) void refreshImage();
+  }
 }
 
 function wireButtons() {
@@ -322,8 +361,6 @@ function initScene() {
 wireButtons();
 initScene();
 poll();
-refreshImage();
 setInterval(poll, 200);
-setInterval(refreshImage, 250);
 
 export {}

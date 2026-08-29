@@ -186,10 +186,6 @@ function IntrinsicPage() {
           )}
           secondary={(
             <ScrollRegion className="calibration-side" fill>
-              <Panel title="Coverage" actions={<span id="samples" className="calibration-meta">0 samples</span>}>
-                <LegacyCoverage />
-              </Panel>
-
               <Panel title="Board detection" actions={<LegacyStatus id="detection-status" initial="waiting" sourceClassName="pill pill-off" />}>
                 <div className="calibration-detection-summary">
                   <strong id="detection-corners">No detection result yet</strong>
@@ -197,6 +193,10 @@ function IntrinsicPage() {
                 </div>
                 <div id="detection-metrics" className="calibration-detection-metrics" />
                 <p id="detection-sample" className="calibration-meta">Capture a frame to run board detection.</p>
+              </Panel>
+
+              <Panel title="Coverage" actions={<span id="samples" className="calibration-meta">0 samples</span>}>
+                <LegacyCoverage />
               </Panel>
 
               <Panel title="Calibration">

@@ -638,7 +638,15 @@ def detect_aprilgrid(
     return BoardDetection(
         image_points=pixels,
         object_points=objects,
-        coverage=_coverage_params_from_points(pixels, width, height),
+        coverage=_aprilgrid_coverage(
+            pixels,
+            objects,
+            board_size,
+            square,
+            tag_spacing,
+            width,
+            height,
+        ),
         calibration_image_points=np.mean(pixels.reshape(-1, 4, 2), axis=1)
         .reshape(-1, 1, 2)
         .astype(np.float32),
@@ -646,6 +654,33 @@ def detect_aprilgrid(
         .reshape(-1, 3)
         .astype(np.float32),
     )
+
+
+def _aprilgrid_coverage(
+    pixels: np.ndarray,
+    objects: np.ndarray,
+    board_size: Sequence[int],
+    tag_size: float,
+    tag_spacing: float,
+    width: int,
+    height: int,
+) -> Tuple[float, float, float, float]:
+    """Project the complete AprilGrid boundary from the detected tag lattice."""
+    homography, _mask = cv2.findHomography(
+        np.asarray(objects, dtype=np.float32)[:, :2],
+        np.asarray(pixels, dtype=np.float32).reshape(-1, 2),
+        method=0,
+    )
+    cols, rows = int(board_size[0]), int(board_size[1])
+    pitch = float(tag_size) + float(tag_spacing)
+    board_width = float(tag_size) + float(cols - 1) * pitch
+    board_height = float(tag_size) + float(rows - 1) * pitch
+    boundary = np.asarray(
+        ((0.0, 0.0), (board_width, 0.0), (board_width, board_height), (0.0, board_height)),
+        dtype=np.float32,
+    ).reshape(-1, 1, 2)
+    projected = cv2.perspectiveTransform(boundary, homography)
+    return _coverage_params_from_points(projected, width, height)
 
 
 def _coverage_params_from_points(

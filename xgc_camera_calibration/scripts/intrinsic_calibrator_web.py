@@ -87,6 +87,7 @@ def main():
             camera_info_topic="snapshot metadata",
             media_source=snapshot_client.source_id,
             jpeg_quality=int(rospy.get_param("~jpeg_quality", 80)),
+            maximum_detect_width=int(rospy.get_param("~maximum_detect_width", 3840)),
             display_width=int(rospy.get_param("~display_width", 720)),
             board_center=board_center,
             references_dir=str(

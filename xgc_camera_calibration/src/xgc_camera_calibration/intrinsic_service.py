@@ -48,10 +48,8 @@ def recommended_views(
     """
     tx, ty, tz = float(board_center[0]), float(board_center[1]), float(board_center[2])
     # Scale translations with the actual target extent so every board keeps the
-    # same projected tag size.  OpenCV 4.2 (the Noetic runtime) only decodes the
-    # official AprilGrid reliably once an 88 mm tag is roughly 80 px across;
-    # therefore X/Y coverage comes from bounded aim offsets while the camera
-    # stays near the plate, rather than from unusable multi-metre viewpoints.
+    # same projected tag size. X/Y coverage comes from bounded aim offsets while
+    # the camera stays near the plate, rather than from distant viewpoints.
     extent = float(board_extent)
     if extent <= 0.0:
         raise ValueError("board extent must be positive")
@@ -63,22 +61,21 @@ def recommended_views(
             ty + dy * view_scale,
             tz + dz * view_scale,
         )
-    # Tuned for the product's 1280x720, 90-degree field-calibration profile.
-    # Keep the whole plate (or all but a narrow border) visible at the four
-    # coverage extremes.  The former 33-45 degree aim offsets left only a few
-    # tags in most frames even though the coverage heuristic eventually passed.
+    # Tuned for the shared 3840x2160, 110-degree camera profile. Keep the whole
+    # plate visible while moving it far enough toward each edge to satisfy the
+    # ROS camera_calibration X/Y coverage ranges.
     specs = [
-        ("left edge", position(-2.91, 0.05, 0.00), -0.46, 0.00, 0.08),
-        ("right edge", position(-2.91, -0.05, 0.00), 0.46, 0.00, -0.08),
-        ("lower edge", position(-2.42, 0.00, 0.00), 0.00, -0.14, 0.00),
-        ("upper edge", position(-2.42, 0.03, 0.00), 0.00, 0.13, 0.00),
+        ("left edge", position(-2.91, 0.05, 0.00), -0.58, 0.00, 0.08),
+        ("right edge", position(-2.91, -0.05, 0.00), 0.58, 0.00, -0.08),
+        ("lower edge", position(-2.42, 0.00, 0.00), 0.00, -0.30, 0.00),
+        ("upper edge", position(-2.42, 0.03, 0.00), 0.00, 0.30, 0.00),
         ("left edge tilted", position(-2.20, 0.15, -0.10), -0.24, 0.00, 0.18),
         ("right edge tilted", position(-2.20, -0.15, -0.08), 0.24, 0.00, -0.18),
         ("lower edge tilted", position(-2.42, 0.05, 0.02), 0.00, -0.06, 0.10),
         ("upper edge tilted", position(-2.42, -0.05, -0.02), 0.00, 0.06, -0.10),
         ("center face", position(-2.30, 0.00, 0.00), 0.00, 0.00, 0.00),
         ("near large", position(-2.10, 0.00, 0.00), 0.00, 0.00, 0.00),
-        ("near maximum", position(-1.95, 0.00, 0.00), 0.00, 0.00, 0.00),
+        ("near maximum", position(-1.30, 0.00, 0.00), 0.00, 0.00, 0.00),
         ("clockwise skew", position(-2.20, 0.04, 0.04), 0.00, 0.00, 0.46),
         ("counter-clockwise skew", position(-2.20, -0.04, -0.04), 0.00, 0.00, -0.46),
         ("oblique high", position(-2.20, 0.35, 0.35), 0.00, 0.00, 0.28),
@@ -106,7 +103,7 @@ class IntrinsicCalibrationService:
         camera_info_topic: str = "",
         jpeg_quality: int = 80,
         sample_distance: float = intrinsic_solver.SAMPLE_DISTANCE,
-        maximum_detect_width: int = 960,
+        maximum_detect_width: int = 3840,
         display_width: int = 960,
         board_center: Sequence[float] = (2.0, 0.0, 2.2),
         references_dir: str = "",
