@@ -98,8 +98,6 @@ def main():
             square=float(rospy.get_param("~square_size", 0.20)),
             output_file=str(calibrations / "intrinsics.yaml"),
             camera_name=camera_name,
-            image_topic="media:{}".format(snapshot_client.source_id),
-            camera_info_topic="snapshot metadata",
             media_source=snapshot_client.source_id,
             jpeg_quality=int(rospy.get_param("~jpeg_quality", 80)),
             maximum_detect_width=int(rospy.get_param("~maximum_detect_width", display_width)),

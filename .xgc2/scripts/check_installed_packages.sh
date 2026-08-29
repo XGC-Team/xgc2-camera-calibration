@@ -17,11 +17,37 @@ for page in extrinsic intrinsic; do
   test -f "${PREFIX}/share/xgc_camera_calibration/web/${page}/styles.css"
 done
 python3 -c 'from xgc_camera_calibration.extrinsic_file_watcher import ExtrinsicFileWatcher; from xgc_camera_calibration.intrinsic_solver import calibrate_intrinsic; from xgc_camera_calibration.media_snapshot import MediaSnapshotClient; from xgc_camera_calibration.solver import solve_extrinsic; from xgc_camera_calibration.transforms import split_parent_to_optical_pose'
-roslaunch --files xgc_camera_calibration extrinsic_calibrator.launch >/dev/null
+RUNTIME="$(mktemp -d)"
+INTRINSIC_FILE="${RUNTIME}/intrinsics.yaml"
+cat >"${INTRINSIC_FILE}" <<'YAML'
+schema: xgc2.camera.intrinsic.v1
+created_at: '2026-01-01T00:00:00Z'
+camera_name: package_smoke
+image_width: 640
+image_height: 480
+camera_matrix:
+  rows: 3
+  cols: 3
+  data: [500.0, 0.0, 319.5, 0.0, 500.0, 239.5, 0.0, 0.0, 1.0]
+distortion_model: plumb_bob
+distortion_coefficients:
+  rows: 1
+  cols: 5
+  data: [0.0, 0.0, 0.0, 0.0, 0.0]
+rectification_matrix:
+  rows: 3
+  cols: 3
+  data: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+projection_matrix:
+  rows: 3
+  cols: 4
+  data: [500.0, 0.0, 319.5, 0.0, 0.0, 500.0, 239.5, 0.0, 0.0, 0.0, 1.0, 0.0]
+YAML
+roslaunch --files xgc_camera_calibration extrinsic_calibrator.launch \
+  intrinsic_file:="${INTRINSIC_FILE}" >/dev/null
 roslaunch --files xgc_camera_calibration intrinsic_calibrator.launch >/dev/null
 roslaunch --files xgc_camera_calibration extrinsic_tf.launch >/dev/null
 
-RUNTIME="$(mktemp -d)"
 ROSCORE_PID=""
 EXTRINSIC_PID=""
 INTRINSIC_PID=""
@@ -88,7 +114,7 @@ wait_http 18790 "${MEDIA_EDGE_PID}"
 "${PREFIX}/lib/xgc_camera_calibration/extrinsic_calibrator_web.py" \
   __name:=xgc_camera_extrinsic_calibrator_web \
   _image_topic:=/not_installed_by_this_product/image_raw \
-  _camera_info_topic:=/not_installed_by_this_product/camera_info \
+  _intrinsic_file:="${INTRINSIC_FILE}" \
   _http_port:=18765 _output_file:="${RUNTIME}/extrinsics.yaml" \
   >"${RUNTIME}/extrinsic.log" 2>&1 &
 EXTRINSIC_PID="$!"

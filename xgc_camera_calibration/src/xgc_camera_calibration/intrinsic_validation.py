@@ -72,7 +72,6 @@ def generate_intrinsic_validation(
         checker[:, x] = (checker[:, x] * 0.45 + (40, 40, 40)).astype(np.uint8)
     for y in range(tile, height, tile):
         checker[y, :] = (checker[y, :] * 0.45 + (40, 40, 40)).astype(np.uint8)
-    label(checker, "RAW even / UNDISTORT odd", (0, 0, 255))
 
     red_cyan = np.zeros_like(image)
     red_cyan[:, :, 2] = image[:, :, 2]

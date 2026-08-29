@@ -7,6 +7,32 @@ from xgc_camera_calibration.intrinsic_validation import generate_intrinsic_valid
 
 
 class IntrinsicValidationTest(unittest.TestCase):
+    def test_checker_keeps_the_image_clear_of_baked_in_red_text(self):
+        width, height = 640, 480
+        raw = np.full((height, width, 3), 128, dtype=np.uint8)
+        document = {
+            "image_width": width,
+            "image_height": height,
+            "camera_matrix": {
+                "data": [500.0, 0.0, width / 2.0, 0.0, 500.0, height / 2.0, 0.0, 0.0, 1.0],
+            },
+            "distortion_coefficients": {"data": [0.0, 0.0, 0.0, 0.0, 0.0]},
+        }
+
+        validation = generate_intrinsic_validation(
+            raw, document, calibration_id="intrinsics-neutral.yaml", jpeg_quality=100
+        )
+        checker = cv2.imdecode(
+            np.frombuffer(validation.images["overlay_checker"], dtype=np.uint8),
+            cv2.IMREAD_COLOR,
+        )
+        label_region = checker[8:44, 8:360].astype(np.int16)
+        red_dominance = label_region[:, :, 2] - np.maximum(
+            label_region[:, :, 0], label_region[:, :, 1]
+        )
+
+        self.assertLess(int(red_dominance.max()), 20)
+
     def test_preserves_source_native_4k_without_analysis_downscaling(self):
         width, height = 3840, 2160
         x = np.linspace(0, 255, width, dtype=np.uint8)[None, :]

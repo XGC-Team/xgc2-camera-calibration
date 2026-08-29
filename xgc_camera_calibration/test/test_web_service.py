@@ -27,7 +27,6 @@ from xgc_camera_calibration.web_service import (
 class FakeSource:
     image_topic = "/camera/image_raw"
     preview_image_topic = "/camera/image_raw/compressed"
-    camera_info_topic = "/camera/camera_info"
     intrinsic_file = "/camera/intrinsics.yaml"
     pose_prefix = "/vrpn_client_node"
     preview_jpeg = b"\xff\xd8cached-compressed-preview\xff\xd9"
@@ -39,11 +38,11 @@ class FakeSource:
         return {
             "image_topic": self.image_topic,
             "preview_image_topic": self.preview_image_topic,
-            "camera_info_topic": self.camera_info_topic,
+            "intrinsic_file": self.intrinsic_file,
             "pose_prefix": self.pose_prefix,
             "image_ready": True,
             "preview_ready": True,
-            "camera_info_ready": True,
+            "intrinsic_ready": True,
             "marker_count": len(self.snapshot.markers),
             "marker_names": sorted(self.snapshot.markers),
             "latest_image_stamp_sec": self.snapshot.stamp_sec,

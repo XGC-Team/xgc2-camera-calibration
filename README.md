@@ -54,7 +54,7 @@ then solves and persists `parent_T_camera_optical` using robust PnP.
 roslaunch xgc_camera_calibration extrinsic_calibrator.launch \
   image_topic:=/usb_cam/image_raw \
   preview_image_topic:=/usb_cam/image_raw/compressed \
-  camera_info_topic:=/usb_cam/camera_info \
+  intrinsic_file:=/absolute/path/to/intrinsics-UTC.yaml \
   pose_prefix:=/vrpn_client_node \
   bind_address:=127.0.0.1 http_port:=8765
 ```

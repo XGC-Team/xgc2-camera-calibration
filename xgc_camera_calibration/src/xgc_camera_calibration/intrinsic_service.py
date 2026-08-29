@@ -118,8 +118,6 @@ class IntrinsicCalibrationService:
         square: float,
         output_file: str,
         camera_name: str,
-        image_topic: str = "",
-        camera_info_topic: str = "",
         jpeg_quality: int = 80,
         sample_distance: float = intrinsic_solver.SAMPLE_DISTANCE,
         maximum_detect_width: int = 960,
@@ -160,8 +158,6 @@ class IntrinsicCalibrationService:
         self.camera_name = str(camera_name).strip()
         self.output_file = self.output_file_base
         self.checkpoint_file = self.output_file_base + ".session.npz"
-        self.image_topic = str(image_topic)
-        self.camera_info_topic = str(camera_info_topic)
         self.media_source = str(media_source).strip()
         self.jpeg_quality = int(jpeg_quality)
         self.sample_distance = float(sample_distance)
@@ -375,7 +371,7 @@ class IntrinsicCalibrationService:
             "tag_spacing": self.tag_spacing,
             "tag_family": self.tag_family,
             "tag_start_id": self.tag_start_id,
-            "media_source": self.media_source or self.image_topic,
+            "media_source": self.media_source,
             "camera_name": self.camera_name,
         }
 
@@ -1054,7 +1050,7 @@ class IntrinsicCalibrationService:
                 "result": self.result_payload,
                 "output_file": self.output_file,
                 "image_ready": self._display is not None,
-                "media_source": self.media_source or self.image_topic,
+                "media_source": self.media_source,
                 "board": self._board_document(),
                 "targets": targets,
                 "next": next_index,
@@ -1366,7 +1362,7 @@ class IntrinsicCalibrationService:
                 board_size=self.board_size,
                 square=self.square,
                 metadata={
-                    "media_source": self.media_source or self.image_topic,
+                    "media_source": self.media_source,
                     "camera_name": self.camera_name,
                     "web_calibrator": True,
                     "coverage": intrinsic_solver.coverage(self.samples)[0],

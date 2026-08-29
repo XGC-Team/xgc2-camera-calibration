@@ -105,6 +105,13 @@ if grep -Eq '<arg name="(image_topic|camera_info_topic|intrinsic_rate)"' \
   echo "intrinsic launch retained a retired ROS image polling parameter" >&2
   exit 1
 fi
+if grep -Eq 'camera_info_topic|_camera_info_topic' \
+  xgc_camera_calibration/launch/extrinsic_calibrator.launch \
+  xgc_camera_calibration/scripts/extrinsic_calibrator_web.py \
+  .xgc2/scripts/check_installed_packages.sh; then
+  echo "extrinsic calibration retained the removed CameraInfo topic contract" >&2
+  exit 1
+fi
 grep -q 'CompressedImage' xgc_camera_calibration/scripts/extrinsic_calibrator_web.py
 grep -q 'wait_for_message' xgc_camera_calibration/scripts/extrinsic_calibrator_web.py
 if grep -q 'Subscriber(.*self.image_topic' \

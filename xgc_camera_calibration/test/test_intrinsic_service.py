@@ -47,7 +47,7 @@ def make_service(output_file):
     return IntrinsicCalibrationService(
         board_size=(7, 5), square=0.20, output_file=str(output_file),
         camera_name="usb_cam",
-        image_topic="/usb_cam/image_raw", display_width=640,
+        media_source="usb_cam", display_width=640,
     )
 
 

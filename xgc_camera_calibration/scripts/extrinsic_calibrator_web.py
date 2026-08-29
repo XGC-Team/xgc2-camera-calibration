@@ -194,11 +194,11 @@ class RosCalibrationSource:
                     else self.image_topic
                 ),
                 "preview_image_topic": self.preview_image_topic,
-                "camera_info_topic": str(self.intrinsic_file),
+                "intrinsic_file": str(self.intrinsic_file),
                 "pose_prefix": self.pose_prefix,
                 "image_ready": preview_ready,
                 "preview_ready": preview_ready,
-                "camera_info_ready": True,
+                "intrinsic_ready": True,
                 "marker_count": len(marker_names),
                 "marker_names": marker_names,
                 "latest_image_stamp_sec": self.preview_stamp_sec,
