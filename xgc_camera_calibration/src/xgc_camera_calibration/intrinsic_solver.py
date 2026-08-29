@@ -35,8 +35,9 @@ _APRILTAG_DICTIONARIES = {
     "apriltag_36h11": "DICT_APRILTAG_36h11",
     "36h11": "DICT_APRILTAG_36h11",
 }
+_APRILGRID_MARKER_BORDER_BITS = 2
 _APRILGRID_FALLBACK_MIN_SHARPNESS = 160.0
-_APRILGRID_FALLBACK_MARKER_PIXELS = 80
+_APRILGRID_FALLBACK_MARKER_PIXELS = 100
 _APRILGRID_FALLBACK_MAX_PAYLOAD_ERRORS = 5
 _APRILGRID_FALLBACK_MAX_BORDER_ERRORS = 2
 
@@ -46,10 +47,9 @@ class BoardDetection:
     image_points: np.ndarray
     object_points: np.ndarray
     coverage: Tuple[float, float, float, float]
-    # AprilGrid renderers/detectors do not always agree on whether a tag has
-    # one or two black border cells. The decoded centre is invariant to that
-    # convention, while the reported outer corners are not. Keep every corner
-    # for annotation and coverage, but allow calibration to use tag centres.
+    # Kalibr t36h11 uses two black border cells. Keep every decoded outer corner
+    # for annotation and coverage, while calibration may use refined tag
+    # centres to avoid border-edge interpolation bias.
     calibration_image_points: Optional[np.ndarray] = None
     calibration_object_points: Optional[np.ndarray] = None
 
@@ -120,11 +120,18 @@ def detect_board(
 
 
 def _detect_aruco_markers(image: np.ndarray, dictionary: Any):
+    if hasattr(cv2.aruco, "DetectorParameters"):
+        parameters = cv2.aruco.DetectorParameters()
+    elif hasattr(cv2.aruco, "DetectorParameters_create"):
+        parameters = cv2.aruco.DetectorParameters_create()
+    else:
+        raise CalibrationError("OpenCV aruco detector parameters are unavailable")
+    parameters.markerBorderBits = _APRILGRID_MARKER_BORDER_BITS
     if hasattr(cv2.aruco, "ArucoDetector"):
-        detector = cv2.aruco.ArucoDetector(dictionary)
+        detector = cv2.aruco.ArucoDetector(dictionary, parameters)
         return detector.detectMarkers(image)
     if hasattr(cv2.aruco, "detectMarkers"):
-        return cv2.aruco.detectMarkers(image, dictionary)
+        return cv2.aruco.detectMarkers(image, dictionary, parameters=parameters)
     raise CalibrationError("OpenCV aruco marker detection is unavailable")
 
 
@@ -181,9 +188,14 @@ def refine_aprilgrid_calibration_centers(
 def _draw_aruco_marker(dictionary: Any, marker_id: int, size: int) -> np.ndarray:
     """Render one marker across the OpenCV 4.2 and 4.7+ Python APIs."""
     if hasattr(cv2.aruco, "generateImageMarker"):
-        return cv2.aruco.generateImageMarker(dictionary, marker_id, size)
+        return cv2.aruco.generateImageMarker(
+            dictionary, marker_id, size, None, _APRILGRID_MARKER_BORDER_BITS
+        )
     if hasattr(cv2.aruco, "drawMarker"):
-        return cv2.aruco.drawMarker(dictionary, marker_id, size, borderBits=1)
+        return cv2.aruco.drawMarker(
+            dictionary, marker_id, size,
+            borderBits=_APRILGRID_MARKER_BORDER_BITS,
+        )
     raise CalibrationError("OpenCV aruco marker rendering is unavailable")
 
 
@@ -199,15 +211,16 @@ def _ordered_quad(points: np.ndarray) -> np.ndarray:
 def _aprilgrid_marker_templates(
     dictionary: Any, start_id: int, count: int
 ) -> List[np.ndarray]:
-    """Build 8x8 binary templates: one black border plus a 6x6 payload."""
+    """Build Kalibr 10x10 templates: two black borders plus 6x6 payload."""
     marker_pixels = _APRILGRID_FALLBACK_MARKER_PIXELS
-    cell = marker_pixels // 8
+    cells = 6 + 2 * _APRILGRID_MARKER_BORDER_BITS
+    cell = marker_pixels // cells
     templates: List[np.ndarray] = []
     for marker_id in range(int(start_id), int(start_id) + int(count)):
         marker = _draw_aruco_marker(dictionary, marker_id, marker_pixels)
-        bits = np.zeros((8, 8), dtype=np.uint8)
-        for row in range(8):
-            for col in range(8):
+        bits = np.zeros((cells, cells), dtype=np.uint8)
+        for row in range(cells):
+            for col in range(cells):
                 patch = marker[
                     row * cell + 2 : (row + 1) * cell - 2,
                     col * cell + 2 : (col + 1) * cell - 2,
@@ -239,24 +252,26 @@ def _decode_aprilgrid_quad(
     _threshold, marker = cv2.threshold(
         marker, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU
     )
-    cell = marker_pixels // 8
-    bits = np.zeros((8, 8), dtype=np.uint8)
-    for row in range(8):
-        for col in range(8):
+    cells = 6 + 2 * _APRILGRID_MARKER_BORDER_BITS
+    cell = marker_pixels // cells
+    bits = np.zeros((cells, cells), dtype=np.uint8)
+    for row in range(cells):
+        for col in range(cells):
             patch = marker[
                 row * cell + 2 : (row + 1) * cell - 2,
                 col * cell + 2 : (col + 1) * cell - 2,
             ]
             bits[row, col] = int(float(np.mean(patch)) > 127.0)
-    border = np.concatenate(
-        (bits[0, :], bits[-1, :], bits[1:-1, 0], bits[1:-1, -1])
-    )
+    payload = slice(_APRILGRID_MARKER_BORDER_BITS, cells - _APRILGRID_MARKER_BORDER_BITS)
+    border_mask = np.ones_like(bits, dtype=bool)
+    border_mask[payload, payload] = False
+    border = bits[border_mask]
     border_errors = int(np.sum(border))
     best = (37, int(start_id), 0, border_errors)
     for offset, template in enumerate(templates):
         for rotation in range(4):
             rotated = np.rot90(template, rotation)
-            errors = int(np.count_nonzero(bits[1:7, 1:7] != rotated[1:7, 1:7]))
+            errors = int(np.count_nonzero(bits[payload, payload] != rotated[payload, payload]))
             if errors < best[0]:
                 best = (errors, int(start_id) + offset, rotation, border_errors)
     return best
@@ -877,12 +892,19 @@ def calibrate_intrinsic(
 def intrinsic_document(
     result: IntrinsicResult,
     *,
+    camera_name: str,
     board_size: Sequence[int],
     square: float,
     metadata: Optional[Dict[str, Any]] = None,
     board: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    identity = str(camera_name).strip()
+    if not identity or "\n" in identity or "\r" in identity:
+        raise ValueError("camera_name must be a non-empty single line")
     k = result.camera_matrix
+    rectification = np.eye(3, dtype=np.float64)
+    projection = np.zeros((3, 4), dtype=np.float64)
+    projection[:, :3] = k
     board_payload: Dict[str, Any] = {
         "size": [int(board_size[0]), int(board_size[1])],
         "square_size_m": float(square),
@@ -893,6 +915,7 @@ def intrinsic_document(
     document: Dict[str, Any] = {
         "schema": "xgc2.camera.intrinsic.v1",
         "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "camera_name": identity,
         "image_width": result.image_size[0],
         "image_height": result.image_size[1],
         "camera_matrix": {"rows": 3, "cols": 3, "data": [float(v) for v in k.reshape(-1)]},
@@ -901,6 +924,16 @@ def intrinsic_document(
             "rows": 1,
             "cols": int(result.distortion.size),
             "data": [float(v) for v in result.distortion],
+        },
+        "rectification_matrix": {
+            "rows": 3,
+            "cols": 3,
+            "data": [float(value) for value in rectification.reshape(-1)],
+        },
+        "projection_matrix": {
+            "rows": 3,
+            "cols": 4,
+            "data": [float(value) for value in projection.reshape(-1)],
         },
         "focal_length": {"fx": float(k[0, 0]), "fy": float(k[1, 1])},
         "principal_point": {"cx": float(k[0, 2]), "cy": float(k[1, 2])},
@@ -917,6 +950,7 @@ def save_intrinsic(
     path: os.PathLike,
     result: IntrinsicResult,
     *,
+    camera_name: str,
     board_size: Sequence[int],
     square: float,
     metadata: Optional[Dict[str, Any]] = None,
@@ -926,7 +960,8 @@ def save_intrinsic(
     destination = Path(path).expanduser()
     destination.parent.mkdir(parents=True, exist_ok=True)
     document = intrinsic_document(
-        result, board_size=board_size, square=square, metadata=metadata, board=board
+        result, camera_name=camera_name, board_size=board_size, square=square,
+        metadata=metadata, board=board
     )
     descriptor, temporary_name = tempfile.mkstemp(
         prefix="." + destination.name + ".", suffix=".tmp", dir=str(destination.parent)

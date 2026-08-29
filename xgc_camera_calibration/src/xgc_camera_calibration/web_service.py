@@ -269,7 +269,7 @@ class CalibrationService:
         ):
             raise ApiError(
                 HTTPStatus.CONFLICT,
-                "CameraInfo is uncalibrated; load or generate camera intrinsics first",
+                "Selected camera intrinsics are invalid",
             )
         if not snapshot.markers:
             raise ApiError(
@@ -394,7 +394,7 @@ class CalibrationService:
                     points=persisted_points,
                     metadata={
                         "image_topic": self.source.image_topic,
-                        "camera_info_topic": self.source.camera_info_topic,
+                        "intrinsic_file": str(self.source.intrinsic_file),
                         "pose_prefix": self.source.pose_prefix,
                         "image_width": snapshot.width,
                         "image_height": snapshot.height,
@@ -586,6 +586,13 @@ class CalibrationRequestHandler(BaseHTTPRequestHandler):
             raise ApiError(HTTPStatus.NOT_FOUND, "No reference image for that target")
         return jpeg
 
+    def _intrinsic_validation_image(self, path: str) -> bytes:
+        prefix = "/api/v1/intrinsic/validation/image/"
+        token = path[len(prefix):]
+        if not token.endswith(".jpg"):
+            raise ApiError(HTTPStatus.NOT_FOUND, "Intrinsic validation image must be JPEG")
+        return self._intrinsic().validation_image(token[:-4])
+
     def _dispatch(self) -> None:
         path = urlsplit(self.path).path
         if self.command in ("GET", "HEAD"):
@@ -619,6 +626,16 @@ class CalibrationRequestHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/v1/intrinsic/targets":
                 self._send_json(HTTPStatus.OK, self._intrinsic().targets_document())
+                return
+            if path == "/api/v1/intrinsic/calibrations":
+                self._send_json(HTTPStatus.OK, self._intrinsic().calibration_history())
+                return
+            if path.startswith("/api/v1/intrinsic/validation/image/"):
+                self._send_bytes(
+                    HTTPStatus.OK,
+                    "image/jpeg",
+                    self._intrinsic_validation_image(path),
+                )
                 return
             if path.startswith("/api/v1/intrinsic/ref/"):
                 self._send_bytes(HTTPStatus.OK, "image/jpeg", self._intrinsic_ref(path))
@@ -664,6 +681,18 @@ class CalibrationRequestHandler(BaseHTTPRequestHandler):
                 if request not in ({}, None):
                     raise ApiError(HTTPStatus.BAD_REQUEST, "Capture request must be an empty object")
                 self._send_json(HTTPStatus.OK, self._intrinsic().capture())
+                return
+            if path == "/api/v1/intrinsic/validation":
+                calibration_id = request.get("calibration_id") if isinstance(request, dict) else None
+                if not isinstance(calibration_id, str):
+                    raise ApiError(
+                        HTTPStatus.BAD_REQUEST,
+                        "Intrinsic validation requires string calibration_id",
+                    )
+                self._send_json(
+                    HTTPStatus.OK,
+                    self._intrinsic().validate_intrinsic(calibration_id),
+                )
                 return
             if path == "/api/v1/intrinsic/auto_capture/start":
                 if request not in ({}, None):

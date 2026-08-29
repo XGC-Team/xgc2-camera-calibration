@@ -15,7 +15,10 @@ from pathlib import Path
 import rospkg
 import rospy
 
-from xgc_camera_calibration.intrinsic_service import IntrinsicCalibrationService
+from xgc_camera_calibration.intrinsic_service import (
+    IntrinsicCalibrationService,
+    intrinsic_calibration_directory,
+)
 from xgc_camera_calibration.media_snapshot import MediaSnapshotClient
 from xgc_camera_calibration.web_service import CalibrationHttpServer
 
@@ -68,7 +71,16 @@ def main():
         snapshot_client.health()
         package_root = Path(rospkg.RosPack().get_path("xgc_camera_calibration"))
         web_root = Path(rospy.get_param("~web_root", str(package_root / "web" / "intrinsic")))
-        calibrations = Path.home() / ".local/state/xgc2/camera/calibrations/usb_cam"
+        calibration_root = Path(
+            str(rospy.get_param("~calibration_root", str(
+                Path.home() / ".local/state/xgc2/camera/calibrations"
+            )))
+        ).expanduser()
+        calibration_mode = str(rospy.get_param("~calibration_mode", "sim")).strip()
+        camera_name = str(rospy.get_param("~camera_name", "usb_cam")).strip()
+        calibrations = intrinsic_calibration_directory(
+            str(calibration_root), calibration_mode, camera_name
+        )
         board_center = (
             float(rospy.get_param("~board_x", 2.0)),
             float(rospy.get_param("~board_y", 0.0)),
@@ -84,7 +96,8 @@ def main():
                 int(rospy.get_param("~board_rows", 5)),
             ),
             square=float(rospy.get_param("~square_size", 0.20)),
-            output_file=rospy.get_param("~output_file", str(calibrations / "intrinsics.yaml")),
+            output_file=str(calibrations / "intrinsics.yaml"),
+            camera_name=camera_name,
             image_topic="media:{}".format(snapshot_client.source_id),
             camera_info_topic="snapshot metadata",
             media_source=snapshot_client.source_id,
@@ -92,9 +105,7 @@ def main():
             maximum_detect_width=int(rospy.get_param("~maximum_detect_width", display_width)),
             display_width=display_width,
             board_center=board_center,
-            references_dir=str(
-                rospy.get_param("~references_dir", str(calibrations / "intrinsic_refs"))
-            ),
+            references_dir=str(calibrations / "intrinsic_refs"),
             board_type=str(rospy.get_param("~board_type", "checkerboard")),
             tag_spacing=float(rospy.get_param("~tag_spacing", 0.0)),
             tag_family=str(rospy.get_param("~tag_family", "tag36h11")),
@@ -115,8 +126,12 @@ def main():
             service.attach_frame_capture(snapshot_client.capture)
         automatic_detection = bool(rospy.get_param("~auto_capture", True))
         if automatic_detection:
+            # Five fresh snapshots per second are sufficient for human motion
+            # and the simulation sweep. An unbounded loop can occupy an entire
+            # CPU core decoding/detecting 4K JPEGs and compete with the 4K30
+            # H264 adapter without improving geometric sample diversity.
             service.start_auto_capture(
-                float(rospy.get_param("~auto_capture_interval", 0.0))
+                float(rospy.get_param("~auto_capture_interval", 0.2))
             )
         bind_address = str(rospy.get_param("~bind_address", "127.0.0.1"))
         http_port = int(rospy.get_param("~http_port", 8766))

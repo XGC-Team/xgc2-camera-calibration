@@ -116,10 +116,26 @@ class IntrinsicSolverTest(unittest.TestCase):
         result = solver.calibrate_intrinsic(image_points, BOARD, SQUARE, (WIDTH, HEIGHT))
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "intrinsics.yaml"
-            solver.save_intrinsic(path, result, board_size=BOARD, square=SQUARE, metadata={"web_calibrator": True})
+            solver.save_intrinsic(
+                path,result,camera_name="usb_cam",board_size=BOARD,square=SQUARE,
+                metadata={"web_calibrator": True},
+            )
             document = solver.load_intrinsic(path)
         self.assertEqual(document["schema"], "xgc2.camera.intrinsic.v1")
         self.assertEqual(document["image_width"], WIDTH)
+        self.assertEqual(document["camera_name"], "usb_cam")
+        self.assertEqual(
+            document["rectification_matrix"]["data"],
+            [1.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,1.0],
+        )
+        self.assertEqual(document["projection_matrix"]["rows"], 3)
+        self.assertEqual(document["projection_matrix"]["cols"], 4)
+        matrix = document["camera_matrix"]["data"]
+        self.assertEqual(document["projection_matrix"]["data"], [
+            matrix[0],matrix[1],matrix[2],0.0,
+            matrix[3],matrix[4],matrix[5],0.0,
+            matrix[6],matrix[7],matrix[8],0.0,
+        ])
         self.assertAlmostEqual(document["camera_matrix_array"][0, 0], result.camera_matrix[0, 0], places=6)
         self.assertEqual(document["metadata"]["web_calibrator"], True)
 
@@ -185,7 +201,9 @@ class IntrinsicSolverTest(unittest.TestCase):
     def test_retries_small_physical_aprilgrid_at_bounded_resolution(self):
         if not hasattr(cv2, "aruco") or not hasattr(cv2.aruco, "DICT_APRILTAG_36h11"):
             self.skipTest("OpenCV AprilTag 36h11 dictionary is unavailable")
-        gray = _render_aprilgrid((6, 6), tag_pixels=12, gap_pixels=4, border=20)
+        # Kalibr's two-cell border plus 6x6 payload needs at least 2 pixels per
+        # logical cell; a 12 px marker cannot preserve ten binary cells.
+        gray = _render_aprilgrid((6, 6), tag_pixels=16, gap_pixels=5, border=20)
         detection = solver.detect_aprilgrid(
             gray, (6, 6), square=0.088, tag_spacing=0.0264, min_tags=6, maximum_width=960
         )
@@ -323,9 +341,9 @@ def _render_aprilgrid(
             tag_row = rows - 1 - row if physical_station_layout else row
             tag_id = tag_row * cols + col
             if hasattr(cv2.aruco, "generateImageMarker"):
-                tag = cv2.aruco.generateImageMarker(dictionary, tag_id, tag_pixels)
+                tag = cv2.aruco.generateImageMarker(dictionary, tag_id, tag_pixels, None, 2)
             else:
-                tag = cv2.aruco.drawMarker(dictionary, tag_id, tag_pixels)
+                tag = cv2.aruco.drawMarker(dictionary, tag_id, tag_pixels, borderBits=2)
             if physical_station_layout:
                 tag = np.rot90(tag, 2)
             y0 = border + row * pitch

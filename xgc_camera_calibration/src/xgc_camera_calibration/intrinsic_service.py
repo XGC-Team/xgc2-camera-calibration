@@ -19,9 +19,11 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import tempfile
 import threading
 import time
+from datetime import datetime, timezone
 from http import HTTPStatus
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -29,11 +31,25 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import cv2
 import numpy as np
 
-from xgc_camera_calibration import intrinsic_solver
+from xgc_camera_calibration import intrinsic_solver, intrinsic_validation
 from xgc_camera_calibration.solver import CalibrationError
 from xgc_camera_calibration.web_service import ApiError
 
 APRILGRID_ADAPTIVE_DETECTION_WIDTH = 2200
+CAMERA_NAME_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9._-]{0,63}$")
+
+
+def intrinsic_calibration_directory(root: str, mode: str, camera_name: str) -> Path:
+    calibration_root = Path(str(root)).expanduser()
+    calibration_mode = str(mode).strip()
+    identity = str(camera_name).strip()
+    if not calibration_root.is_absolute():
+        raise ValueError("calibration root must be absolute")
+    if calibration_mode not in ("sim", "phy"):
+        raise ValueError("calibration mode must be sim or phy")
+    if not CAMERA_NAME_PATTERN.fullmatch(identity):
+        raise ValueError("camera name must be a stable identifier")
+    return calibration_root / calibration_mode / identity
 
 
 def recommended_views(
@@ -101,6 +117,7 @@ class IntrinsicCalibrationService:
         board_size: Sequence[int],
         square: float,
         output_file: str,
+        camera_name: str,
         image_topic: str = "",
         camera_info_topic: str = "",
         jpeg_quality: int = 80,
@@ -119,6 +136,8 @@ class IntrinsicCalibrationService:
     ):
         if not output_file:
             raise ValueError("output_file must not be empty")
+        if not CAMERA_NAME_PATTERN.fullmatch(str(camera_name).strip()):
+            raise ValueError("camera_name must be a stable identifier")
         if int(board_size[0]) < 2 or int(board_size[1]) < 2:
             raise ValueError("board_size must be at least 2x2")
         if float(square) <= 0.0:
@@ -137,8 +156,10 @@ class IntrinsicCalibrationService:
         self.min_tags = int(min_tags)
         self.board_size = (int(board_size[0]), int(board_size[1]))
         self.square = float(square)
-        self.output_file = str(Path(output_file).expanduser())
-        self.checkpoint_file = self.output_file + ".session.npz"
+        self.output_file_base = str(Path(output_file).expanduser())
+        self.camera_name = str(camera_name).strip()
+        self.output_file = self.output_file_base
+        self.checkpoint_file = self.output_file_base + ".session.npz"
         self.image_topic = str(image_topic)
         self.camera_info_topic = str(camera_info_topic)
         self.media_source = str(media_source).strip()
@@ -195,11 +216,15 @@ class IntrinsicCalibrationService:
         self.target_done: List[bool] = [False] * len(self.views)
         self.references_dir = str(Path(references_dir).expanduser()) if references_dir else ""
         self.refs: Dict[int, bytes] = {}
+        self._validation_generation = 0
+        self._validation_report: Optional[Dict[str, Any]] = None
+        self._validation_images: Dict[str, bytes] = {}
         self.align_threshold = float(align_threshold)
         self.camera: Optional[Any] = None
         self.frame_capture: Optional[Callable[[], np.ndarray]] = None
         self._recording = False
         self.action: Optional[Dict[str, Any]] = None
+        self._selected_target_index: Optional[int] = None
         self._auto_run_thread: Optional[threading.Thread] = None
         self._auto_capture_thread: Optional[threading.Thread] = None
         self._auto_capture_stop = threading.Event()
@@ -351,6 +376,7 @@ class IntrinsicCalibrationService:
             "tag_family": self.tag_family,
             "tag_start_id": self.tag_start_id,
             "media_source": self.media_source or self.image_topic,
+            "camera_name": self.camera_name,
         }
 
     def _saved_board_matches(self, document: Dict[str, Any]) -> bool:
@@ -363,6 +389,8 @@ class IntrinsicCalibrationService:
         except (TypeError, ValueError):
             return False
         if size != self.board_size or abs(square - self.square) > 1e-9:
+            return False
+        if document.get("camera_name") != self.camera_name:
             return False
         saved_type = str(board.get("type", "checkerboard")).strip().lower()
         if saved_type != self.board_type:
@@ -396,13 +424,171 @@ class IntrinsicCalibrationService:
             "output_file": self.output_file,
         }
 
+    def _versioned_output_path(self) -> Path:
+        base = Path(self.output_file_base)
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+        candidate = base.with_name("{}-{}{}".format(base.stem, timestamp, base.suffix))
+        sequence = 1
+        while candidate.exists():
+            candidate = base.with_name(
+                "{}-{}-{:02d}{}".format(base.stem, timestamp, sequence, base.suffix)
+            )
+            sequence += 1
+        return candidate
+
+    def _saved_result_candidates(self) -> List[Path]:
+        base = Path(self.output_file_base)
+        if not base.parent.is_dir():
+            return []
+        return [
+            path for path in base.parent.glob("{}-*{}".format(base.stem, base.suffix))
+            if path.is_file()
+        ]
+
+    def calibration_history(self) -> Dict[str, Any]:
+        items = []
+        for path in self._saved_result_candidates():
+            try:
+                document = intrinsic_solver.load_intrinsic(path)
+                created_time = self._saved_result_time(document, path)
+                intrinsic_validation.intrinsic_parameters(document)
+            except (OSError, ValueError, CalibrationError):
+                continue
+            if document.get("camera_name") != self.camera_name:
+                continue
+            items.append({
+                "id": path.name,
+                "created_at": str(document.get("created_at", "")),
+                "created_time": created_time,
+                "image_width": int(document.get("image_width", 0)),
+                "image_height": int(document.get("image_height", 0)),
+                "rms_reprojection_error_px": float(
+                    document.get("rms_reprojection_error_px", 0.0)
+                ),
+                "sample_count": int(document.get("sample_count", 0)),
+            })
+        items.sort(key=lambda item: (item["created_time"], item["id"]), reverse=True)
+        for index, item in enumerate(items):
+            item["latest"] = index == 0
+            del item["created_time"]
+        return {
+            "items": items,
+            "selected": items[0]["id"] if items else None,
+        }
+
+    def _calibration_document(self, calibration_id: str) -> Tuple[Path, Dict[str, Any]]:
+        if not isinstance(calibration_id, str) or not calibration_id or Path(calibration_id).name != calibration_id:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "calibration_id must be a result filename")
+        candidates = {path.name: path for path in self._saved_result_candidates()}
+        path = candidates.get(calibration_id)
+        if path is None:
+            raise ApiError(HTTPStatus.NOT_FOUND, "Selected intrinsic calibration is unavailable")
+        try:
+            document = intrinsic_solver.load_intrinsic(path)
+            intrinsic_validation.intrinsic_parameters(document)
+        except (OSError, ValueError, CalibrationError) as error:
+            raise ApiError(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                "Selected intrinsic calibration is invalid: {}".format(error),
+            ) from error
+        if document.get("camera_name") != self.camera_name:
+            raise ApiError(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                "Selected intrinsic calibration belongs to another camera",
+            )
+        return path, document
+
+    def _capture_validation_frame(self) -> np.ndarray:
+        with self._capture_lock:
+            with self.lock:
+                capture = self.frame_capture
+            if capture is None:
+                raise ApiError(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    "No calibration frame source is available",
+                )
+            try:
+                frame = capture()
+            except ApiError:
+                raise
+            except Exception as error:
+                raise ApiError(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    "Could not capture an intrinsic validation frame: {}".format(error),
+                ) from error
+            jpeg = getattr(frame, "jpeg", None)
+            if isinstance(jpeg, bytes):
+                image = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+            elif isinstance(frame, np.ndarray):
+                image = frame.copy()
+            else:
+                source = getattr(frame, "bgr", None)
+                image = source.copy() if isinstance(source, np.ndarray) else None
+            if not isinstance(image, np.ndarray) or image.ndim != 3 or image.shape[2] != 3:
+                raise ApiError(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    "Calibration frame source returned no validation image",
+                )
+            return image
+
+    def validate_intrinsic(self, calibration_id: str) -> Dict[str, Any]:
+        path, document = self._calibration_document(calibration_id)
+        image = self._capture_validation_frame()
+        try:
+            validation = intrinsic_validation.generate_intrinsic_validation(
+                image,
+                document,
+                calibration_id=path.name,
+                jpeg_quality=self.jpeg_quality,
+            )
+        except (ValueError, CalibrationError, cv2.error) as error:
+            raise ApiError(HTTPStatus.UNPROCESSABLE_ENTITY, str(error)) from error
+        with self.lock:
+            self._validation_generation += 1
+            self._validation_images = dict(validation.images)
+            self._validation_report = {
+                **validation.report,
+                "generation": self._validation_generation,
+            }
+            return dict(self._validation_report)
+
+    def validation_image(self, view_id: str) -> bytes:
+        with self.lock:
+            image = self._validation_images.get(view_id)
+        if image is None:
+            raise ApiError(HTTPStatus.NOT_FOUND, "Intrinsic validation image is unavailable")
+        return image
+
+    @staticmethod
+    def _saved_result_time(document: Dict[str, Any], path: Path) -> float:
+        raw = document.get("created_at")
+        if isinstance(raw, str) and raw.strip():
+            try:
+                parsed = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                return parsed.timestamp()
+            except ValueError:
+                pass
+        return path.stat().st_mtime
+
     def _load_saved_result(self) -> bool:
-        path = Path(self.output_file)
-        if not path.is_file():
+        saved = []
+        load_error: Optional[Exception] = None
+        for path in self._saved_result_candidates():
+            try:
+                document = intrinsic_solver.load_intrinsic(path)
+            except (OSError, CalibrationError) as error:
+                load_error = error
+                continue
+            if self._saved_board_matches(document):
+                saved.append((self._saved_result_time(document, path), path.name, path, document))
+        if not saved:
+            if load_error is not None:
+                raise load_error
             return False
-        document = intrinsic_solver.load_intrinsic(path)
-        if not self._saved_board_matches(document):
-            return False
+        _created_at, _name, path, document = max(saved, key=lambda item: (item[0], item[1]))
+        self.output_file = str(path)
         distortion = document.get("distortion_coefficients", {})
         distortion_values = distortion.get("data") if isinstance(distortion, dict) else None
         image_size = (int(document["image_width"]), int(document["image_height"]))
@@ -502,14 +688,13 @@ class IntrinsicCalibrationService:
                 pass
             raise
 
-    def _remove_recovery_files_locked(self) -> None:
-        for raw_path in (self.output_file, self.checkpoint_file):
-            try:
-                Path(raw_path).unlink()
-            except FileNotFoundError:
-                pass
-            except OSError as error:
-                self._recovery_error = str(error) or error.__class__.__name__
+    def _remove_checkpoint_locked(self) -> None:
+        try:
+            Path(self.checkpoint_file).unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            self._recovery_error = str(error) or error.__class__.__name__
 
     def _save_ref(self, index: int, jpeg: bytes) -> None:
         self.refs[index] = jpeg
@@ -563,6 +748,9 @@ class IntrinsicCalibrationService:
             candidate = self.action.get("target_index")
             if isinstance(candidate, int) and 0 <= candidate < len(self.views):
                 index = candidate
+        if index is None and self._selected_target_index is not None:
+            if 0 <= self._selected_target_index < len(self.views):
+                index = self._selected_target_index
         if index is None:
             index, _ = self._nearest_target(position)
         if index is None or self.target_done[index]:
@@ -902,7 +1090,7 @@ class IntrinsicCalibrationService:
             self.action = None
 
     def _clear_session_locked(self) -> None:
-        self._remove_recovery_files_locked()
+        self._remove_checkpoint_locked()
         self.samples = []
         self.image_points = []
         self.object_points = []
@@ -910,7 +1098,10 @@ class IntrinsicCalibrationService:
         self.result_payload = None
         self.result_restored = False
         self.restored_coverage = []
+        self.output_file = self.output_file_base
+        self.refs = {}
         self.target_done = [False] * len(self.views)
+        self._selected_target_index = None
         self._auto_capture_completed = False
 
     def _require_camera(self) -> Any:
@@ -976,6 +1167,7 @@ class IntrinsicCalibrationService:
             if not 0 <= index < len(self.views):
                 raise ApiError(HTTPStatus.UNPROCESSABLE_ENTITY, "Unknown target index")
             view = self.views[index]
+            self._selected_target_index = index
             # Keep admission and the short camera command atomic with respect
             # to an auto-run starting on another HTTP worker thread.
             camera.goto(
@@ -987,6 +1179,7 @@ class IntrinsicCalibrationService:
         with self.lock:
             self._require_idle_locked()
             camera = self._require_camera()
+            self._selected_target_index = None
             camera.reset()
         return {"ok": True}
 
@@ -1052,6 +1245,7 @@ class IntrinsicCalibrationService:
                         return
                     self.action["target_index"] = index
                     self.action["target_name"] = view["name"]
+                    self._selected_target_index = index
                 camera.goto(
                     view["position"], view["yaw_offset"], view["pitch_offset"], view["roll"]
                 )
@@ -1164,13 +1358,16 @@ class IntrinsicCalibrationService:
         except (CalibrationError, cv2.error) as error:
             raise ApiError(HTTPStatus.UNPROCESSABLE_ENTITY, str(error)) from error
         try:
+            output_file = self._versioned_output_path()
             intrinsic_solver.save_intrinsic(
-                self.output_file,
+                output_file,
                 result,
+                camera_name=self.camera_name,
                 board_size=self.board_size,
                 square=self.square,
                 metadata={
                     "media_source": self.media_source or self.image_topic,
+                    "camera_name": self.camera_name,
                     "web_calibrator": True,
                     "coverage": intrinsic_solver.coverage(self.samples)[0],
                 },
@@ -1181,6 +1378,7 @@ class IntrinsicCalibrationService:
                 HTTPStatus.INTERNAL_SERVER_ERROR,
                 "Could not save calibration result: {}".format(error),
             ) from error
+        self.output_file = str(output_file)
         self.result = result
         self.result_restored = False
         self.result_payload = self._result_document(result)

@@ -96,8 +96,8 @@ EXTRINSIC_PID="$!"
   __name:=xgc_camera_intrinsic_calibrator_web \
   _media_edge_address:=http://127.0.0.1:18790 \
   _media_source_id:=usb_cam _snapshot_timeout:=1 \
-  _http_port:=18766 _output_file:="${RUNTIME}/intrinsics.yaml" \
-  _references_dir:="${RUNTIME}/refs" \
+  _http_port:=18766 _calibration_root:="${RUNTIME}/calibrations" \
+  _calibration_mode:=sim _camera_name:=usb_cam \
   >"${RUNTIME}/intrinsic.log" 2>&1 &
 INTRINSIC_PID="$!"
 

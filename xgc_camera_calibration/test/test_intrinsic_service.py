@@ -18,6 +18,7 @@ import numpy as np
 from xgc_camera_calibration import intrinsic_solver
 from xgc_camera_calibration.intrinsic_service import (
     IntrinsicCalibrationService,
+    intrinsic_calibration_directory,
     recommended_views,
 )
 from xgc_camera_calibration.web_service import ApiError, CalibrationHttpServer
@@ -45,6 +46,7 @@ def make_service(output_file):
     # 8x6 squares -> 7x5 interior corners.
     return IntrinsicCalibrationService(
         board_size=(7, 5), square=0.20, output_file=str(output_file),
+        camera_name="usb_cam",
         image_topic="/usb_cam/image_raw", display_width=640,
     )
 
@@ -79,6 +81,20 @@ class FakeCameraControl:
 
 
 class IntrinsicServiceTest(unittest.TestCase):
+    def test_storage_contract_is_explicitly_partitioned_by_mode_and_camera(self):
+        root = "/home/operator/Documents/XGC/Calibration/camera"
+        self.assertEqual(
+            intrinsic_calibration_directory(root, "sim", "front_camera"),
+            Path(root) / "sim/front_camera",
+        )
+        self.assertEqual(
+            intrinsic_calibration_directory(root, "phy", "front_camera"),
+            Path(root) / "phy/front_camera",
+        )
+        for mode, camera in (("simulation", "front_camera"), ("phy", "../camera"), ("phy", "")):
+            with self.assertRaises(ValueError):
+                intrinsic_calibration_directory(root, mode, camera)
+
     def test_90_degree_simulation_sweep_stays_high_and_near(self):
         views = recommended_views((2.0, 0.0, 2.2))
         near = next(view for view in views if view["name"] == "near maximum")
@@ -118,11 +134,17 @@ class IntrinsicServiceTest(unittest.TestCase):
     def test_entrypoint_runs_one_continuous_detector_for_both_camera_origins(self):
         source = ENTRYPOINT.read_text(encoding="utf-8")
         self.assertIn('rospy.get_param("~auto_capture", True)', source)
-        self.assertIn('rospy.get_param("~auto_capture_interval", 0.0)', source)
+        self.assertIn('rospy.get_param("~auto_capture_interval", 0.2)', source)
         self.assertNotIn('rospy.get_param("~auto_capture", not bool(', source)
         self.assertIn('rospy.get_param("~maximum_detect_width", display_width)', source)
         self.assertIn('rospy.get_param("~detection_target_pixels", 640 * 480)', " ".join(source.split()))
         self.assertIn('kwargs={"poll_interval": 0.05}', source)
+        self.assertIn('rospy.get_param("~calibration_root"', source)
+        self.assertIn('rospy.get_param("~calibration_mode", "sim")', source)
+        self.assertIn('rospy.get_param("~camera_name", "usb_cam")', source)
+        self.assertIn('intrinsic_calibration_directory(', source)
+        self.assertNotIn('rospy.get_param("~output_file"', source)
+        self.assertNotIn('rospy.get_param("~references_dir"', source)
         self.assertIn("time.sleep(0.1)", WEB_SERVICE_SOURCE.read_text(encoding="utf-8"))
 
     def test_process_frame_collects_a_board_sample(self):
@@ -163,6 +185,18 @@ class IntrinsicServiceTest(unittest.TestCase):
             service._capture_frame()
             self.assertTrue(service.target_done[0])
 
+    def test_manual_goto_marks_the_explicit_target_when_guide_positions_overlap(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = make_service(Path(directory) / "intrinsics.yaml")
+            camera = FakeCameraControl()
+            service.attach_camera_control(camera)
+            service.views[0]["position"] = [0.0, 0.0, 0.0]
+            service.views[1]["position"] = [0.0, 0.01, 0.0]
+            service.goto(1)
+            service.process_frame(render_board())
+            self.assertFalse(service.target_done[0])
+            self.assertTrue(service.target_done[1])
+
     def test_reduced_detection_frame_keeps_source_calibration_coordinates(self):
         with tempfile.TemporaryDirectory() as directory:
             service = make_service(Path(directory) / "intrinsics.yaml")
@@ -187,6 +221,7 @@ class IntrinsicServiceTest(unittest.TestCase):
                 board_size=(2, 2),
                 square=0.088,
                 output_file=str(Path(directory) / "intrinsics.yaml"),
+                camera_name="usb_cam",
                 board_type="aprilgrid",
                 tag_spacing=0.0264,
                 min_tags=4,
@@ -232,6 +267,7 @@ class IntrinsicServiceTest(unittest.TestCase):
             service = IntrinsicCalibrationService(
                 board_size=(2, 2), square=0.088,
                 output_file=str(Path(directory) / "intrinsics.yaml"),
+                camera_name="usb_cam",
                 board_type="aprilgrid", tag_spacing=0.0264, min_tags=4,
             )
             reduced = np.zeros((270, 480, 3), np.uint8)
@@ -344,15 +380,18 @@ class IntrinsicServiceTest(unittest.TestCase):
 
     def test_saved_result_restores_without_recollecting_samples(self):
         with tempfile.TemporaryDirectory() as directory:
-            output = Path(directory) / "intrinsics.yaml"
+            base = Path(directory) / "intrinsics.yaml"
+            output = Path(directory) / "intrinsics-20260830T120000.000000Z.yaml"
             result = intrinsic_solver.IntrinsicResult(
                 camera_matrix=np.array([[638.0, 0.0, 600.0], [0.0, 637.0, 390.0], [0.0, 0.0, 1.0]]),
                 distortion=np.array([0.01, -0.02, 0.0, 0.0, 0.0]),
                 image_size=(1280, 720), rms_reprojection_error_px=0.9, sample_count=40,
             )
-            intrinsic_solver.save_intrinsic(output, result, board_size=(7, 5), square=0.20)
+            intrinsic_solver.save_intrinsic(
+                output,result,camera_name="usb_cam",board_size=(7, 5),square=0.20,
+            )
 
-            restored = make_service(output)
+            restored = make_service(base)
             restored.attach_frame_capture(lambda: render_board())
             state = restored.state()
             self.assertTrue(state["calibrated"])
@@ -363,7 +402,67 @@ class IntrinsicServiceTest(unittest.TestCase):
             restored.stop_auto_capture()
 
             restored.reset()
-            self.assertFalse(output.exists())
+            self.assertTrue(output.exists())
+            self.assertFalse(restored.state()["calibrated"])
+            self.assertEqual(restored.state()["samples"], 0)
+
+    def test_latest_timestamped_result_restores_by_created_time(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory) / "intrinsics.yaml"
+            older = Path(directory) / "intrinsics-20260829T120000.000000Z.yaml"
+            newer = Path(directory) / "intrinsics-20260830T120000.000000Z.yaml"
+            older_result = intrinsic_solver.IntrinsicResult(
+                camera_matrix=np.array([[638.0, 0.0, 600.0], [0.0, 637.0, 390.0], [0.0, 0.0, 1.0]]),
+                distortion=np.array([0.01, -0.02, 0.0, 0.0, 0.0]),
+                image_size=(1280, 720), rms_reprojection_error_px=0.9, sample_count=40,
+            )
+            newer_result = intrinsic_solver.IntrinsicResult(
+                camera_matrix=np.array([[742.0, 0.0, 601.0], [0.0, 741.0, 391.0], [0.0, 0.0, 1.0]]),
+                distortion=np.array([0.02, -0.03, 0.0, 0.0, 0.0]),
+                image_size=(1280, 720), rms_reprojection_error_px=0.6, sample_count=45,
+            )
+            intrinsic_solver.save_intrinsic(
+                older,older_result,camera_name="usb_cam",board_size=(7, 5),square=0.20,
+            )
+            intrinsic_solver.save_intrinsic(
+                newer,newer_result,camera_name="usb_cam",board_size=(7, 5),square=0.20,
+            )
+
+            restored = make_service(base)
+            state = restored.state()
+            self.assertTrue(state["result_restored"])
+            self.assertEqual(state["output_file"], str(newer))
+            self.assertEqual(state["result"]["output_file"], str(newer))
+            self.assertAlmostEqual(state["result"]["fx"], 742.0)
+
+    def test_calibrate_writes_timestamped_version_and_reset_preserves_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory) / "intrinsics.yaml"
+            service = make_service(base)
+            service.image_points = [np.zeros((35, 1, 2), dtype=np.float32)]
+            service.object_points = [np.zeros((35, 3), dtype=np.float32)]
+            service.image_size = (1280, 720)
+            result = intrinsic_solver.IntrinsicResult(
+                camera_matrix=np.array([[638.0, 0.0, 600.0], [0.0, 637.0, 390.0], [0.0, 0.0, 1.0]]),
+                distortion=np.array([0.01, -0.02, 0.0, 0.0, 0.0]),
+                image_size=(1280, 720), rms_reprojection_error_px=0.9, sample_count=1,
+            )
+            with patch.object(intrinsic_solver, "calibrate_intrinsic", return_value=result):
+                solved = service.calibrate()
+
+            saved = Path(solved["output_file"])
+            self.assertRegex(saved.name, r"^intrinsics-\d{8}T\d{6}\.\d{6}Z\.yaml$")
+            self.assertTrue(saved.is_file())
+            self.assertFalse(base.exists())
+            saved_document = intrinsic_solver.load_intrinsic(saved)
+            self.assertEqual(saved_document["camera_name"], "usb_cam")
+            self.assertEqual(saved_document["metadata"]["camera_name"], "usb_cam")
+
+            reset = service.reset()
+            self.assertEqual(reset["samples"], 0)
+            self.assertFalse(reset["calibrated"])
+            self.assertTrue(saved.is_file())
+            self.assertEqual(reset["output_file"], str(base))
 
     def test_continuous_detection_keeps_running_after_coverage_is_ready(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -607,6 +706,59 @@ class IntrinsicServiceTest(unittest.TestCase):
                 )
                 with urllib.request.urlopen(request) as response:
                     self.assertFalse(json.loads(response.read())["auto_capture"]["enabled"])
+
+                calibration_path = Path(directory) / "intrinsics-20260830T120000.000000Z.yaml"
+                intrinsic_solver.save_intrinsic(
+                    calibration_path,
+                    intrinsic_solver.IntrinsicResult(
+                        camera_matrix=np.array([
+                            [638.0, 0.0, 200.0],
+                            [0.0, 637.0, 160.0],
+                            [0.0, 0.0, 1.0],
+                        ]),
+                        distortion=np.array([-0.18, 0.04, 0.0, 0.0, 0.0]),
+                        image_size=(400, 320),
+                        rms_reprojection_error_px=0.7,
+                        sample_count=40,
+                    ),
+                    camera_name="usb_cam",
+                    board_size=(7, 5),
+                    square=0.20,
+                )
+                with urllib.request.urlopen(base + "/api/v1/intrinsic/calibrations") as response:
+                    history = json.loads(response.read())
+                self.assertEqual(history["selected"], calibration_path.name)
+                self.assertTrue(history["items"][0]["latest"])
+
+                samples_before_validation = service.state()["samples"]
+                request = urllib.request.Request(
+                    base + "/api/v1/intrinsic/validation",
+                    data=json.dumps({"calibration_id": calibration_path.name}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(request) as response:
+                    validation = json.loads(response.read())
+                self.assertEqual(validation["schema"], "xgc2.camera.intrinsic-validation.v1")
+                self.assertEqual(validation["calibration_id"], calibration_path.name)
+                self.assertEqual(validation["default_view"], "overlay_checker")
+                self.assertEqual(
+                    [view["id"] for view in validation["views"][:5]],
+                    [
+                        "overlay_checker",
+                        "overlay_redcyan",
+                        "overlay_corner_zoom",
+                        "overlay_diff",
+                        "displacement",
+                    ],
+                )
+                self.assertGreater(validation["remap_px"]["maximum"], 0.0)
+                self.assertEqual(service.state()["samples"], samples_before_validation)
+                with urllib.request.urlopen(
+                    base + "/api/v1/intrinsic/validation/image/displacement.jpg"
+                ) as response:
+                    self.assertEqual(response.headers.get_content_type(), "image/jpeg")
+                    self.assertTrue(response.read().startswith(b"\xff\xd8"))
 
                 service.attach_camera_control(FakeCameraControl())
                 service.auto_run = lambda: {

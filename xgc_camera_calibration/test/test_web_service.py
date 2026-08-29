@@ -28,6 +28,7 @@ class FakeSource:
     image_topic = "/camera/image_raw"
     preview_image_topic = "/camera/image_raw/compressed"
     camera_info_topic = "/camera/camera_info"
+    intrinsic_file = "/camera/intrinsics.yaml"
     pose_prefix = "/vrpn_client_node"
     preview_jpeg = b"\xff\xd8cached-compressed-preview\xff\xd9"
 

@@ -8,11 +8,10 @@ from collections import deque
 from pathlib import Path
 
 import cv2
-import numpy as np
 import rospkg
 import rospy
 from geometry_msgs.msg import PoseStamped
-from sensor_msgs.msg import CameraInfo, CompressedImage, Image
+from sensor_msgs.msg import CompressedImage, Image
 
 from xgc_camera_calibration.web_service import (
     ApiError,
@@ -23,6 +22,8 @@ from xgc_camera_calibration.web_service import (
     image_message_to_bgr,
     nearest_observation,
 )
+from xgc_camera_calibration.intrinsic_solver import load_intrinsic
+from xgc_camera_calibration.intrinsic_validation import intrinsic_parameters
 from xgc_camera_calibration.media_snapshot import MediaSnapshotClient, MediaSnapshotError
 
 
@@ -34,17 +35,23 @@ def normalize_topic(value):
 class RosCalibrationSource:
     """Thread-safe latest camera frame and timestamped pose-marker history."""
 
-    def __init__(self, snapshot_client=None):
+    def __init__(self, intrinsic_file, snapshot_client=None):
         self.lock = threading.RLock()
         self.snapshot_client = snapshot_client
+        self.intrinsic_file = Path(str(intrinsic_file).strip()).expanduser()
+        if not self.intrinsic_file.is_absolute():
+            raise ValueError("~intrinsic_file must be an absolute YAML file path")
+        intrinsic_document = load_intrinsic(self.intrinsic_file)
+        (
+            self.intrinsic_matrix,
+            self.intrinsic_distortion,
+            self.intrinsic_size,
+        ) = intrinsic_parameters(intrinsic_document)
         self.image_topic = normalize_topic(rospy.get_param("~image_topic", "/usb_cam/image_raw"))
         self.preview_image_topic = normalize_topic(
             rospy.get_param(
                 "~preview_image_topic", "/usb_cam/image_raw/compressed"
             )
-        )
-        self.camera_info_topic = normalize_topic(
-            rospy.get_param("~camera_info_topic", "/usb_cam/camera_info")
         )
         self.freeze_image_timeout = float(
             rospy.get_param("~freeze_image_timeout", 2.0)
@@ -68,13 +75,11 @@ class RosCalibrationSource:
             raise ValueError("~pose_history_size must be at least 2")
         self.preview_jpeg = None
         self.preview_stamp_sec = None
-        self.camera_info = None
         self.marker_latest = {}
         self.marker_history = {}
         self.marker_subscribers = {}
         self.marker_topics = {}
         self.preview_subscriber = None
-        self.info_subscriber = None
         if self.snapshot_client is None:
             self.preview_subscriber = rospy.Subscriber(
                 self.preview_image_topic,
@@ -82,9 +87,6 @@ class RosCalibrationSource:
                 self._preview_callback,
                 queue_size=1,
                 buff_size=2**20,
-            )
-            self.info_subscriber = rospy.Subscriber(
-                self.camera_info_topic, CameraInfo, self._info_callback, queue_size=1
             )
         self.discovery_timer = rospy.Timer(rospy.Duration(1.0), self._refresh_markers)
         self._refresh_markers(None)
@@ -110,10 +112,6 @@ class RosCalibrationSource:
         with self.lock:
             self.preview_jpeg = payload
             self.preview_stamp_sec = stamp_sec
-
-    def _info_callback(self, message):
-        with self.lock:
-            self.camera_info = message
 
     def _refresh_markers(self, _event):
         pattern = re.compile(r"^" + re.escape(self.pose_prefix) + r"/([^/]+)/pose$")
@@ -186,7 +184,6 @@ class RosCalibrationSource:
         with self.lock:
             snapshot_ready = self.snapshot_client is not None
             preview_ready = snapshot_ready or self.preview_jpeg is not None
-            info = self.camera_info
             marker_names = sorted(
                 name for name, history in self.marker_history.items() if history
             )
@@ -197,13 +194,11 @@ class RosCalibrationSource:
                     else self.image_topic
                 ),
                 "preview_image_topic": self.preview_image_topic,
-                "camera_info_topic": (
-                    "snapshot metadata" if snapshot_ready else self.camera_info_topic
-                ),
+                "camera_info_topic": str(self.intrinsic_file),
                 "pose_prefix": self.pose_prefix,
                 "image_ready": preview_ready,
                 "preview_ready": preview_ready,
-                "camera_info_ready": snapshot_ready or info is not None,
+                "camera_info_ready": True,
                 "marker_count": len(marker_names),
                 "marker_names": marker_names,
                 "latest_image_stamp_sec": self.preview_stamp_sec,
@@ -222,8 +217,6 @@ class RosCalibrationSource:
                 snapshot.bgr,
                 stamp_sec,
                 snapshot.frame_id,
-                snapshot.camera_matrix,
-                snapshot.distortion,
                 parent_frame,
                 maximum_marker_age,
             )
@@ -240,28 +233,15 @@ class RosCalibrationSource:
                     self.freeze_image_timeout
                 ),
             ) from error
-        with self.lock:
-            camera_info = self.camera_info
-        if camera_info is None:
-            raise ApiError(409, "CameraInfo has not arrived")
         image_stamp = image_message.header.stamp
         if image_stamp.is_zero():
             image_stamp = rospy.Time.now()
         stamp_sec = float(image_stamp.to_sec())
         image = self._convert_image(image_message)
-        if (
-            camera_info.width
-            and int(camera_info.width) != image.shape[1]
-            or camera_info.height
-            and int(camera_info.height) != image.shape[0]
-        ):
-            raise ApiError(409, "CameraInfo dimensions do not match the image")
         return self._frame_snapshot(
             image,
             stamp_sec,
             image_message.header.frame_id,
-            np.asarray(camera_info.K, dtype=np.float64).reshape(3, 3),
-            np.asarray(camera_info.D, dtype=np.float64),
             parent_frame,
             maximum_marker_age,
         )
@@ -271,11 +251,20 @@ class RosCalibrationSource:
         image,
         stamp_sec,
         frame_id,
-        camera_matrix,
-        distortion,
         parent_frame,
         maximum_marker_age,
     ):
+        image_size = (int(image.shape[1]), int(image.shape[0]))
+        if image_size != self.intrinsic_size:
+            raise ApiError(
+                409,
+                "Selected intrinsic calibration is {}x{}, but the captured image is {}x{}".format(
+                    self.intrinsic_size[0],
+                    self.intrinsic_size[1],
+                    image_size[0],
+                    image_size[1],
+                ),
+            )
         with self.lock:
             histories = {
                 name: tuple(history) for name, history in self.marker_history.items()
@@ -315,8 +304,8 @@ class RosCalibrationSource:
             image=image,
             stamp_sec=stamp_sec,
             frame_id=frame_id,
-            camera_matrix=np.asarray(camera_matrix, dtype=np.float64).reshape(3, 3),
-            distortion=np.asarray(distortion, dtype=np.float64),
+            camera_matrix=self.intrinsic_matrix.copy(),
+            distortion=self.intrinsic_distortion.copy(),
             markers=markers,
             stale_markers=stale,
         )
@@ -340,7 +329,10 @@ def main():
                 float(rospy.get_param("~snapshot_timeout", 5.0)),
             )
             snapshot_client.health()
-        source = RosCalibrationSource(snapshot_client=snapshot_client)
+        source = RosCalibrationSource(
+            rospy.get_param("~intrinsic_file"),
+            snapshot_client=snapshot_client,
+        )
         package_root = Path(rospkg.RosPack().get_path("xgc_camera_calibration"))
         web_root = Path(rospy.get_param("~web_root", str(package_root / "web" / "extrinsic")))
         service = CalibrationService(
@@ -400,6 +392,10 @@ def main():
         else source.image_topic,
         "WebRTC" if snapshot_client is not None else source.preview_image_topic,
         source.pose_prefix,
+    )
+    rospy.loginfo(
+        "Camera extrinsic calibration uses intrinsics from %s",
+        source.intrinsic_file,
     )
     try:
         rospy.spin()
