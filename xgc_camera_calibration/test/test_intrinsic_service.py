@@ -861,6 +861,33 @@ class IntrinsicServiceTest(unittest.TestCase):
             self.assertEqual(state["guidance"]["direction"], "center")
             self.assertFalse(state["recovery"]["checkpoint_available"])
 
+    def test_guidance_uses_the_final_coverage_bars_returned_by_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = make_service(Path(directory) / "intrinsics.yaml")
+            service.samples = [
+                (0.05, 0.05, 0.40, 0.02),
+                (0.622, 0.75, 0.40, 0.08),
+            ]
+            final_bars = [
+                {"label": "X", "progress": 0.817},
+                {"label": "Y", "progress": 1.0},
+                {"label": "Size", "progress": 1.0},
+                {"label": "Skew", "progress": 1.0},
+            ]
+            with patch.object(
+                service,
+                "_coverage_state_locked",
+                return_value=(final_bars, False),
+            ):
+                state = service.state()
+            self.assertEqual(state["coverage"], final_bars)
+            self.assertEqual(state["guidance"], {
+                "complete": False,
+                "dimension": "X",
+                "direction": "right",
+                "progress": 0.817,
+            })
+
     def test_accepted_corner_checkpoint_restores_an_interrupted_stage(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "intrinsics.yaml"

@@ -1758,7 +1758,14 @@ class IntrinsicCalibrationService:
             if not self.samples and self.restored_coverage:
                 bars = [dict(item) for item in self.restored_coverage]
             goodenough = self.result is not None or sample_goodenough
-            guidance = intrinsic_solver.next_view_guidance(self.samples)
+            # Guidance must use the same final bars presented to the operator.
+            # Physical AprilGrid coverage replaces generic image-plane Skew with
+            # signed plane-normal bins; recomputing the generic bars here could
+            # recommend tilt while the visible incomplete axis is X or Y.
+            guidance = intrinsic_solver.next_view_guidance(
+                self.samples,
+                coverage_bars=bars,
+            )
             targets = [{
                 "name": view["name"],
                 "position": view["position"],

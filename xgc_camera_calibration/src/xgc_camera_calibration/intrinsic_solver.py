@@ -16,7 +16,7 @@ import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -1049,7 +1049,8 @@ def coverage(
 
 
 def next_view_guidance(
-    samples: Sequence[Sequence[float]], ranges: Sequence[float] = PARAM_RANGES
+    samples: Sequence[Sequence[float]], ranges: Sequence[float] = PARAM_RANGES,
+    coverage_bars: Optional[Sequence[Mapping[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Describe the single view that expands the weakest coverage axis most.
 
@@ -1059,7 +1060,16 @@ def next_view_guidance(
     operator a stable direction based on the whole sample history rather than
     whichever frame happened to arrive last.
     """
-    bars, _goodenough = coverage(samples, ranges)
+    if coverage_bars is None:
+        bars, _goodenough = coverage(samples, ranges)
+    else:
+        bars = [
+            {"label": name, "progress": float(item["progress"])}
+            for name, item in zip(PARAM_NAMES, coverage_bars)
+            if item.get("label") == name
+        ]
+        if len(bars) != len(PARAM_NAMES):
+            raise ValueError("coverage_bars must contain ordered X/Y/Size/Skew entries")
     complete = bool(samples) and all(bar["progress"] >= 1.0 for bar in bars)
     if complete:
         return {

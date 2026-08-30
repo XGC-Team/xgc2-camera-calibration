@@ -176,6 +176,24 @@ class IntrinsicSolverTest(unittest.TestCase):
         self.assertTrue(complete["complete"])
         self.assertEqual(complete["direction"], "complete")
 
+    def test_next_view_guidance_uses_the_same_final_bars_shown_to_the_operator(self):
+        samples = [
+            (0.05, 0.05, 0.40, 0.02),
+            (0.622, 0.75, 0.40, 0.08),
+        ]
+        guidance = solver.next_view_guidance(samples, coverage_bars=[
+            {"label": "X", "progress": 0.817},
+            {"label": "Y", "progress": 1.0},
+            {"label": "Size", "progress": 1.0},
+            {"label": "Skew", "progress": 1.0},
+        ])
+        self.assertEqual(guidance, {
+            "complete": False,
+            "dimension": "X",
+            "direction": "right",
+            "progress": 0.817,
+        })
+
     def test_rejects_too_few_samples(self):
         with self.assertRaises(CalibrationError):
             solver.calibrate_intrinsic([np.zeros((35, 1, 2), np.float32)], BOARD, SQUARE, (WIDTH, HEIGHT))
