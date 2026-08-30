@@ -84,8 +84,8 @@ assert deb["size"] > 0
 PY
 
 grep -q '^id: xgc2-camera-calibration-ros1$' .xgc2/product.yml
-grep -q '^version: 0.3.0-27$' .xgc2/product.yml
-grep -q '^    focal: 0.3.0-27$' .xgc2/product.yml
+grep -q '^version: 0.3.0-28$' .xgc2/product.yml
+grep -q '^    focal: 0.3.0-28$' .xgc2/product.yml
 if grep -q '^    focal: .*~focal' .xgc2/product.yml; then
   echo "single-distribution ROS1 package version must not retain a focal suffix" >&2
   exit 1

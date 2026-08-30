@@ -21,6 +21,7 @@ class AprilGridProfile:
     start_id: int = 0
     min_tags: int = 6
     gazebo_model: str = ""
+    gazebo_instance_name: str = ""
 
 
 PROFILES: Dict[str, AprilGridProfile] = {
@@ -31,6 +32,7 @@ PROFILES: Dict[str, AprilGridProfile] = {
         tag_size_m=0.088,
         tag_gap_m=0.0264,
         gazebo_model="aprilgrid_6x6_tag36h11_88mm",
+        gazebo_instance_name="intrinsic_aprilgrid_field_6x6_88mm",
     ),
     A4_6X6_24MM_30PCT_KALIBR_V1: AprilGridProfile(
         profile_id=A4_6X6_24MM_30PCT_KALIBR_V1,
@@ -39,6 +41,7 @@ PROFILES: Dict[str, AprilGridProfile] = {
         tag_size_m=0.024,
         tag_gap_m=0.0072,
         gazebo_model="aprilgrid_6x6_tag36h11_24mm_a4",
+        gazebo_instance_name="intrinsic_aprilgrid_a4_6x6_24mm",
     ),
 }
 

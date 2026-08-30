@@ -42,6 +42,12 @@ it does not select the Kalibr solver or require rosbag. Detection and solving
 remain on the same XGC OpenCV path for both profiles. The retired pre-datum A4
 identifier is rejected rather than translated or restored.
 
+Gazebo gives each selected profile a distinct runtime model instance name.
+Switching profiles removes only the other known calibration-board instances;
+reselecting the current profile is idempotent. The world-file legacy instance
+is never deleted and respawned under the same name, avoiding asynchronous
+delete events that could remove a freshly selected board after startup.
+
 The Media Edge must run on the same host and expose the configured source
 before the calibrator starts. Each manual or automatic sample creates one
 immutable snapshot, reads its RGB8 pixels and intrinsic metadata from that same

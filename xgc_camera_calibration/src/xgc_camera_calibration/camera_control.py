@@ -19,7 +19,10 @@ import time
 from pathlib import Path
 from typing import Dict, Optional, Sequence, Tuple
 
-from xgc_camera_calibration.board_profiles import AprilGridProfile
+from xgc_camera_calibration.board_profiles import AprilGridProfile, PROFILES
+
+
+_LEGACY_GAZEBO_BOARD_INSTANCE_NAME = "intrinsic_aprilgrid"
 
 
 def select_gazebo_board_profile(
@@ -48,36 +51,62 @@ def select_gazebo_board_profile(
     delete = rospy.ServiceProxy(delete_name, DeleteModel)
     world = rospy.ServiceProxy(world_name, GetWorldProperties)
     spawn = rospy.ServiceProxy(spawn_name, SpawnModel)
-    try:
-        delete("intrinsic_aprilgrid")
-    except Exception:
-        pass
-    _wait_for_gazebo_model_presence(
-        world,
-        model_name="intrinsic_aprilgrid",
-        expected=False,
-        timeout=connection_timeout,
+    desired_name = profile.gazebo_instance_name
+    if not desired_name:
+        raise RuntimeError(
+            "Gazebo calibration board profile has no unique instance name: {}".format(
+                profile.profile_id
+            )
+        )
+    known_names = {_LEGACY_GAZEBO_BOARD_INSTANCE_NAME}
+    known_names.update(
+        item.gazebo_instance_name for item in PROFILES.values()
+        if item.gazebo_instance_name
     )
+    present = set(world().model_names)
+    for model_name in sorted((present & known_names) - {desired_name}):
+        response = delete(model_name)
+        if not response.success:
+            raise RuntimeError(
+                "Could not remove Gazebo calibration board '{}': {}".format(
+                    model_name, response.status_message
+                )
+            )
+        _wait_for_gazebo_model_presence(
+            world,
+            model_name=model_name,
+            expected=False,
+            timeout=connection_timeout,
+        )
+    if desired_name in present:
+        rospy.loginfo(
+            "Gazebo calibration board already selected: profile=%s model=%s instance=%s",
+            profile.profile_id,
+            profile.gazebo_model,
+            desired_name,
+        )
+        return
     pose = Pose()
     pose.position.x, pose.position.y, pose.position.z = (
         float(board_center[0]), float(board_center[1]), float(board_center[2])
     )
     pose.orientation.w = 1.0
     response = spawn(
-        "intrinsic_aprilgrid", model_path.read_text(encoding="utf-8"), "", pose, "world"
+        desired_name, model_path.read_text(encoding="utf-8"), "", pose, "world"
     )
     if not response.success:
         raise RuntimeError("Could not spawn Gazebo calibration board: {}".format(response.status_message))
     _wait_for_gazebo_model_presence(
         world,
-        model_name="intrinsic_aprilgrid",
+        model_name=desired_name,
         expected=True,
         timeout=connection_timeout,
     )
     rospy.loginfo(
-        "Gazebo calibration board selected: profile=%s model=%s",
+        "Gazebo calibration board selected: profile=%s model=%s instance=%s",
         profile.profile_id,
         profile.gazebo_model,
+        desired_name,
     )
 
 
