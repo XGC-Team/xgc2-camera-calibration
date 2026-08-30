@@ -65,6 +65,7 @@ jobs:
           DEPENDENCY_SET_DIGEST: ${{ inputs.dependency_set_digest }}
         run: |
           set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           case "$PREPARE_ACTION" in release|compatibility-verify) ;; *) exit 1 ;; esac
           if [[ -n "$DEPENDENCY_SET_DIGEST" && ! "$DEPENDENCY_SET_DIGEST" =~ ^[0-9a-f]{64}$ ]]; then
             echo "invalid dependency_set_digest" >&2; exit 1
