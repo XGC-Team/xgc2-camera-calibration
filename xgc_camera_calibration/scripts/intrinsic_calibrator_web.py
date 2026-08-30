@@ -19,6 +19,10 @@ from xgc_camera_calibration.intrinsic_service import (
     IntrinsicCalibrationService,
     intrinsic_calibration_directory,
 )
+from xgc_camera_calibration.board_profiles import (
+    FIELD_6X6_88MM_30PCT,
+    resolve_aprilgrid_profile,
+)
 from xgc_camera_calibration.media_snapshot import MediaSnapshotClient
 from xgc_camera_calibration.web_service import CalibrationHttpServer
 
@@ -86,16 +90,21 @@ def main():
             float(rospy.get_param("~board_y", 0.0)),
             float(rospy.get_param("~board_z", 2.2)),
         )
-        # Simulation and physical use the same station AprilGrid contract:
-        # 6x6 tag36h11, 88 mm tags, 26.4 mm gaps, ids 0..35. Gazebo renders an
-        # official Kalibr export at those physical dimensions.
+        board_profile = resolve_aprilgrid_profile(
+            rospy.get_param("~board_profile", FIELD_6X6_88MM_30PCT)
+        )
+        if bool(rospy.get_param("~camera_control", False)):
+            from xgc_camera_calibration.camera_control import select_gazebo_board_profile
+
+            select_gazebo_board_profile(
+                board_profile,
+                board_center,
+                float(rospy.get_param("~camera_control_timeout", 8.0)),
+            )
         display_width = int(rospy.get_param("~display_width", 720))
         service = IntrinsicCalibrationService(
-            board_size=(
-                int(rospy.get_param("~board_cols", 7)),
-                int(rospy.get_param("~board_rows", 5)),
-            ),
-            square=float(rospy.get_param("~square_size", 0.20)),
+            board_size=(board_profile.columns, board_profile.rows),
+            square=board_profile.tag_size_m,
             output_file=str(calibrations / "intrinsics.yaml"),
             camera_name=camera_name,
             media_source=snapshot_client.source_id,
@@ -104,11 +113,11 @@ def main():
             display_width=display_width,
             board_center=board_center,
             references_dir=str(calibrations / "intrinsic_refs"),
-            board_type=str(rospy.get_param("~board_type", "checkerboard")),
-            tag_spacing=float(rospy.get_param("~tag_spacing", 0.0)),
-            tag_family=str(rospy.get_param("~tag_family", "tag36h11")),
-            tag_start_id=int(rospy.get_param("~tag_start_id", 0)),
-            min_tags=int(rospy.get_param("~min_tags", 6)),
+            board_type="aprilgrid",
+            tag_spacing=board_profile.tag_gap_m,
+            tag_family=board_profile.tag_family,
+            tag_start_id=board_profile.start_id,
+            min_tags=board_profile.min_tags,
         )
         camera = maybe_camera_control(board_center)
         if camera is not None:

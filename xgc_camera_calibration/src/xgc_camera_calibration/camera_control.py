@@ -16,7 +16,49 @@ import copy
 import math
 import threading
 import time
+from pathlib import Path
 from typing import Dict, Optional, Sequence, Tuple
+
+from xgc_camera_calibration.board_profiles import AprilGridProfile
+
+
+def select_gazebo_board_profile(
+    profile: AprilGridProfile,
+    board_center: Sequence[float],
+    connection_timeout: float = 10.0,
+) -> None:
+    """Replace the calibration target with the selected exact-size model."""
+    import rospkg
+    import rospy
+    from gazebo_msgs.srv import DeleteModel, SpawnModel
+    from geometry_msgs.msg import Pose
+
+    package_root = rospkg.RosPack().get_path("gazebo_sim_worlds")
+    model_path = (
+        Path(package_root) / "models" / profile.gazebo_model / "model.sdf"
+    )
+    if not model_path.is_file():
+        raise RuntimeError("Gazebo calibration board model is unavailable: {}".format(model_path))
+    delete_name = "/gazebo/delete_model"
+    spawn_name = "/gazebo/spawn_sdf_model"
+    rospy.wait_for_service(delete_name, timeout=connection_timeout)
+    rospy.wait_for_service(spawn_name, timeout=connection_timeout)
+    delete = rospy.ServiceProxy(delete_name, DeleteModel)
+    spawn = rospy.ServiceProxy(spawn_name, SpawnModel)
+    try:
+        delete("intrinsic_aprilgrid")
+    except Exception:
+        pass
+    pose = Pose()
+    pose.position.x, pose.position.y, pose.position.z = (
+        float(board_center[0]), float(board_center[1]), float(board_center[2])
+    )
+    pose.orientation.w = 1.0
+    response = spawn(
+        "intrinsic_aprilgrid", model_path.read_text(encoding="utf-8"), "", pose, "world"
+    )
+    if not response.success:
+        raise RuntimeError("Could not spawn Gazebo calibration board: {}".format(response.status_message))
 
 
 def look_at_orientation(position, target, yaw_offset=0.0, pitch_offset=0.0, roll=0.0):
