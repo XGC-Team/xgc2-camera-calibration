@@ -924,6 +924,30 @@ class IntrinsicServiceTest(unittest.TestCase):
                 "progress": 0.92,
             })
 
+    def test_physical_candidate_can_complete_size_without_l1_novelty(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = make_service(Path(directory) / "intrinsics.yaml")
+            service.samples = [
+                (0.05, 0.05, 0.387, 0.1),
+                (0.85, 0.85, 0.387, 0.1),
+                (0.50, 0.50, 0.387, 0.1),
+            ]
+            completing = (0.50, 0.50, 0.401, 0.1)
+            insufficient = (0.50, 0.50, 0.399, 0.1)
+            self.assertFalse(
+                intrinsic_solver.is_new_sample(
+                    completing,
+                    service.samples,
+                    service.sample_distance,
+                )
+            )
+            self.assertTrue(
+                service._candidate_completes_spatial_coverage_locked(completing)
+            )
+            self.assertFalse(
+                service._candidate_completes_spatial_coverage_locked(insufficient)
+            )
+
     def test_accepted_corner_checkpoint_restores_an_interrupted_stage(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "intrinsics.yaml"
@@ -1494,10 +1518,16 @@ class IntrinsicServiceTest(unittest.TestCase):
                 return frame
 
             service.attach_frame_capture(capture)
-            first = service.validate_intrinsic(
-                {"kind": "raw"},
-                {"kind": "calibration", "calibration_id": calibration.name},
-            )
+            with patch.object(
+                intrinsic_validation,
+                "generate_intrinsic_comparison",
+                wraps=intrinsic_validation.generate_intrinsic_comparison,
+            ) as render:
+                first = service.validate_intrinsic(
+                    {"kind": "raw"},
+                    {"kind": "calibration", "calibration_id": calibration.name},
+                )
+            self.assertEqual(render.call_args.kwargs["jpeg_quality"], 95)
             self.assertEqual(captures, [1])
             self.assertEqual(first["schema"], "xgc2.camera.intrinsic-validation.v2")
             self.assertEqual(first["configurations"]["reference"], {"kind": "raw"})

@@ -267,7 +267,10 @@ def _apply_configuration(
     map_x, map_y = cv2.initUndistortRectifyMap(
         matrix, distortion, None, matrix, (width, height), cv2.CV_32FC1
     )
-    return cv2.remap(raw, map_x, map_y, cv2.INTER_LINEAR), (map_x, map_y)
+    # Validation is an explicit one-shot analysis product, not the live path.
+    # Prefer high-quality reconstruction over the lower-cost linear filter so
+    # source-native 4K detail survives the undistortion comparison.
+    return cv2.remap(raw, map_x, map_y, cv2.INTER_LANCZOS4), (map_x, map_y)
 
 
 def _remap_delta(

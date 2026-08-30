@@ -42,6 +42,7 @@ from xgc_camera_calibration.solver import CalibrationError
 from xgc_camera_calibration.web_service import ApiError
 
 APRILGRID_ADAPTIVE_DETECTION_WIDTH = 2200
+INTRINSIC_VALIDATION_MIN_JPEG_QUALITY = 95
 CAMERA_NAME_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9._-]{0,63}$")
 _TARGET_CAPTURE_TOKEN_UNSET = object()
 _SIM_TARGET_ANGLE_TOLERANCE_RAD = 0.04
@@ -415,6 +416,29 @@ class IntrinsicCalibrationService:
             for name in ("x_negative", "x_positive", "y_negative", "y_positive")
         )
 
+    def _candidate_completes_spatial_coverage_locked(
+        self,
+        params: Sequence[float],
+    ) -> bool:
+        """Allow one physical view that directly completes X, Y, or Size.
+
+        Ordinary L1 novelty prevents redundant solve samples, but it must not
+        make an explicit alignment target impossible to satisfy. This override
+        admits only a threshold-crossing candidate; incremental improvements
+        below the completion gate remain subject to ordinary novelty.
+        """
+        if not self.samples:
+            return False
+        current, _complete = intrinsic_solver.coverage(self.samples)
+        extended, _extended_complete = intrinsic_solver.coverage(
+            [*self.samples, tuple(float(value) for value in params)]
+        )
+        return any(
+            current[index]["progress"] < 1.0
+            and extended[index]["progress"] >= 1.0
+            for index in range(3)
+        )
+
     def _coverage_state_locked(self) -> Tuple[List[Dict[str, Any]], bool]:
         bars, generic_complete = intrinsic_solver.coverage(self.samples)
         if self.result is not None:
@@ -783,7 +807,10 @@ class IntrinsicCalibrationService:
                     comparison_document,
                     reference_calibration_id=reference_id,
                     comparison_calibration_id=comparison_id,
-                    jpeg_quality=self.jpeg_quality,
+                    jpeg_quality=max(
+                        self.jpeg_quality,
+                        INTRINSIC_VALIDATION_MIN_JPEG_QUALITY,
+                    ),
                 )
             except (ValueError, CalibrationError, cv2.error) as error:
                 raise ApiError(HTTPStatus.UNPROCESSABLE_ENTITY, str(error)) from error
@@ -1538,6 +1565,7 @@ class IntrinsicCalibrationService:
             accepted = False
             duplicate = False
             pose_coverage_override = False
+            spatial_coverage_override = False
             if detection is not None:
                 corners = detection.image_points
                 params = detection.coverage
@@ -1581,14 +1609,23 @@ class IntrinsicCalibrationService:
                         image_plane_novel = intrinsic_solver.is_new_sample(
                             params, self.samples, self.sample_distance
                         )
+                        spatial_coverage_override = (
+                            not image_plane_novel
+                            and self._candidate_completes_spatial_coverage_locked(params)
+                        )
                         pose_coverage_override = (
                             not image_plane_novel
+                            and not spatial_coverage_override
                             and self.board_type == "aprilgrid"
                             and self._candidate_extends_pose_coverage_locked(
                                 calibration_corners, calibration_objects
                             )
                         )
-                        accepted = image_plane_novel or pose_coverage_override
+                        accepted = (
+                            image_plane_novel
+                            or spatial_coverage_override
+                            or pose_coverage_override
+                        )
                         duplicate = not accepted
                     if accepted:
                         if self.board_type == "aprilgrid" and source_jpeg:
@@ -1626,6 +1663,17 @@ class IntrinsicCalibrationService:
                                     raise CalibrationError(
                                         "AprilGrid source-resolution correspondences are missing"
                                     )
+                                source_params = source_detection.coverage
+                                if (
+                                    spatial_coverage_override
+                                    and not self._candidate_completes_spatial_coverage_locked(
+                                        source_params
+                                    )
+                                ):
+                                    raise CalibrationError(
+                                        "AprilGrid source correspondences do not complete "
+                                        "the requested spatial coverage axis"
+                                    )
                                 if (
                                     pose_coverage_override
                                     and not self._candidate_extends_pose_coverage_locked(
@@ -1636,6 +1684,7 @@ class IntrinsicCalibrationService:
                                         "AprilGrid source correspondences do not fill a missing "
                                         "signed plane-normal bin"
                                     )
+                                params = source_params
                             except Exception as error:
                                 # Keep the live detection, but never admit a
                                 # solve sample containing mixed refined/raw

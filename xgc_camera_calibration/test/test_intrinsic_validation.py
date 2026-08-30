@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 import cv2
 import numpy as np
@@ -32,6 +33,23 @@ def intrinsic_document(
 
 
 class IntrinsicValidationTest(unittest.TestCase):
+    def test_calibrated_comparison_uses_high_quality_lanczos_remap(self):
+        raw = np.full((180, 320, 3), 91, dtype=np.uint8)
+        document = intrinsic_document(320, 180, -0.08, "2026-08-30T12:00:00Z")
+        with patch(
+            "xgc_camera_calibration.intrinsic_validation.cv2.remap",
+            wraps=cv2.remap,
+        ) as remap:
+            generate_intrinsic_comparison(
+                raw,
+                None,
+                document,
+                comparison_calibration_id="intrinsics-comparison.yaml",
+                jpeg_quality=95,
+            )
+        self.assertTrue(remap.called)
+        self.assertTrue(all(call.args[3] == cv2.INTER_LANCZOS4 for call in remap.call_args_list))
+
     def test_v2_compares_two_calibrations_on_one_source_native_frame(self):
         width, height = 640, 360
         raw = np.empty((height, width, 3), dtype=np.uint8)
