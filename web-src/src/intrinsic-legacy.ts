@@ -8,6 +8,7 @@ let displayedImageSequence = 0;
 let pendingImageSequence = 0;
 let imageRefreshInFlight = false;
 let displayedImageUrl = "";
+let currentCandidateId = "";
 
 async function postJSON(path, body) {
   try {
@@ -53,15 +54,23 @@ function renderBars(progress) {
   }
 }
 
-function renderResult(result) {
+function renderResult(result, phase) {
   const box = el("result");
   if (!result) { box.hidden = true; return; }
-  box.textContent = [
+  const lines = [
     `fx = ${result.fx.toFixed(2)}   fy = ${result.fy.toFixed(2)}`,
     `cx = ${result.cx.toFixed(2)}   cy = ${result.cy.toFixed(2)}`,
     `rms = ${result.rms_reprojection_error_px.toFixed(3)} px   (${result.sample_count} samples)`,
-    `saved: ${result.output_file}`,
-  ].join("\n");
+  ];
+  if (phase === "candidate_ready") {
+    const quality = result.quality || {};
+    lines.push(quality.status === "save_ready"
+      ? "candidate: independent stability checks passed"
+      : `candidate: ${quality.status || "review required"}`);
+  } else if (phase === "saved") {
+    lines.push(`saved: ${result.output_file}`);
+  }
+  box.textContent = lines.join("\n");
   box.hidden = false;
 }
 
@@ -99,10 +108,10 @@ function renderDetection(detection, board) {
   sample.textContent = !detected
     ? `${kind} is not fully visible in this frame.`
     : detection.accepted
-      ? "Accepted as a geometrically distinct sample."
+      ? "Added to the calibration candidate pool."
       : detection.duplicate
-        ? "Detected, but too similar to an existing sample."
-        : "Detected and ready for inspection.";
+        ? "This exact snapshot is already in the candidate pool."
+        : "Detected, but not admitted as strict calibration evidence.";
 }
 
 function applyState(s) {
@@ -112,23 +121,30 @@ function applyState(s) {
   if (action && action.status === "failed") {
     setStatus("Auto-run failed: " + (action.error || "camera control failed"));
   } else if (wasAutoRunning && !autoRunning) {
-    setStatus(`Auto-run done — ${s.samples} samples. Press Calibrate.`);
+    setStatus(`Auto-run done — ${s.samples} observations analyzed.`);
   }
+  const phase = s.phase;
+  const candidate = phase === "candidate_ready" ? s.candidate : null;
+  currentCandidateId = candidate && candidate.candidate_id || "";
   el("conn").textContent = "connected";
   el("conn").className = "legacy-state-source pill pill-on";
   el("samples").textContent = `${s.samples} samples`;
   renderBars(s.coverage || []);
 
-  el("btn-calibrate").disabled = autoRunning || !(s.goodenough && !s.calibrated);
+  const poolCount = Number(s.candidate_pool && s.candidate_pool.count) || 0;
+  el("btn-candidate").disabled = autoRunning || phase !== "collecting" || poolCount < 3;
+  el("btn-save").disabled = autoRunning || phase !== "candidate_ready"
+    || !candidate || !candidate.quality || candidate.quality.status !== "save_ready";
+  el("btn-continue").disabled = autoRunning || phase !== "candidate_ready";
   el("btn-reset").disabled = autoRunning;
-  renderResult(s.result);
+  renderResult(phase === "saved" ? s.result : candidate, phase);
   renderPose(s.pose);
   renderDetection(s.detection, s.board);
   queueImageRefresh(s.detection, s.image_ready);
 
   scene.control = !!s.camera_control;
-  el("btn-reset-pose").disabled = !scene.control || autoRunning;
-  el("btn-auto").disabled = !scene.control || autoRunning;
+  el("btn-reset-pose").disabled = !scene.control || autoRunning || phase !== "collecting";
+  el("btn-auto").disabled = !scene.control || autoRunning || phase !== "collecting";
   scene.cam = s.pose || null;
   if (s.targets) scene.targets = s.targets;
   scene.next = (s.next === undefined ? null : s.next);
@@ -184,10 +200,26 @@ async function refreshImage() {
 }
 
 function wireButtons() {
-  el("btn-calibrate").addEventListener("click", async () => {
-    setStatus("Calibrating…");
-    const r = await postJSON("api/v1/intrinsic/calibrate");
-    setStatus(r.ok === false ? (r.error || "Not enough coverage yet.") : "Calibrated and saved.");
+  el("btn-candidate").addEventListener("click", async () => {
+    setStatus("Analyzing the candidate pool…");
+    const r = await postJSON("api/v1/intrinsic/candidate");
+    setStatus(r.ok === false ? (r.error || "Candidate analysis failed.")
+      : r.quality && r.quality.status === "save_ready"
+        ? "Candidate stability checks passed."
+        : "Candidate needs more diverse observations.");
+    poll();
+  });
+  el("btn-save").addEventListener("click", async () => {
+    if (!currentCandidateId) return;
+    setStatus("Saving the validated candidate…");
+    const r = await postJSON("api/v1/intrinsic/save", { candidate_id: currentCandidateId });
+    setStatus(r.ok === false ? (r.error || "Save failed.") : "Calibration saved.");
+    poll();
+  });
+  el("btn-continue").addEventListener("click", async () => {
+    const r = await postJSON("api/v1/intrinsic/continue");
+    setStatus(r.ok === false ? (r.error || "Could not continue collecting.")
+      : "Candidate discarded; the observation pool is still available.");
     poll();
   });
   el("btn-reset").addEventListener("click", async () => {
@@ -208,7 +240,7 @@ function wireButtons() {
       setStatus("Auto-run accepted: sweeping every pose…");
     } else {
       autoRunning = false;
-      setStatus(r && r.ok ? `Auto-run done — ${r.samples} samples. Press Calibrate.` : (r.error || "Auto-run failed."));
+      setStatus(r && r.ok ? `Auto-run done — ${r.samples} observations analyzed.` : (r.error || "Auto-run failed."));
     }
     poll();
   });
@@ -306,7 +338,7 @@ function updateRefPanel() {
   if (idx == null || !targets[idx]) {
     nameEl.textContent = (targets.length && done === targets.length) ? "all captured ✓" : "—";
     img.hidden = true; hint.hidden = false;
-    hint.textContent = (targets.length && done === targets.length) ? "Coverage complete — Calibrate." : "Waiting…";
+    hint.textContent = (targets.length && done === targets.length) ? "Authored views captured — review the candidate." : "Waiting…";
     return;
   }
   const t = targets[idx];

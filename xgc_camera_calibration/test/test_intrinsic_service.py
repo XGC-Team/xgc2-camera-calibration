@@ -70,14 +70,22 @@ def render_aprilgrid_view(center_pixel, depth_m, rotation_vector):
         APRILGRID_TEST_SIZE[1] * tag_pixels
         + (APRILGRID_TEST_SIZE[1] - 1) * gap_pixels
     )
+    printed_width = content_width + 2 * gap_pixels
+    printed_height = content_height + 2 * gap_pixels
     board = np.full(
-        (content_height + 2 * margin, content_width + 2 * margin),
+        (printed_height + 2 * margin, printed_width + 2 * margin),
         255,
         dtype=np.uint8,
     )
-    for row in range(APRILGRID_TEST_SIZE[1]):
+    for row in range(APRILGRID_TEST_SIZE[1] + 1):
+        for col in range(APRILGRID_TEST_SIZE[0] + 1):
+            y0 = margin + row * pitch_pixels
+            x0 = margin + col * pitch_pixels
+            board[y0:y0 + gap_pixels, x0:x0 + gap_pixels] = 0
+    for visual_row in range(APRILGRID_TEST_SIZE[1]):
         for col in range(APRILGRID_TEST_SIZE[0]):
-            marker_id = row * APRILGRID_TEST_SIZE[0] + col
+            tag_row = APRILGRID_TEST_SIZE[1] - 1 - visual_row
+            marker_id = tag_row * APRILGRID_TEST_SIZE[0] + col
             if hasattr(cv2.aruco, "generateImageMarker"):
                 marker = cv2.aruco.generateImageMarker(
                     dictionary, marker_id, tag_pixels, None, 2
@@ -86,8 +94,9 @@ def render_aprilgrid_view(center_pixel, depth_m, rotation_vector):
                 marker = cv2.aruco.drawMarker(
                     dictionary, marker_id, tag_pixels, borderBits=2
                 )
-            y0 = margin + row * pitch_pixels
-            x0 = margin + col * pitch_pixels
+            marker = np.rot90(marker, 2)
+            y0 = margin + gap_pixels + visual_row * pitch_pixels
+            x0 = margin + gap_pixels + col * pitch_pixels
             board[y0:y0 + tag_pixels, x0:x0 + tag_pixels] = marker
 
     board_width = (
@@ -100,13 +109,11 @@ def render_aprilgrid_view(center_pixel, depth_m, rotation_vector):
         + (APRILGRID_TEST_SIZE[1] - 1)
         * (APRILGRID_TEST_TAG_SIZE + APRILGRID_TEST_TAG_GAP)
     )
+    lo = float(margin + gap_pixels) - 0.5
+    hi_x = lo + float(content_width)
+    hi_y = lo + float(content_height)
     source = np.asarray(
-        (
-            (margin - 0.5, margin - 0.5),
-            (margin - 0.5 + content_width, margin - 0.5),
-            (margin - 0.5 + content_width, margin - 0.5 + content_height),
-            (margin - 0.5, margin - 0.5 + content_height),
-        ),
+        ((lo, hi_y), (hi_x, hi_y), (hi_x, lo), (lo, lo)),
         dtype=np.float32,
     )
     boundary = np.asarray(
@@ -118,8 +125,11 @@ def render_aprilgrid_view(center_pixel, depth_m, rotation_vector):
         ),
         dtype=np.float32,
     )
-    rotation_vector = np.asarray(rotation_vector, dtype=np.float64)
-    rotation = cv2.Rodrigues(rotation_vector)[0]
+    delta_rotation = cv2.Rodrigues(
+        np.asarray(rotation_vector, dtype=np.float64)
+    )[0]
+    rotation = delta_rotation.dot(np.diag((1.0, -1.0, -1.0)))
+    rvec = cv2.Rodrigues(rotation)[0].reshape(3)
     board_center = np.asarray((board_width / 2.0, board_height / 2.0, 0.0))
     u, v = center_pixel
     camera_center = np.asarray(
@@ -132,7 +142,7 @@ def render_aprilgrid_view(center_pixel, depth_m, rotation_vector):
     translation = camera_center - rotation.dot(board_center)
     projected, _jacobian = cv2.projectPoints(
         boundary,
-        rotation_vector,
+        rvec,
         translation,
         APRILGRID_TEST_K,
         np.zeros(5, dtype=np.float64),
@@ -162,6 +172,85 @@ def make_service(output_file, **kwargs):
         camera_name="usb_cam",
         media_source="usb_cam", display_width=640,
         **kwargs,
+    )
+
+
+def make_diagnostic_result(
+    image_size,
+    sample_count,
+    *,
+    rank_deficient=False,
+    failed=(),
+    held_out_rms_max=0.405,
+    ray_max=0.008,
+):
+    parameter_names = ("fx", "fy", "cx", "cy", "k1", "k2", "p1", "p2", "k3")
+    folds = tuple(
+        intrinsic_solver.IntrinsicFoldEstimate(
+            omitted_view_index=index,
+            rms_reprojection_error_px=0.4,
+            parameters=(638.0, 637.0, 600.0, 390.0, 0.01, -0.02, 0.0, 0.0, 0.0),
+            held_out_rms_reprojection_error_px=held_out_rms_max,
+            held_out_mean_reprojection_error_px=0.4,
+            held_out_max_reprojection_error_px=0.42,
+            held_out_point_errors_px=(0.39, 0.40, 0.42),
+            held_out_rotation_vector=(0.0, 0.0, 0.0),
+            held_out_translation_vector=(0.0, 0.0, 1.0),
+            undistorted_ray_rms_equivalent_px=0.005,
+            undistorted_ray_max_equivalent_px=ray_max,
+        )
+        for index in range(sample_count)
+        if index not in failed
+    )
+    stability = intrinsic_solver.IntrinsicStabilityDiagnostics(
+        method="leave_one_view_out",
+        parameter_names=parameter_names,
+        reference_parameters=folds[0].parameters if folds else (0.0,) * 9,
+        folds=folds,
+        failed_omitted_view_indices=tuple(failed),
+        parameter_standard_deviation=(0.0,) * 9 if folds else None,
+        parameter_span=(0.0,) * 9 if folds else None,
+        maximum_absolute_delta=(0.0,) * 9 if folds else None,
+        maximum_relative_delta=(0.0,) * 9 if folds else None,
+        held_out_rms_mean_px=0.405 if folds else None,
+        held_out_rms_max_px=held_out_rms_max if folds else None,
+        undistorted_ray_rms_equivalent_px=0.005 if folds else None,
+        undistorted_ray_max_equivalent_px=ray_max if folds else None,
+    )
+    diagnostics = intrinsic_solver.IntrinsicCalibrationDiagnostics(
+        finite=True,
+        parameter_names=parameter_names,
+        per_view_errors_px=(0.4,) * sample_count,
+        intrinsic_standard_deviations=(0.01,) * 9,
+        rotation_vectors=((0.0, 0.0, 0.0),) * sample_count,
+        translation_vectors=((0.0, 0.0, 1.0),) * sample_count,
+        projected_intrinsic_rank=8 if rank_deficient else 9,
+        projected_intrinsic_parameter_count=9,
+        projected_intrinsic_rank_deficient=rank_deficient,
+        projected_intrinsic_condition_number=float("inf") if rank_deficient else 500.0,
+        projected_intrinsic_rank_tolerance=1e-12,
+        projected_intrinsic_singular_values=(1.0,) * (8 if rank_deficient else 9),
+        projected_intrinsic_column_norms=(1.0,) * 9,
+        stability=stability,
+        pool_sample_count=sample_count,
+        selected_view_indices=tuple(range(sample_count)),
+        rejected_views=(),
+        initial_per_view_errors_px=(0.4,) * sample_count,
+        observation_uncertainty_px=intrinsic_solver.observation_uncertainty_px(
+            "checkerboard"
+        ),
+    )
+    return intrinsic_solver.IntrinsicResult(
+        camera_matrix=np.array([
+            [638.0, 0.0, 600.0],
+            [0.0, 637.0, 390.0],
+            [0.0, 0.0, 1.0],
+        ]),
+        distortion=np.array([0.01, -0.02, 0.0, 0.0, 0.0]),
+        image_size=image_size,
+        rms_reprojection_error_px=0.4,
+        sample_count=sample_count,
+        diagnostics=diagnostics,
     )
 
 
@@ -646,7 +735,7 @@ class IntrinsicServiceTest(unittest.TestCase):
             )
             self.assertEqual(service.state()["detection"]["corner_count"], 4)
 
-    def test_source_jpeg_must_confirm_the_working_signed_pose_candidate(self):
+    def test_source_jpeg_refinement_is_the_candidate_pool_authority(self):
         if not hasattr(cv2, "aruco") or not hasattr(cv2.aruco, "DICT_APRILTAG_36h11"):
             self.skipTest("OpenCV AprilTag 36h11 dictionary is unavailable")
         with tempfile.TemporaryDirectory() as directory:
@@ -667,7 +756,6 @@ class IntrinsicServiceTest(unittest.TestCase):
             ):
                 service.process_frame(render_aprilgrid_view(center, depth, rotation))
             self.assertEqual(len(service.samples), 3)
-            self.assertEqual(service.state()["pose_coverage"]["status"], "ready")
 
             frontal_source = render_aprilgrid_view(
                 (640, 360), 1.50, (0.00, 0.00, 0.00)
@@ -695,21 +783,17 @@ class IntrinsicServiceTest(unittest.TestCase):
                 source_image_size=APRILGRID_TEST_IMAGE_SIZE,
                 source_jpeg=stale_jpeg.tobytes(),
             )
-            rejected = service.state()
+            admitted = service.state()
             self.assertEqual(
                 (
                     len(service.samples),
                     len(service.image_points),
                     len(service.object_points),
                 ),
-                baseline_lengths,
+                tuple(value + 1 for value in baseline_lengths),
             )
-            self.assertFalse(rejected["detection"]["accepted"])
-            self.assertEqual(
-                rejected["recovery"]["last_error"],
-                "AprilGrid source correspondences do not fill a missing signed "
-                "plane-normal bin",
-            )
+            self.assertTrue(admitted["detection"]["accepted"])
+            self.assertIsNone(admitted["recovery"]["last_error"])
 
             matching_ok, matching_jpeg = cv2.imencode(
                 ".jpg", positive_x_source, (cv2.IMWRITE_JPEG_QUALITY, 94)
@@ -721,26 +805,29 @@ class IntrinsicServiceTest(unittest.TestCase):
                 source_jpeg=matching_jpeg.tobytes(),
             )
             accepted = service.state()
-            self.assertEqual(len(service.samples), baseline_lengths[0] + 1)
-            self.assertEqual(len(service.image_points), baseline_lengths[1] + 1)
-            self.assertEqual(len(service.object_points), baseline_lengths[2] + 1)
+            self.assertEqual(len(service.samples), baseline_lengths[0] + 2)
+            self.assertEqual(len(service.image_points), baseline_lengths[1] + 2)
+            self.assertEqual(len(service.object_points), baseline_lengths[2] + 2)
             self.assertTrue(accepted["detection"]["accepted"])
-            self.assertTrue(accepted["pose_coverage"]["bins"]["x_positive"])
             self.assertIsNone(accepted["recovery"]["last_error"])
 
-    def test_repeated_board_frame_reports_geometric_duplicate(self):
+    def test_only_an_explicit_snapshot_identity_is_deduplicated(self):
         with tempfile.TemporaryDirectory() as directory:
             service = make_service(Path(directory) / "intrinsics.yaml")
             frame = render_board()
-            service.process_frame(frame)
-            service.process_frame(frame)
+            service.process_frame(frame, source_snapshot_id="snapshot-1")
+            service.process_frame(frame, source_snapshot_id="snapshot-1")
             state = service.state()
             self.assertEqual(state["samples"], 1)
             self.assertEqual(state["detection"]["status"], "detected")
             self.assertFalse(state["detection"]["accepted"])
             self.assertTrue(state["detection"]["duplicate"])
 
-    def test_physical_aprilgrid_completion_requires_signed_plane_tilt(self):
+            service.process_frame(frame, source_snapshot_id="snapshot-2")
+            service.process_frame(frame)
+            self.assertEqual(service.state()["samples"], 3)
+
+    def test_physical_candidate_pool_keeps_thirty_plus_strict_observations(self):
         if not hasattr(cv2, "aruco") or not hasattr(cv2.aruco, "DICT_APRILTAG_36h11"):
             self.skipTest("OpenCV AprilTag 36h11 dictionary is unavailable")
         with tempfile.TemporaryDirectory() as directory:
@@ -752,65 +839,21 @@ class IntrinsicServiceTest(unittest.TestCase):
                 tag_spacing=APRILGRID_TEST_TAG_GAP, min_tags=6,
                 display_width=640,
             )
-            # Seed provisional K through ordinary image-plane novelty without
-            # filling any >=10 degree signed tilt bin.
-            seed_views = (
-                ((640, 360), 1.50, (0.00, 0.00, 0.00)),
-                ((300, 360), 1.50, (0.08, 0.00, 0.00)),
-                ((640, 180), 1.05, (0.00, 0.08, 0.00)),
-            )
-            for center, depth, rotation in seed_views:
-                service.process_frame(render_aprilgrid_view(center, depth, rotation))
-            self.assertEqual(len(service.samples), 3)
-            self.assertFalse(any(
-                service.state()["pose_coverage"]["bins"][name]
-                for name in ("x_negative", "x_positive", "y_negative", "y_positive")
+            frame = render_aprilgrid_view((640, 360), 1.50, (0.0, 0.2, 0.0))
+            history = []
+            for index in range(32):
+                service.process_frame(frame, source_snapshot_id="snapshot-{}".format(index))
+                history.append([
+                    item["progress"] for item in service.state()["coverage"]
+                ])
+
+            self.assertEqual(service.state()["samples"], 32)
+            self.assertEqual(service.state()["candidate_pool"]["count"], 32)
+            self.assertTrue(all(
+                current[axis] >= previous[axis]
+                for previous, current in zip(history, history[1:])
+                for axis in range(4)
             ))
-
-            # All four production frames have nearly the same centre/depth and
-            # old 4D footprint, but each missing normal sign remains admissible.
-            service.process_frame(
-                render_aprilgrid_view((640, 360), 1.50, (0.00, 0.35, 0.00))
-            )
-            self.assertEqual(len(service.samples), 4)
-            self.assertLess(
-                sum(abs(a - b) for a, b in zip(service.samples[0], service.samples[3])),
-                service.sample_distance,
-            )
-
-            # A nearby observation in the already-covered x-positive bin is a
-            # genuine duplicate and must not receive the signed-bin override.
-            service.process_frame(
-                render_aprilgrid_view((640, 360), 1.50, (0.00, 0.36, 0.00))
-            )
-            self.assertEqual(len(service.samples), 4)
-            self.assertTrue(service.state()["detection"]["duplicate"])
-
-            for rotation in (
-                (0.00, -0.35, 0.00),
-                (0.35, 0.00, 0.00),
-                (-0.35, 0.00, 0.00),
-            ):
-                service.process_frame(
-                    render_aprilgrid_view((640, 360), 1.50, rotation)
-                )
-
-            state = service.state()
-            self.assertEqual(state["samples"], 7)
-            self.assertEqual(state["pose_coverage"]["status"], "ready")
-            self.assertTrue(state["pose_coverage"]["bins"]["complete"])
-            self.assertLess(
-                sum(abs(a - b) for a, b in zip(service.samples[3], service.samples[4])),
-                service.sample_distance,
-            )
-            self.assertLess(
-                sum(abs(a - b) for a, b in zip(service.samples[5], service.samples[6])),
-                service.sample_distance,
-            )
-            self.assertEqual(
-                next(item for item in state["coverage"] if item["label"] == "Skew")["progress"],
-                1.0,
-            )
 
     def test_non_board_frame_adds_no_sample(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -823,6 +866,99 @@ class IntrinsicServiceTest(unittest.TestCase):
                 "frame_width": 320, "frame_height": 200, "sequence": 1, "metrics": [],
                 "accepted": False, "duplicate": False,
             })
+
+    def test_first_candidate_freezes_resolution_and_mismatches_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = make_service(Path(directory) / "intrinsics.yaml")
+            service.process_frame(np.full((720, 1280, 3), 127, np.uint8))
+            self.assertIsNone(service.image_size)
+
+            frame = render_board()
+            service.process_frame(frame, source_snapshot_id="first")
+            frozen = (frame.shape[1], frame.shape[0])
+            self.assertEqual(service.image_size, frozen)
+            self.assertEqual(service.state()["samples"], 1)
+
+            larger = cv2.resize(frame, (frame.shape[1] * 2, frame.shape[0] * 2))
+            service.process_frame(larger, source_snapshot_id="wrong-size")
+            state = service.state()
+            self.assertEqual(service.image_size, frozen)
+            self.assertEqual(state["samples"], 1)
+            self.assertFalse(state["detection"]["accepted"])
+            self.assertIn("do not match the frozen", state["recovery"]["last_error"])
+
+            service.reset()
+            self.assertIsNone(service.image_size)
+
+    def test_rank_deficient_candidate_is_structured_and_never_persisted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory) / "intrinsics.yaml"
+            service = make_service(base)
+            frame = render_board()
+            for index in range(3):
+                service.process_frame(
+                    frame, source_snapshot_id="weak-{}".format(index)
+                )
+            checkpoint = Path(service.checkpoint_file)
+            self.assertTrue(checkpoint.is_file())
+            weak = make_diagnostic_result(
+                (frame.shape[1], frame.shape[0]), 3, rank_deficient=True
+            )
+            with patch.object(intrinsic_solver, "calibrate_intrinsic", return_value=weak):
+                with self.assertRaises(ApiError) as caught:
+                    service.calibrate()
+            self.assertEqual(caught.exception.status, int(HTTPStatus.UNPROCESSABLE_ENTITY))
+            self.assertEqual(
+                caught.exception.details["code"], "intrinsic_candidate_unstable"
+            )
+            self.assertIn(
+                "projected_intrinsic_rank_deficient",
+                caught.exception.details["reasons"],
+            )
+            self.assertEqual(
+                caught.exception.details["save_blocked"],
+                "stability_validation_failed",
+            )
+            self.assertTrue(checkpoint.is_file())
+            self.assertFalse(base.exists())
+            self.assertEqual(list(Path(directory).glob("intrinsics-*.yaml")), [])
+
+    def test_normalized_ray_instability_blocks_explicit_save(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory) / "intrinsics.yaml"
+            service = make_service(base)
+            frame = render_board()
+            for index in range(3):
+                service.process_frame(frame, source_snapshot_id="ray-{}".format(index))
+            unstable = make_diagnostic_result(
+                (frame.shape[1], frame.shape[0]), 3, ray_max=214.0
+            )
+            with patch.object(
+                intrinsic_solver, "calibrate_intrinsic", return_value=unstable
+            ):
+                candidate = service.calibrate()
+            self.assertEqual(candidate["quality"]["status"], "unstable")
+            self.assertIn(
+                "normalized_ray_stability_exceeds_confidence_envelope",
+                candidate["quality"]["reasons"],
+            )
+            with self.assertRaises(ApiError) as caught:
+                service.save(candidate["candidate_id"])
+            self.assertEqual(caught.exception.status, int(HTTPStatus.UNPROCESSABLE_ENTITY))
+            self.assertIn(
+                "normalized_ray_stability_exceeds_confidence_envelope",
+                caught.exception.details["reasons"],
+            )
+            self.assertGreater(
+                caught.exception.details["assessment"][
+                    "undistorted_ray_max_equivalent_px"
+                ],
+                caught.exception.details["assessment"][
+                    "normalized_ray_confidence_limit_px"
+                ],
+            )
+            self.assertFalse(base.exists())
+            self.assertEqual(service.state()["phase"], "candidate_ready")
 
     def test_calibrate_without_samples_conflicts(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -888,7 +1024,7 @@ class IntrinsicServiceTest(unittest.TestCase):
                 "progress": 0.817,
             })
 
-    def test_physical_guidance_finishes_spatial_coverage_before_signed_tilt(self):
+    def test_physical_guidance_uses_monotonic_image_plane_coverage(self):
         with tempfile.TemporaryDirectory() as directory:
             service = IntrinsicCalibrationService(
                 board_size=(2, 2),
@@ -919,34 +1055,21 @@ class IntrinsicServiceTest(unittest.TestCase):
             self.assertEqual(state["coverage"], final_bars)
             self.assertEqual(state["guidance"], {
                 "complete": False,
-                "dimension": "Y",
-                "direction": "top",
-                "progress": 0.92,
+                "dimension": "Skew",
+                "direction": "tilt",
+                "progress": 0.5,
             })
 
-    def test_physical_candidate_can_complete_size_without_l1_novelty(self):
+    def test_l1_proximity_never_rejects_candidate_observations(self):
         with tempfile.TemporaryDirectory() as directory:
             service = make_service(Path(directory) / "intrinsics.yaml")
-            service.samples = [
-                (0.05, 0.05, 0.387, 0.1),
-                (0.85, 0.85, 0.387, 0.1),
-                (0.50, 0.50, 0.387, 0.1),
-            ]
-            completing = (0.50, 0.50, 0.401, 0.1)
-            insufficient = (0.50, 0.50, 0.399, 0.1)
-            self.assertFalse(
-                intrinsic_solver.is_new_sample(
-                    completing,
-                    service.samples,
-                    service.sample_distance,
-                )
-            )
-            self.assertTrue(
-                service._candidate_completes_spatial_coverage_locked(completing)
-            )
-            self.assertFalse(
-                service._candidate_completes_spatial_coverage_locked(insufficient)
-            )
+            frame = render_board()
+            service.process_frame(frame)
+            service.process_frame(frame)
+            service.process_frame(frame)
+            self.assertEqual(service.state()["samples"], 3)
+            self.assertTrue(service.state()["detection"]["accepted"])
+            self.assertFalse(service.state()["detection"]["duplicate"])
 
     def test_accepted_corner_checkpoint_restores_an_interrupted_stage(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -962,8 +1085,9 @@ class IntrinsicServiceTest(unittest.TestCase):
             self.assertEqual(len(restored.image_points), 1)
             self.assertEqual(len(restored.object_points), 1)
             self.assertEqual(restored.sample_target_ids, [None])
+            self.assertEqual(restored.sample_snapshot_ids, [""])
             self.assertTrue(state["recovery"]["checkpoint_available"])
-            self.assertFalse(state["result_restored"])
+            self.assertNotIn("result_restored", state)
 
     def test_checkpoint_restores_exact_simulation_target_identity(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1023,7 +1147,7 @@ class IntrinsicServiceTest(unittest.TestCase):
             self.assertIn("incompatible observation feature model", state["recovery"]["last_error"])
             self.assertTrue(state["recovery"]["checkpoint_available"])
 
-    def test_saved_result_restores_without_recollecting_samples(self):
+    def test_legacy_result_without_quality_contract_is_not_restored(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory) / "intrinsics.yaml"
             output = Path(directory) / "intrinsics-20260830T120000.000000Z.yaml"
@@ -1039,24 +1163,19 @@ class IntrinsicServiceTest(unittest.TestCase):
             restored = make_service(base)
             restored.attach_frame_capture(lambda: render_board())
             state = restored.state()
-            self.assertTrue(state["calibrated"])
-            self.assertTrue(state["result_restored"])
-            self.assertEqual(state["samples"], 40)
-            self.assertAlmostEqual(state["result"]["fx"], 638.0)
-            self.assertTrue(all(item["progress"] == 1.0 for item in state["coverage"]))
-            self.assertEqual(state["guidance"], {
-                "complete": True,
-                "dimension": None,
-                "direction": "complete",
-                "progress": 1.0,
-            })
+            self.assertEqual(state["phase"], "collecting")
+            self.assertEqual(state["samples"], 0)
+            self.assertNotIn("result", state)
+            self.assertNotIn("output_file", state)
+            history = restored.calibration_history()
+            self.assertIsNone(history["selected"])
+            self.assertFalse(history["items"][0]["validated"])
             restored_capture = restored.start_auto_capture(interval=0.1)["auto_capture"]
-            self.assertFalse(restored_capture["enabled"])
-            self.assertTrue(restored_capture["coverage_complete"])
+            self.assertTrue(restored_capture["enabled"])
 
             restored.reset()
             self.assertTrue(output.exists())
-            self.assertFalse(restored.state()["calibrated"])
+            self.assertEqual(restored.state()["phase"], "collecting")
             self.assertEqual(restored.state()["samples"], 0)
             self.assertTrue(restored.state()["auto_capture"]["enabled"])
             restored.stop_auto_capture()
@@ -1078,17 +1197,43 @@ class IntrinsicServiceTest(unittest.TestCase):
             )
             intrinsic_solver.save_intrinsic(
                 older,older_result,camera_name="usb_cam",board_size=(7, 5),square=0.20,
+                metadata={
+                    "quality_contract": "xgc2.camera.intrinsic-quality.v2",
+                    "candidate_id": "intrinsic-candidate-older",
+                    "stability_assessment": {"passed": True},
+                    "coverage": [
+                        {"label": "X", "progress": 0.8},
+                        {"label": "Y", "progress": 0.9},
+                        {"label": "Size", "progress": 0.7},
+                        {"label": "Skew", "progress": 0.6},
+                    ],
+                },
             )
             intrinsic_solver.save_intrinsic(
                 newer,newer_result,camera_name="usb_cam",board_size=(7, 5),square=0.20,
+                metadata={
+                    "quality_contract": "xgc2.camera.intrinsic-quality.v2",
+                    "candidate_id": "intrinsic-candidate-newer",
+                    "stability_assessment": {"passed": True},
+                    "coverage": [
+                        {"label": "X", "progress": 0.8},
+                        {"label": "Y", "progress": 0.9},
+                        {"label": "Size", "progress": 0.7},
+                        {"label": "Skew", "progress": 0.6},
+                    ],
+                },
             )
 
             restored = make_service(base)
             state = restored.state()
+            self.assertEqual(state["phase"], "saved")
             self.assertTrue(state["result_restored"])
             self.assertEqual(state["output_file"], str(newer))
             self.assertEqual(state["result"]["output_file"], str(newer))
             self.assertAlmostEqual(state["result"]["fx"], 742.0)
+            self.assertEqual(state["saved_candidate_id"], "intrinsic-candidate-newer")
+            self.assertEqual(state["coverage"][0]["progress"], 0.8)
+            self.assertFalse(state["guidance"]["complete"])
 
     def test_in_progress_checkpoint_takes_precedence_over_an_older_saved_result(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1098,7 +1243,9 @@ class IntrinsicServiceTest(unittest.TestCase):
             stage.image_points = [np.zeros((35, 1, 2), dtype=np.float32)]
             stage.object_points = [np.zeros((35, 3), dtype=np.float32)]
             stage.sample_target_ids = [None]
+            stage.sample_snapshot_ids = [""]
             stage.image_size = (1280, 720)
+            stage.collection_revision = 1
             with stage.lock:
                 stage._save_checkpoint_locked()
 
@@ -1122,40 +1269,111 @@ class IntrinsicServiceTest(unittest.TestCase):
 
             restored = make_service(base)
             state = restored.state()
-            self.assertFalse(state["calibrated"])
-            self.assertFalse(state["result_restored"])
+            self.assertEqual(state["phase"], "collecting")
+            self.assertNotIn("result", state)
             self.assertEqual(state["samples"], 1)
             self.assertEqual(restored.samples, stage.samples)
-            self.assertEqual(state["output_file"], str(base))
+            self.assertNotIn("output_file", state)
 
-    def test_calibrate_writes_timestamped_version_and_reset_preserves_it(self):
+    def test_calibrate_produces_immutable_candidate_without_writing_an_asset(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory) / "intrinsics.yaml"
             service = make_service(base)
             service.image_points = [np.zeros((35, 1, 2), dtype=np.float32)]
             service.object_points = [np.zeros((35, 3), dtype=np.float32)]
+            service.samples = [(0.2, 0.3, 0.4, 0.1)]
+            service.sample_target_ids = [None]
+            service.sample_snapshot_ids = [""]
             service.image_size = (1280, 720)
-            result = intrinsic_solver.IntrinsicResult(
-                camera_matrix=np.array([[638.0, 0.0, 600.0], [0.0, 637.0, 390.0], [0.0, 0.0, 1.0]]),
-                distortion=np.array([0.01, -0.02, 0.0, 0.0, 0.0]),
-                image_size=(1280, 720), rms_reprojection_error_px=0.9, sample_count=1,
-            )
+            service.collection_revision = 1
+            result = make_diagnostic_result((1280, 720), 1)
             with patch.object(intrinsic_solver, "calibrate_intrinsic", return_value=result):
-                solved = service.calibrate()
+                candidate = service.calibrate()
 
-            saved = Path(solved["output_file"])
-            self.assertRegex(saved.name, r"^intrinsics-\d{8}T\d{6}\.\d{6}Z\.yaml$")
-            self.assertTrue(saved.is_file())
+            self.assertFalse(candidate["saved"])
+            self.assertIsNone(candidate["output_file"])
+            self.assertEqual(
+                candidate["save_blocked"], "explicit_save_required"
+            )
+            self.assertEqual(candidate["quality"]["status"], "save_ready")
+            self.assertTrue(candidate["quality"]["assessment"]["passed"])
+            self.assertEqual(
+                candidate["diagnostics"]["stability"]["folds"][0][
+                    "held_out_rms_reprojection_error_px"
+                ],
+                0.405,
+            )
             self.assertFalse(base.exists())
-            saved_document = intrinsic_solver.load_intrinsic(saved)
-            self.assertEqual(saved_document["camera_name"], "usb_cam")
-            self.assertEqual(saved_document["metadata"]["camera_name"], "usb_cam")
+            self.assertEqual(list(Path(directory).glob("intrinsics-*.yaml")), [])
+            self.assertEqual(service.state()["phase"], "candidate_ready")
+            self.assertNotIn("result", service.state())
+            self.assertNotIn("output_file", service.state())
+            self.assertTrue(service.state()["candidate_pool"]["solve_frozen"])
+            self.assertEqual(service.calibrate(), candidate)
+            service.process_frame(render_board(), source_snapshot_id="after-solve")
+            self.assertEqual(service.state()["samples"], 1)
+            self.assertEqual(service.state()["candidate"], candidate)
 
             reset = service.reset()
             self.assertEqual(reset["samples"], 0)
-            self.assertFalse(reset["calibrated"])
-            self.assertTrue(saved.is_file())
-            self.assertEqual(reset["output_file"], str(base))
+            self.assertEqual(reset["phase"], "collecting")
+            self.assertNotIn("candidate", reset)
+            self.assertIsNone(service.image_size)
+            self.assertNotIn("output_file", reset)
+
+    def test_continue_retains_pool_and_new_observation_changes_candidate_cas(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = make_service(Path(directory) / "intrinsics.yaml")
+            frame = render_board()
+            service.process_frame(frame, source_snapshot_id="one")
+            first_result = make_diagnostic_result(
+                (frame.shape[1], frame.shape[0]), 1
+            )
+            with patch.object(
+                intrinsic_solver, "calibrate_intrinsic", return_value=first_result
+            ):
+                first = service.calibrate()
+            first_session_revision = service.state()["session_revision"]
+            with self.assertRaises(ApiError) as stale:
+                service.save("intrinsic-candidate-stale")
+            self.assertEqual(stale.exception.status, int(HTTPStatus.CONFLICT))
+
+            continued = service.continue_collection()
+            self.assertEqual(continued["phase"], "collecting")
+            self.assertEqual(continued["samples"], 1)
+            self.assertNotIn("candidate", continued)
+            self.assertGreater(continued["session_revision"], first_session_revision)
+            with patch.object(
+                intrinsic_solver, "calibrate_intrinsic", return_value=first_result
+            ):
+                replay = service.calibrate()
+            self.assertNotEqual(replay["candidate_id"], first["candidate_id"])
+            service.continue_collection()
+            service.process_frame(frame, source_snapshot_id="two")
+            self.assertEqual(service.state()["collection_revision"], 2)
+
+            second_result = make_diagnostic_result(
+                (frame.shape[1], frame.shape[0]), 2
+            )
+            with patch.object(
+                intrinsic_solver, "calibrate_intrinsic", return_value=second_result
+            ):
+                second = service.calibrate()
+            self.assertNotEqual(first["candidate_id"], second["candidate_id"])
+            self.assertEqual(second["collection_revision"], 2)
+
+            service.reset()
+            service.process_frame(frame, source_snapshot_id="one")
+            with patch.object(
+                intrinsic_solver, "calibrate_intrinsic", return_value=first_result
+            ):
+                after_reset = service.calibrate()
+            self.assertNotEqual(first["candidate_id"], after_reset["candidate_id"])
+            with self.assertRaises(ApiError) as stale_after_reset:
+                service.save(first["candidate_id"])
+            self.assertEqual(
+                stale_after_reset.exception.status, int(HTTPStatus.CONFLICT)
+            )
 
     def test_evidence_download_contains_exact_sources_annotations_manifest_and_yaml(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1181,23 +1399,20 @@ class IntrinsicServiceTest(unittest.TestCase):
             self.assertEqual(service.state()["samples"], 1)
             self.assertFalse(service.state()["evidence"]["available"])
 
-            result = intrinsic_solver.IntrinsicResult(
-                camera_matrix=np.array([
-                    [638.0, 0.0, 200.0],
-                    [0.0, 637.0, 160.0],
-                    [0.0, 0.0, 1.0],
-                ]),
-                distortion=np.array([-0.18, 0.04, 0.0, 0.0, 0.0]),
-                image_size=(frame.shape[1], frame.shape[0]),
-                rms_reprojection_error_px=0.42,
-                sample_count=1,
+            result = make_diagnostic_result(
+                (frame.shape[1], frame.shape[0]), 1
             )
             with patch.object(intrinsic_solver, "calibrate_intrinsic", return_value=result):
-                solved = service.calibrate()
+                candidate = service.calibrate()
+            self.assertEqual(
+                candidate["save_blocked"], "explicit_save_required"
+            )
             evidence = service.state()["evidence"]
             self.assertTrue(evidence["available"])
             self.assertEqual(evidence["sample_count"], 1)
-            self.assertRegex(evidence["filename"], r"^intrinsics-.*-evidence\.zip$")
+            self.assertEqual(
+                evidence["filename"], candidate["candidate_id"] + "-evidence.zip"
+            )
 
             server = CalibrationHttpServer(
                 ("127.0.0.1", 0), object(), WEB_ROOT,
@@ -1223,19 +1438,28 @@ class IntrinsicServiceTest(unittest.TestCase):
             with zipfile.ZipFile(io.BytesIO(archive_payload)) as archive:
                 self.assertEqual(
                     sorted(archive.namelist()),
-                    ["annotated/000.jpg", "intrinsics.yaml", "manifest.json", "source/000.jpg"],
+                    ["annotated/000.jpg", "manifest.json", "source/000.jpg"],
                 )
                 self.assertEqual(archive.read("source/000.jpg"), source_jpeg)
-                self.assertEqual(
-                    archive.read("intrinsics.yaml"), Path(solved["output_file"]).read_bytes()
-                )
                 annotated = cv2.imdecode(
                     np.frombuffer(archive.read("annotated/000.jpg"), dtype=np.uint8),
                     cv2.IMREAD_COLOR,
                 )
                 self.assertEqual(annotated.shape, frame.shape)
                 manifest = json.loads(archive.read("manifest.json"))
-            self.assertEqual(manifest["schema"], "xgc2.camera.intrinsic-evidence.v1")
+            self.assertEqual(manifest["schema"], "xgc2.camera.intrinsic-evidence.v2")
+            self.assertIsNone(manifest["result"])
+            self.assertEqual(
+                manifest["candidate"]["candidate_id"], candidate["candidate_id"]
+            )
+            self.assertNotIn(
+                "held_out_point_errors_px",
+                service.state()["candidate"]["diagnostics"]["stability"]["folds"][0],
+            )
+            self.assertIn(
+                "held_out_point_errors_px",
+                manifest["solver_diagnostics"]["stability"]["folds"][0],
+            )
             self.assertEqual(manifest["mode"], "phy")
             self.assertEqual(manifest["camera_name"], "usb_cam")
             self.assertEqual(manifest["board_profile"], "field_6x6_88mm_30pct")
@@ -1245,6 +1469,32 @@ class IntrinsicServiceTest(unittest.TestCase):
                 manifest["samples"][0]["source_sha256"],
                 hashlib.sha256(source_jpeg).hexdigest(),
             )
+
+            saved = service.save(candidate["candidate_id"])
+            self.assertTrue(saved["saved"])
+            self.assertEqual(service.state()["phase"], "saved")
+            saved_filename, saved_bundle = service.evidence_bundle()
+            self.assertEqual(saved_filename, evidence["filename"])
+            with zipfile.ZipFile(saved_bundle) as archive:
+                self.assertIn("intrinsics.yaml", archive.namelist())
+                saved_manifest = json.loads(archive.read("manifest.json"))
+            self.assertEqual(
+                saved_manifest["result"]["original_filename"],
+                Path(saved["output_file"]).name,
+            )
+            saved_document = intrinsic_solver.load_intrinsic(saved["output_file"])
+            self.assertEqual(
+                saved_document["metadata"]["quality_contract"],
+                "xgc2.camera.intrinsic-quality.v2",
+            )
+            self.assertEqual(
+                saved_document["metadata"]["candidate_id"],
+                candidate["candidate_id"],
+            )
+            self.assertTrue(
+                saved_document["metadata"]["stability_assessment"]["passed"]
+            )
+            self.assertEqual(service.save(candidate["candidate_id"]), saved)
 
             old_evidence_root = service._evidence_root
             service.reset()
@@ -1301,6 +1551,21 @@ class IntrinsicServiceTest(unittest.TestCase):
             self.assertGreater(service.state()["detection"]["sequence"], first_sequence)
             self.assertTrue(service.state()["auto_capture"]["enabled"])
             service.stop_auto_capture()
+
+    def test_advisory_coverage_completion_does_not_close_the_candidate_pool(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = make_service(Path(directory) / "intrinsics.yaml")
+            bars = [
+                {"label": label, "progress": 1.0}
+                for label in ("X", "Y", "Size", "Skew")
+            ]
+            with patch.object(
+                intrinsic_solver, "coverage", return_value=(bars, True)
+            ):
+                service.process_frame(render_board(), source_snapshot_id="complete-1")
+                self.assertTrue(service._coverage_state_locked()[1])
+                service.process_frame(render_board(), source_snapshot_id="complete-2")
+            self.assertEqual(service.state()["samples"], 2)
 
     def test_simulation_and_physical_share_continuous_detection(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1612,6 +1877,88 @@ class IntrinsicServiceTest(unittest.TestCase):
             self.assertEqual(maximum_active, 1)
             self.assertEqual(service._validation_generation, 2)
 
+    def test_transport_uses_strict_candidate_save_continue_routes_without_alias(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = make_service(Path(directory) / "intrinsics.yaml")
+            server = CalibrationHttpServer(
+                ("127.0.0.1", 0),
+                object(),
+                WEB_ROOT,
+                frame_ancestors="'self'",
+                intrinsic_service=service,
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            base = "http://127.0.0.1:{}".format(server.server_address[1])
+
+            def post(path, payload):
+                request = urllib.request.Request(
+                    base + path,
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(request) as response:
+                    return json.loads(response.read())
+
+            try:
+                with patch.object(
+                    service,
+                    "calibrate",
+                    return_value={"candidate_id": "intrinsic-candidate-abc"},
+                ) as candidate, patch.object(
+                    service,
+                    "save",
+                    return_value={"saved": True},
+                ) as save, patch.object(
+                    service,
+                    "continue_collection",
+                    return_value={"phase": "collecting"},
+                ) as continue_collection:
+                    self.assertEqual(
+                        post("/api/v1/intrinsic/candidate", {}),
+                        {"candidate_id": "intrinsic-candidate-abc"},
+                    )
+                    candidate.assert_called_once_with()
+                    self.assertEqual(
+                        post(
+                            "/api/v1/intrinsic/save",
+                            {"candidate_id": "intrinsic-candidate-abc"},
+                        ),
+                        {"saved": True},
+                    )
+                    save.assert_called_once_with("intrinsic-candidate-abc")
+                    self.assertEqual(
+                        post("/api/v1/intrinsic/continue", {}),
+                        {"phase": "collecting"},
+                    )
+                    continue_collection.assert_called_once_with()
+
+                    for path, payload, status in (
+                        ("/api/v1/intrinsic/calibrate", {}, HTTPStatus.NOT_FOUND),
+                        (
+                            "/api/v1/intrinsic/candidate",
+                            {"legacy": True},
+                            HTTPStatus.BAD_REQUEST,
+                        ),
+                        (
+                            "/api/v1/intrinsic/save",
+                            {"candidate_id": "", "extra": True},
+                            HTTPStatus.BAD_REQUEST,
+                        ),
+                        (
+                            "/api/v1/intrinsic/continue",
+                            {"legacy": True},
+                            HTTPStatus.BAD_REQUEST,
+                        ),
+                    ):
+                        with self.assertRaises(urllib.error.HTTPError) as caught:
+                            post(path, payload)
+                        self.assertEqual(caught.exception.code, int(status))
+            finally:
+                server.shutdown()
+                server.server_close()
+
     def test_transport_routes_intrinsic_and_gates_when_absent(self):
         with tempfile.TemporaryDirectory() as directory:
             service = make_service(Path(directory) / "intrinsics.yaml")
@@ -1668,6 +2015,11 @@ class IntrinsicServiceTest(unittest.TestCase):
                     camera_name="usb_cam",
                     board_size=(7, 5),
                     square=0.20,
+                    metadata={
+                        "quality_contract": "xgc2.camera.intrinsic-quality.v2",
+                        "candidate_id": "intrinsic-candidate-transport",
+                        "stability_assessment": {"passed": True},
+                    },
                 )
                 with urllib.request.urlopen(base + "/api/v1/intrinsic/calibrations") as response:
                     history = json.loads(response.read())

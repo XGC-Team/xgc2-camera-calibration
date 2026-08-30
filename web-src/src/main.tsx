@@ -180,7 +180,7 @@ function IntrinsicPage() {
             >
               <div className="calibration-frame"><img id="stream" alt="Camera stream" /></div>
               <p className="calibration-hint">
-                Move the camera so the board is seen near and far, at the image edges and tilted, until all four bars fill; then <strong>Calibrate</strong>. In simulation, click a sphere in the guide or use Auto-run.
+                Collect sharp views near and far, around the image, and at oblique angles. The bars are framing guidance, not a save gate. In simulation, click a sphere in the guide or use Auto-run.
               </p>
             </Panel>
           )}
@@ -201,7 +201,9 @@ function IntrinsicPage() {
 
               <Panel title="Calibration">
                 <div className="calibration-actions">
-                  <Button id="btn-calibrate" className="calibration-action" tone="primary" appearance="solid" disabled>Calibrate and save</Button>
+                  <Button id="btn-candidate" className="calibration-action" disabled>Analyze candidate</Button>
+                  <Button id="btn-save" className="calibration-action" tone="primary" appearance="solid" disabled>Save</Button>
+                  <Button id="btn-continue" className="calibration-action" disabled>Continue collecting</Button>
                   <Button id="btn-reset" className="calibration-action">Reset</Button>
                 </div>
                 <LegacyStatus id="status" initial="" hideValues={['']} />

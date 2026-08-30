@@ -1,11 +1,11 @@
 """Intrinsic (pinhole) camera calibration, cv2-direct and cv_bridge-free.
 
 Mirrors the ROS ``camera_calibration`` coverage heuristics (X / Y / Size / Skew)
-and delegates the actual estimation to ``cv2.calibrateCamera`` -- the same call
-``MonoCalibrator`` makes internally -- without dragging in ``cv_bridge`` or any
-ROS calibration class.  Frames arrive already decoded (see
-``web_service.image_message_to_bgr``); board detection runs on a down-scaled copy
-for speed on large (4K) frames, then corners are refined at full resolution.
+and delegates the actual estimation to ``cv2.calibrateCameraExtended`` without
+dragging in ``cv_bridge`` or any ROS calibration class. Frames arrive already
+decoded (see ``web_service.image_message_to_bgr``); board detection runs on a
+down-scaled copy for speed on large (4K) frames, then corners are refined at full
+resolution.
 """
 
 from __future__ import annotations
@@ -29,7 +29,6 @@ _SUBPIX_CRITERIA = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_MAX_ITER, 30, 0.01
 # Same acceptance ranges the ROS camera_calibration GUI uses for goodenough.
 PARAM_RANGES: Tuple[float, float, float, float] = (0.7, 0.7, 0.4, 0.5)
 PARAM_NAMES: Tuple[str, str, str, str] = ("X", "Y", "Size", "Skew")
-SAMPLE_DISTANCE = 0.2
 _APRILTAG_DICTIONARIES = {
     "tag36h11": "DICT_APRILTAG_36h11",
     "apriltag_36h11": "DICT_APRILTAG_36h11",
@@ -40,7 +39,9 @@ _APRILGRID_FALLBACK_MIN_SHARPNESS = 160.0
 _APRILGRID_FALLBACK_MARKER_PIXELS = 100
 _APRILGRID_FALLBACK_MAX_PAYLOAD_ERRORS = 5
 _APRILGRID_FALLBACK_MAX_BORDER_ERRORS = 2
-APRILGRID_FEATURE_MODEL = "aprilgrid_tag_corners_v1"
+APRILGRID_FEATURE_MODEL = "aprilgrid_kalibr_tag_corners_v2"
+APRILGRID_CORNER_DATUM = "kalibr_id0_lower_left_opencv_rotated_180_v1"
+_APRILGRID_OPENCV_TO_KALIBR_CORNER_ORDER: Tuple[int, int, int, int] = (1, 0, 3, 2)
 _APRILGRID_MIN_BORDER_DISTANCE = 6.0
 _APRILGRID_MIN_EDGE_LENGTH_PX = 20.0
 _APRILGRID_EDGE_SEARCH_RADIUS_PX = 3.0
@@ -49,6 +50,27 @@ _APRILGRID_EDGE_MIN_PROFILE_GRADIENT = 6.0
 _APRILGRID_EDGE_MIN_MEDIAN_CONTRAST = 24.0
 _APRILGRID_EDGE_MAX_LINE_RMS_PX = 0.65
 _APRILGRID_EDGE_MAX_LINE_P90_PX = 0.75
+_CALIBRATION_CRITERIA = (
+    cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_MAX_ITER,
+    100,
+    1.0e-12,
+)
+_DISTORTION_PARAMETER_NAMES: Tuple[str, ...] = (
+    "k1",
+    "k2",
+    "p1",
+    "p2",
+    "k3",
+    "k4",
+    "k5",
+    "k6",
+    "s1",
+    "s2",
+    "s3",
+    "s4",
+    "tau_x",
+    "tau_y",
+)
 
 
 @dataclass(frozen=True)
@@ -64,12 +86,118 @@ class BoardDetection:
 
 
 @dataclass(frozen=True)
+class IntrinsicFoldEstimate:
+    omitted_view_index: int
+    # Training RMS for the N-1 optimization.
+    rms_reprojection_error_px: float
+    parameters: Tuple[float, ...]
+    held_out_rms_reprojection_error_px: Optional[float] = None
+    held_out_mean_reprojection_error_px: Optional[float] = None
+    held_out_max_reprojection_error_px: Optional[float] = None
+    held_out_point_errors_px: Tuple[float, ...] = ()
+    held_out_rotation_vector: Optional[Tuple[float, float, float]] = None
+    held_out_translation_vector: Optional[Tuple[float, float, float]] = None
+    undistorted_ray_rms_equivalent_px: Optional[float] = None
+    undistorted_ray_max_equivalent_px: Optional[float] = None
+
+
+@dataclass(frozen=True)
+class IntrinsicRejectedView:
+    original_view_index: int
+    reason: str
+    initial_rms_reprojection_error_px: float
+    rejection_rms_reprojection_error_px: float
+    rejection_envelope_px: float
+
+
+@dataclass(frozen=True)
+class IntrinsicStabilityDiagnostics:
+    """Continuous leave-one-view-out sensitivity, never an admission gate."""
+
+    method: str
+    parameter_names: Tuple[str, ...]
+    reference_parameters: Tuple[float, ...]
+    folds: Tuple[IntrinsicFoldEstimate, ...]
+    failed_omitted_view_indices: Tuple[int, ...]
+    parameter_standard_deviation: Optional[Tuple[float, ...]]
+    parameter_span: Optional[Tuple[float, ...]]
+    maximum_absolute_delta: Optional[Tuple[float, ...]]
+    maximum_relative_delta: Optional[Tuple[float, ...]]
+    held_out_rms_mean_px: Optional[float] = None
+    held_out_rms_max_px: Optional[float] = None
+    undistorted_ray_rms_equivalent_px: Optional[float] = None
+    undistorted_ray_max_equivalent_px: Optional[float] = None
+
+
+@dataclass(frozen=True)
+class IntrinsicCalibrationDiagnostics:
+    """Optimizer, residual, observability and stability evidence for one solve."""
+
+    finite: bool
+    parameter_names: Tuple[str, ...]
+    per_view_errors_px: Tuple[float, ...]
+    intrinsic_standard_deviations: Tuple[float, ...]
+    rotation_vectors: Tuple[Tuple[float, float, float], ...]
+    translation_vectors: Tuple[Tuple[float, float, float], ...]
+    projected_intrinsic_rank: int
+    projected_intrinsic_parameter_count: int
+    projected_intrinsic_rank_deficient: bool
+    projected_intrinsic_condition_number: float
+    projected_intrinsic_rank_tolerance: float
+    projected_intrinsic_singular_values: Tuple[float, ...]
+    projected_intrinsic_column_norms: Tuple[float, ...]
+    stability: IntrinsicStabilityDiagnostics
+    pool_sample_count: int = 0
+    selected_view_indices: Tuple[int, ...] = ()
+    rejected_views: Tuple[IntrinsicRejectedView, ...] = ()
+    initial_per_view_errors_px: Tuple[float, ...] = ()
+    observation_uncertainty_px: Optional[float] = None
+
+
+@dataclass(frozen=True)
 class IntrinsicResult:
     camera_matrix: np.ndarray          # 3x3
     distortion: np.ndarray             # (k1,k2,p1,p2,k3)
     image_size: Tuple[int, int]        # (width, height)
     rms_reprojection_error_px: float
     sample_count: int
+    diagnostics: Optional[IntrinsicCalibrationDiagnostics] = None
+
+
+@dataclass(frozen=True)
+class _ExtendedCalibration:
+    rms_reprojection_error_px: float
+    camera_matrix: np.ndarray
+    distortion: np.ndarray
+    rotation_vectors: Tuple[np.ndarray, ...]
+    translation_vectors: Tuple[np.ndarray, ...]
+    intrinsic_standard_deviations: np.ndarray
+    per_view_errors_px: np.ndarray
+
+
+def observation_uncertainty_px(board_type: str) -> float:
+    """Return the active detector's pixel localization uncertainty contract."""
+    kind = str(board_type).strip().lower()
+    if kind == "aprilgrid":
+        return float(_APRILGRID_EDGE_MAX_LINE_P90_PX)
+    if kind in ("checkerboard", "chessboard"):
+        return float(_SUBPIX_CRITERIA[2])
+    raise ValueError("unsupported calibration board type: {}".format(board_type))
+
+
+def _opencv_corners_to_aprilgrid_datum(
+    corners: np.ndarray, corner_datum: str
+) -> np.ndarray:
+    """Map decoded OpenCV marker corners to the one Kalibr board datum.
+
+    Production artwork is ID0 lower-left with ids increasing +X then +Y and
+    each raw OpenCV marker rotated 180 degrees. OpenCV consequently reports
+    physical BR, BL, TL, TR; the Kalibr object model is BL, BR, TR, TL.
+    """
+    if str(corner_datum) != APRILGRID_CORNER_DATUM:
+        raise ValueError("unsupported AprilGrid corner datum: {}".format(corner_datum))
+    decoded = np.asarray(corners, dtype=np.float32).reshape(4, 2)
+    return decoded[np.asarray(_APRILGRID_OPENCV_TO_KALIBR_CORNER_ORDER)]
 
 
 def board_object_points(board_size: Sequence[int], square: float) -> np.ndarray:
@@ -583,92 +711,6 @@ def _project_points(homography: np.ndarray, points: np.ndarray) -> np.ndarray:
     ).reshape(-1, 2)
 
 
-def _match_aprilgrid_lattice(
-    homography: np.ndarray,
-    tag_objects: Sequence[np.ndarray],
-    candidates: Sequence[Dict[str, Any]],
-) -> List[Tuple[int, int, float]]:
-    choices: List[Tuple[float, float, int, int]] = []
-    for tag_index, tag_object in enumerate(tag_objects):
-        predicted = _project_points(homography, tag_object[:, :2])
-        predicted_center = np.mean(predicted, axis=0)
-        predicted_edge = float(
-            np.mean(
-                [
-                    np.linalg.norm(predicted[(index + 1) % 4] - predicted[index])
-                    for index in range(4)
-                ]
-            )
-        )
-        limit = max(8.0, predicted_edge * 0.55)
-        for candidate_index, candidate in enumerate(candidates):
-            if int(candidate["border_errors"]) > 4:
-                continue
-            edge_ratio = float(candidate["edge"]) / max(1.0, predicted_edge)
-            if not 0.6 <= edge_ratio <= 1.4:
-                continue
-            distance = float(np.linalg.norm(candidate["center"] - predicted_center))
-            if distance < limit:
-                choices.append(
-                    (distance / limit, distance, tag_index, candidate_index)
-                )
-    matches: List[Tuple[int, int, float]] = []
-    used_tags = set()
-    used_candidates = set()
-    for _relative, distance, tag_index, candidate_index in sorted(choices):
-        if tag_index in used_tags or candidate_index in used_candidates:
-            continue
-        matches.append((tag_index, candidate_index, distance))
-        used_tags.add(tag_index)
-        used_candidates.add(candidate_index)
-    return matches
-
-
-def _align_aprilgrid_corners_to_lattice(
-    image_points: Sequence[np.ndarray], object_points: Sequence[np.ndarray]
-) -> List[np.ndarray]:
-    """Align per-tag corner order with the board lattice encoded by tag ids.
-
-    Some printed AprilGrid plates rotate every marker bitmap relative to the
-    board axes. ArUco then decodes the correct ids and centers but returns a
-    per-marker corner order that is inconsistent with the board geometry. A
-    homography fitted only from decoded tag centers resolves the board axes;
-    measured corners are then permuted, never synthesized, to match them.
-    """
-    if len(image_points) < 4 or len(image_points) != len(object_points):
-        return [np.asarray(points, dtype=np.float32) for points in image_points]
-    source_centers = np.asarray(
-        [np.mean(points[:, :2], axis=0) for points in object_points],
-        dtype=np.float32,
-    )
-    image_centers = np.asarray(
-        [np.mean(points, axis=0) for points in image_points], dtype=np.float32
-    )
-    homography, mask = cv2.findHomography(
-        source_centers, image_centers, cv2.RANSAC, 5.0
-    )
-    if homography is None or mask is None or int(np.sum(mask)) < 4:
-        return [np.asarray(points, dtype=np.float32) for points in image_points]
-    aligned_points: List[np.ndarray] = []
-    for measured, tag_object in zip(image_points, object_points):
-        predicted = _project_points(homography, tag_object[:, :2])
-        measured = np.asarray(measured, dtype=np.float32).reshape(4, 2)
-        permutations = [
-            np.roll(measured, shift, axis=0) for shift in range(4)
-        ] + [
-            np.roll(measured[::-1], shift, axis=0) for shift in range(4)
-        ]
-        aligned_points.append(
-            min(
-                permutations,
-                key=lambda quad: float(
-                    np.sum(np.linalg.norm(quad - predicted, axis=1))
-                ),
-            ).astype(np.float32)
-        )
-    return aligned_points
-
-
 def _aprilgrid_contour_fallback(
     gray: np.ndarray,
     dictionary: Any,
@@ -677,7 +719,8 @@ def _aprilgrid_contour_fallback(
     tag_spacing: float,
     start_id: int,
     min_tags: int,
-) -> Optional[Tuple[List[np.ndarray], List[np.ndarray]]]:
+    corner_datum: str = APRILGRID_CORNER_DATUM,
+) -> Optional[Tuple[List[np.ndarray], List[np.ndarray], List[int]]]:
     """Recover a decoded lattice when OpenCV 4.2 rejects small real tags."""
     sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
     if sharpness < _APRILGRID_FALLBACK_MIN_SHARPNESS:
@@ -694,90 +737,53 @@ def _aprilgrid_contour_fallback(
     ]
     if not anchors:
         return None
-    tag_objects = [
-        aprilgrid_tag_object_points(
-            board_size, square, tag_spacing, start_id, start_id + offset
-        )
-        for offset in range(tag_count)
-    ]
-    if any(tag_object is None for tag_object in tag_objects):
-        return None
     unique_anchors: Dict[int, Dict[str, Any]] = {}
     for anchor in anchors:
         marker_offset = int(anchor["marker_id"]) - int(start_id)
+        if marker_offset < 0 or marker_offset >= tag_count:
+            return None
         current = unique_anchors.get(marker_offset)
-        if current is None or int(anchor["payload_errors"]) < int(
-            current["payload_errors"]
-        ):
+        quality = (int(anchor["payload_errors"]), int(anchor["border_errors"]))
+        current_quality = (
+            (int(current["payload_errors"]), int(current["border_errors"]))
+            if current is not None
+            else None
+        )
+        if current_quality is None or quality < current_quality:
             unique_anchors[marker_offset] = anchor
-    if len(unique_anchors) < 4:
-        return None
-
-    source_centers = np.asarray(
-        [
-            np.mean(tag_objects[tag_index][:, :2], axis=0)
-            for tag_index in unique_anchors
-        ],
-        dtype=np.float32,
-    )
-    image_centers = np.asarray(
-        [unique_anchors[tag_index]["center"] for tag_index in unique_anchors],
-        dtype=np.float32,
-    )
-    initial_homography, mask = cv2.findHomography(
-        source_centers, image_centers, cv2.RANSAC, 5.0
-    )
-    if initial_homography is None or mask is None or int(np.sum(mask)) < 4:
-        return None
-    initial_matches = _match_aprilgrid_lattice(
-        initial_homography, tag_objects, candidates
-    )
-    if len(initial_matches) < int(min_tags):
-        return None
-    source_centers = np.asarray(
-        [
-            np.mean(tag_objects[tag_index][:, :2], axis=0)
-            for tag_index, _candidate, _distance in initial_matches
-        ],
-        dtype=np.float32,
-    )
-    image_centers = np.asarray(
-        [
-            candidates[candidate_index]["center"]
-            for _tag, candidate_index, _distance in initial_matches
-        ],
-        dtype=np.float32,
-    )
-    refined_homography, mask = cv2.findHomography(
-        source_centers, image_centers, cv2.RANSAC, 5.0
-    )
-    if refined_homography is None or mask is None or int(np.sum(mask)) < 4:
-        return None
-    matches = _match_aprilgrid_lattice(
-        refined_homography, tag_objects, candidates
-    )
-    if len(matches) < int(min_tags):
+    independently_decoded_ids = [
+        int(start_id) + marker_offset for marker_offset in sorted(unique_anchors)
+    ]
+    if len(unique_anchors) < int(min_tags) or not _aprilgrid_tag_lattice_is_two_dimensional(
+        independently_decoded_ids, board_size, start_id
+    ):
         return None
 
     image_points: List[np.ndarray] = []
     object_points: List[np.ndarray] = []
-    for tag_index, candidate_index, _distance in sorted(matches):
-        predicted = _project_points(
-            refined_homography, tag_objects[tag_index][:, :2]
+    tag_ids: List[int] = []
+    for marker_offset, candidate in sorted(unique_anchors.items()):
+        marker_id = int(start_id) + int(marker_offset)
+        tag_object = aprilgrid_tag_object_points(
+            board_size, square, tag_spacing, start_id, marker_id
         )
-        candidate_quad = candidates[candidate_index]["quad"]
-        permutations = [
-            np.roll(candidate_quad, shift, axis=0) for shift in range(4)
-        ] + [
-            np.roll(candidate_quad[::-1], shift, axis=0) for shift in range(4)
-        ]
-        aligned = min(
-            permutations,
-            key=lambda quad: float(np.sum(np.linalg.norm(quad - predicted, axis=1))),
+        if tag_object is None:
+            return None
+        # The decoder rotation identifies the canonical marker corner datum.
+        # It is not a geometry-driven D4 guess: an observation whose decoded
+        # canonical order disagrees with the board is rejected downstream.
+        decoded_opencv = np.roll(
+            np.asarray(candidate["quad"], dtype=np.float32),
+            int(candidate["rotation"]),
+            axis=0,
         )
-        image_points.append(aligned.astype(np.float32))
-        object_points.append(tag_objects[tag_index])
-    return image_points, object_points
+        canonical = _opencv_corners_to_aprilgrid_datum(
+            decoded_opencv, corner_datum
+        )
+        image_points.append(canonical)
+        object_points.append(tag_object)
+        tag_ids.append(marker_id)
+    return image_points, object_points, tag_ids
 
 
 def aprilgrid_tag_object_points(
@@ -787,7 +793,7 @@ def aprilgrid_tag_object_points(
     start_id: int,
     tag_id: int,
 ) -> Optional[np.ndarray]:
-    """Four tag corners (TL, TR, BR, BL) in the board frame, matching OpenCV ArUco order."""
+    """Kalibr board corners BL, BR, TR, TL with ID0 at the lower-left."""
     cols, rows = int(board_size[0]), int(board_size[1])
     index = int(tag_id) - int(start_id)
     if index < 0 or index >= cols * rows:
@@ -809,6 +815,158 @@ def aprilgrid_tag_object_points(
     )
 
 
+def _aprilgrid_tag_lattice_is_two_dimensional(
+    tag_ids: Sequence[int], board_size: Sequence[int], start_id: int
+) -> bool:
+    cols, rows = int(board_size[0]), int(board_size[1])
+    first = int(start_id)
+    ids = [int(value) for value in tag_ids]
+    if (
+        cols < 2
+        or rows < 2
+        or len(ids) < 4
+        or len(set(ids)) != len(ids)
+        or any(value < first or value >= first + cols * rows for value in ids)
+    ):
+        return False
+    lattice = np.asarray(
+        [((value - first) % cols, (value - first) // cols) for value in ids],
+        dtype=np.float64,
+    )
+    return int(np.linalg.matrix_rank(lattice - np.mean(lattice, axis=0))) == 2
+
+
+def _strict_aprilgrid_observation(
+    image_points: Sequence[np.ndarray],
+    object_points: Sequence[np.ndarray],
+    tag_ids: Sequence[int],
+    board_size: Sequence[int],
+    tag_size: float,
+    tag_spacing: float,
+    start_id: int,
+    detection_uncertainty_px: float,
+) -> bool:
+    """Validate one standard-datum AprilGrid observation without repairing it.
+
+    IDs define one and only one board lattice, and decoded corner zero must
+    already correspond to object corner zero. The checks below never permute a
+    tag. Assignment bounds come from half the observed lattice separation (the
+    nearest-neighbour ambiguity boundary) and the active detector uncertainty,
+    rather than a fixed pixel residual chosen for a particular camera.
+    """
+    if len(image_points) != len(object_points) or len(image_points) != len(tag_ids):
+        return False
+    if not _aprilgrid_tag_lattice_is_two_dimensional(
+        tag_ids, board_size, start_id
+    ):
+        return False
+    try:
+        image_tags = np.asarray(image_points, dtype=np.float64).reshape(-1, 4, 2)
+        object_tags = np.asarray(object_points, dtype=np.float64).reshape(-1, 4, 3)
+    except (TypeError, ValueError):
+        return False
+    if (
+        len(image_tags) != len(tag_ids)
+        or len(object_tags) != len(tag_ids)
+        or not np.all(np.isfinite(image_tags))
+        or not np.all(np.isfinite(object_tags))
+    ):
+        return False
+    numeric_tolerance = (
+        np.finfo(np.float32).eps
+        * max(1.0, float(tag_size), float(tag_spacing))
+        * 8.0
+    )
+    for marker_id, observed_object in zip(tag_ids, object_tags):
+        expected_object = aprilgrid_tag_object_points(
+            board_size, tag_size, tag_spacing, start_id, int(marker_id)
+        )
+        if expected_object is None or not np.allclose(
+            observed_object,
+            expected_object,
+            rtol=0.0,
+            atol=numeric_tolerance,
+        ):
+            return False
+
+    object_centers = np.mean(object_tags[:, :, :2], axis=1)
+    image_centers = np.mean(image_tags, axis=1)
+    uncertainty = max(
+        float(detection_uncertainty_px),
+        np.finfo(np.float64).eps
+        * max(1.0, float(np.max(np.abs(image_centers)))),
+    )
+    centered_image = image_centers - np.mean(image_centers, axis=0)
+    try:
+        image_singular_values = np.linalg.svd(centered_image, compute_uv=False)
+    except np.linalg.LinAlgError:
+        return False
+    if (
+        len(image_singular_values) < 2
+        or float(image_singular_values[-1])
+        <= uncertainty * math.sqrt(float(len(image_centers)))
+    ):
+        return False
+    try:
+        homography, _mask = cv2.findHomography(
+            object_centers.astype(np.float32),
+            image_centers.astype(np.float32),
+            method=0,
+        )
+    except cv2.error:
+        return False
+    if homography is None or not np.all(np.isfinite(homography)):
+        return False
+    try:
+        predicted_centers = _project_points(homography, object_centers)
+    except cv2.error:
+        return False
+    pair_distances = np.linalg.norm(
+        predicted_centers[:, None, :] - predicted_centers[None, :, :], axis=2
+    )
+    np.fill_diagonal(pair_distances, np.inf)
+    minimum_lattice_separation = float(np.min(pair_distances))
+    assignment_margin = 0.5 * minimum_lattice_separation - uncertainty
+    if not np.isfinite(assignment_margin) or assignment_margin <= 0.0:
+        return False
+    center_residuals = np.linalg.norm(predicted_centers - image_centers, axis=1)
+    if bool(np.any(center_residuals > assignment_margin)):
+        return False
+
+    for measured, tag_object in zip(image_tags, object_tags):
+        try:
+            predicted = _project_points(homography, tag_object[:, :2])
+        except cv2.error:
+            return False
+        distances = np.linalg.norm(
+            measured[:, None, :] - predicted[None, :, :], axis=2
+        )
+        # Canonical index i must be the unique nearest prediction for measured
+        # corner i in both directions. This rejects rotated/reflected D4 corner
+        # order instead of silently selecting whichever permutation fits best.
+        if not np.array_equal(np.argmin(distances, axis=1), np.arange(4)):
+            return False
+        if not np.array_equal(np.argmin(distances, axis=0), np.arange(4)):
+            return False
+        for index in range(4):
+            other = np.delete(distances[index], index)
+            if float(distances[index, index]) + 2.0 * uncertainty >= float(
+                np.min(other)
+            ):
+                return False
+        predicted_area = float(
+            cv2.contourArea(predicted.astype(np.float32), oriented=True)
+        )
+        measured_area = float(
+            cv2.contourArea(measured.astype(np.float32), oriented=True)
+        )
+        if predicted_area == 0.0 or measured_area == 0.0:
+            return False
+        if math.copysign(1.0, predicted_area) != math.copysign(1.0, measured_area):
+            return False
+    return True
+
+
 def detect_aprilgrid(
     gray: np.ndarray,
     board_size: Sequence[int],
@@ -819,6 +977,7 @@ def detect_aprilgrid(
     start_id: int = 0,
     min_tags: int = 6,
     maximum_width: int = 960,
+    corner_datum: str = APRILGRID_CORNER_DATUM,
 ) -> Optional[BoardDetection]:
     """Detect a Kalibr-style AprilGrid and return the visible tag corners."""
     if float(square) <= 0.0:
@@ -827,6 +986,8 @@ def detect_aprilgrid(
         raise ValueError("AprilGrid tag spacing must be non-negative")
     if int(min_tags) < 4:
         raise ValueError("AprilGrid detection needs at least four tags")
+    if str(corner_datum) != APRILGRID_CORNER_DATUM:
+        raise ValueError("unsupported AprilGrid corner datum: {}".format(corner_datum))
     if not hasattr(cv2, "aruco"):
         raise CalibrationError("OpenCV was built without the aruco module")
     dictionary_name = _APRILTAG_DICTIONARIES.get(str(tag_family).strip().lower())
@@ -841,14 +1002,15 @@ def detect_aprilgrid(
     dictionary = cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, dictionary_name))
     corners, ids, _rejected = _detect_aruco_markers(search, dictionary)
 
-    def in_board_count(marker_ids: Optional[np.ndarray]) -> int:
-        if marker_ids is None:
-            return 0
-        first = int(start_id)
-        last = first + int(board_size[0]) * int(board_size[1])
-        return sum(first <= int(marker_id) < last for marker_id in marker_ids.reshape(-1))
-
-    best_count = in_board_count(ids)
+    decoded_ids = [] if ids is None else [int(value) for value in ids.reshape(-1)]
+    first_id = int(start_id)
+    last_id = first_id + int(board_size[0]) * int(board_size[1])
+    if (
+        len(set(decoded_ids)) != len(decoded_ids)
+        or any(value < first_id or value >= last_id for value in decoded_ids)
+    ):
+        return None
+    best_count = len(decoded_ids)
     base_scale = scale
     recovered = None
     if best_count < int(min_tags):
@@ -865,6 +1027,7 @@ def detect_aprilgrid(
             tag_spacing,
             start_id,
             min_tags,
+            corner_datum,
         )
     # Do not upscale this search image. AprilTag payload bits discarded by the
     # low-resolution decode cannot be reconstructed by interpolation. The
@@ -872,6 +1035,7 @@ def detect_aprilgrid(
     # original JPEG into a larger, still-bounded working plane.
     image_points: List[np.ndarray] = []
     object_points: List[np.ndarray] = []
+    tag_ids: List[int] = []
     if ids is not None:
         for marker_corners, marker_id in zip(corners, ids.reshape(-1)):
             obj = aprilgrid_tag_object_points(
@@ -882,10 +1046,12 @@ def detect_aprilgrid(
             image = (
                 np.asarray(marker_corners, dtype=np.float32).reshape(4, 2) / scale
             ).astype(np.float32)
+            image = _opencv_corners_to_aprilgrid_datum(image, corner_datum)
             image_points.append(image)
             object_points.append(obj)
+            tag_ids.append(int(marker_id))
     if recovered is not None:
-        image_points, object_points = recovered
+        image_points, object_points, tag_ids = recovered
         if base_scale != 1.0:
             image_points = [
                 (np.asarray(points, dtype=np.float32) / base_scale).astype(np.float32)
@@ -893,9 +1059,10 @@ def detect_aprilgrid(
             ]
     elif len(image_points) < int(min_tags):
         return None
-    image_points = _align_aprilgrid_corners_to_lattice(
-        image_points, object_points
-    )
+    if not _aprilgrid_tag_lattice_is_two_dimensional(
+        tag_ids, board_size, start_id
+    ):
+        return None
     tag_image_points = np.asarray(image_points, dtype=np.float32).reshape(-1, 4, 2)
     tag_object_points = np.asarray(object_points, dtype=np.float32).reshape(-1, 4, 3)
     raw_pixels = tag_image_points.reshape(-1, 1, 2)
@@ -906,8 +1073,35 @@ def detect_aprilgrid(
         )
     except CalibrationError:
         return None
-    # Keep the complete refined detection for annotation and coverage. The
-    # calibration arrays above remain the separately quality-gated paired set.
+    calibration_image_tags = np.asarray(
+        calibration_pixels, dtype=np.float32
+    ).reshape(-1, 4, 2)
+    calibration_object_tags = np.asarray(
+        calibration_objects, dtype=np.float32
+    ).reshape(-1, 4, 3)
+    calibration_tag_ids: List[int] = []
+    for refined_object in calibration_object_tags:
+        matching = [
+            index
+            for index, raw_object in enumerate(tag_object_points)
+            if np.array_equal(refined_object, raw_object)
+        ]
+        if len(matching) != 1:
+            return None
+        calibration_tag_ids.append(tag_ids[matching[0]])
+    if not _strict_aprilgrid_observation(
+        calibration_image_tags,
+        calibration_object_tags,
+        calibration_tag_ids,
+        board_size,
+        square,
+        tag_spacing,
+        start_id,
+        observation_uncertainty_px("aprilgrid"),
+    ):
+        return None
+    # Raw decoded corners remain annotation-only. Calibration and coverage use
+    # the exact same complete-tag refinement mask and correspondence order.
     pixels = raw_pixels.copy()
     flat = raw_pixels.reshape(-1, 2)
     valid = (
@@ -924,11 +1118,8 @@ def detect_aprilgrid(
         image_points=pixels,
         object_points=objects,
         coverage=_aprilgrid_coverage(
-            pixels,
-            objects,
-            board_size,
-            square,
-            tag_spacing,
+            calibration_pixels,
+            calibration_objects,
             width,
             height,
         ),
@@ -940,28 +1131,67 @@ def detect_aprilgrid(
 def _aprilgrid_coverage(
     pixels: np.ndarray,
     objects: np.ndarray,
-    board_size: Sequence[int],
-    tag_size: float,
-    tag_spacing: float,
     width: int,
     height: int,
 ) -> Tuple[float, float, float, float]:
-    """Project the complete AprilGrid boundary from the detected tag lattice."""
-    homography, _mask = cv2.findHomography(
-        np.asarray(objects, dtype=np.float32)[:, :2],
-        np.asarray(pixels, dtype=np.float32).reshape(-1, 2),
-        method=0,
+    """Describe actual solve support and its local projective obliqueness.
+
+    X/Y/Size come from the visible refined-corner hull. The fourth component
+    measures non-conformal local homography deformation on those same object
+    points. A 2-D roll is a similarity and therefore contributes zero; no
+    invisible full-board boundary is synthesized.
+    """
+    hull_coverage = _coverage_params_from_points(pixels, width, height)
+    object_xy = np.asarray(objects, dtype=np.float32).reshape(-1, 3)[:, :2]
+    image_xy = np.asarray(pixels, dtype=np.float32).reshape(-1, 2)
+    try:
+        homography, _mask = cv2.findHomography(object_xy, image_xy, method=0)
+    except cv2.error:
+        homography = None
+    obliqueness = 0.0
+    if homography is not None and np.all(np.isfinite(homography)):
+        local_values = []
+        h = np.asarray(homography, dtype=np.float64)
+        for x_value, y_value in object_xy.astype(np.float64):
+            denominator = h[2, 0] * x_value + h[2, 1] * y_value + h[2, 2]
+            if abs(denominator) <= np.finfo(np.float64).eps:
+                continue
+            u_value = (
+                h[0, 0] * x_value + h[0, 1] * y_value + h[0, 2]
+            ) / denominator
+            v_value = (
+                h[1, 0] * x_value + h[1, 1] * y_value + h[1, 2]
+            ) / denominator
+            jacobian = np.asarray(
+                (
+                    (
+                        (h[0, 0] - u_value * h[2, 0]) / denominator,
+                        (h[0, 1] - u_value * h[2, 1]) / denominator,
+                    ),
+                    (
+                        (h[1, 0] - v_value * h[2, 0]) / denominator,
+                        (h[1, 1] - v_value * h[2, 1]) / denominator,
+                    ),
+                ),
+                dtype=np.float64,
+            )
+            singular_values = np.linalg.svd(jacobian, compute_uv=False)
+            if (
+                len(singular_values) == 2
+                and np.all(np.isfinite(singular_values))
+                and singular_values[0] > 0.0
+            ):
+                local_values.append(
+                    1.0 - float(singular_values[-1] / singular_values[0])
+                )
+        if local_values:
+            obliqueness = min(1.0, max(0.0, float(max(local_values))))
+    return (
+        float(hull_coverage[0]),
+        float(hull_coverage[1]),
+        float(hull_coverage[2]),
+        obliqueness,
     )
-    cols, rows = int(board_size[0]), int(board_size[1])
-    pitch = float(tag_size) + float(tag_spacing)
-    board_width = float(tag_size) + float(cols - 1) * pitch
-    board_height = float(tag_size) + float(rows - 1) * pitch
-    boundary = np.asarray(
-        ((0.0, 0.0), (board_width, 0.0), (board_width, board_height), (0.0, board_height)),
-        dtype=np.float32,
-    ).reshape(-1, 1, 2)
-    projected = cv2.perspectiveTransform(boundary, homography)
-    return _coverage_params_from_points(projected, width, height)
 
 
 def _coverage_params_from_points(
@@ -1019,16 +1249,6 @@ def _coverage_params(
     angle = math.acos(min(1.0, max(-1.0, cosine)))
     p_skew = min(1.0, 2.0 * abs(math.pi / 2.0 - angle))
     return (p_x, p_y, p_size, p_skew)
-
-
-def is_new_sample(
-    params: Sequence[float], samples: Sequence[Sequence[float]], threshold: float = SAMPLE_DISTANCE
-) -> bool:
-    """True if params are far enough (L1) from every already-collected sample."""
-    if not samples:
-        return True
-    distance = min(sum(abs(a - b) for a, b in zip(params, sample)) for sample in samples)
-    return distance > threshold
 
 
 def coverage(
@@ -1106,43 +1326,560 @@ def next_view_guidance(
     }
 
 
+def _prepare_calibration_observations(
+    image_points: Sequence[np.ndarray],
+    board_size: Sequence[int],
+    square: float,
+    image_size: Sequence[int],
+    object_points: Optional[Sequence[np.ndarray]],
+) -> Tuple[List[np.ndarray], List[np.ndarray], Tuple[int, int]]:
+    if object_points is None:
+        board = board_object_points(board_size, square)
+        object_points = [board for _ in image_points]
+    if len(object_points) != len(image_points):
+        raise CalibrationError("each sample must provide matching image and object points")
+    if len(image_size) != 2:
+        raise CalibrationError("image size must contain width and height")
+    size = (int(image_size[0]), int(image_size[1]))
+    if size[0] <= 0 or size[1] <= 0:
+        raise CalibrationError("image width and height must be positive")
+
+    prepared_object: List[np.ndarray] = []
+    corners: List[np.ndarray] = []
+    for image, obj in zip(image_points, object_points):
+        try:
+            pixels = np.asarray(image, dtype=np.float32).reshape(-1, 1, 2)
+            world = np.asarray(obj, dtype=np.float32).reshape(-1, 3)
+        except (TypeError, ValueError) as error:
+            raise CalibrationError(
+                "calibration correspondences have invalid dimensions"
+            ) from error
+        if len(pixels) != len(world) or len(pixels) < 4:
+            raise CalibrationError("each sample must contain at least four corresponding points")
+        if not np.all(np.isfinite(pixels)) or not np.all(np.isfinite(world)):
+            raise CalibrationError("calibration correspondences must be finite")
+        corners.append(pixels)
+        prepared_object.append(world)
+    return prepared_object, corners, size
+
+
+def _run_extended_calibration(
+    object_points: Sequence[np.ndarray],
+    image_points: Sequence[np.ndarray],
+    image_size: Tuple[int, int],
+) -> _ExtendedCalibration:
+    try:
+        output = cv2.calibrateCameraExtended(
+            object_points,
+            image_points,
+            image_size,
+            None,
+            None,
+            flags=0,
+            criteria=_CALIBRATION_CRITERIA,
+        )
+    except cv2.error as error:
+        raise CalibrationError("OpenCV intrinsic optimization failed: {}".format(error)) from error
+    if not isinstance(output, tuple) or len(output) != 8:
+        raise CalibrationError("OpenCV intrinsic optimization returned an invalid result")
+    (
+        rms,
+        camera_matrix,
+        distortion,
+        rotation_vectors,
+        translation_vectors,
+        intrinsic_standard_deviations,
+        extrinsic_standard_deviations,
+        per_view_errors,
+    ) = output
+
+    camera_matrix = np.asarray(camera_matrix, dtype=np.float64)
+    distortion = np.asarray(distortion, dtype=np.float64).reshape(-1)
+    intrinsic_standard_deviations = np.asarray(
+        intrinsic_standard_deviations, dtype=np.float64
+    ).reshape(-1)
+    extrinsic_standard_deviations = np.asarray(
+        extrinsic_standard_deviations, dtype=np.float64
+    ).reshape(-1)
+    per_view_errors = np.asarray(per_view_errors, dtype=np.float64).reshape(-1)
+    rotations = tuple(
+        np.asarray(vector, dtype=np.float64).reshape(-1) for vector in rotation_vectors
+    )
+    translations = tuple(
+        np.asarray(vector, dtype=np.float64).reshape(-1) for vector in translation_vectors
+    )
+    sample_count = len(image_points)
+    if (
+        not np.isfinite(float(rms))
+        or not np.all(np.isfinite(camera_matrix))
+        or not np.all(np.isfinite(distortion))
+        or not np.all(np.isfinite(intrinsic_standard_deviations))
+        or not np.all(np.isfinite(extrinsic_standard_deviations))
+        or not np.all(np.isfinite(per_view_errors))
+        or any(not np.all(np.isfinite(vector)) for vector in rotations)
+        or any(not np.all(np.isfinite(vector)) for vector in translations)
+    ):
+        raise CalibrationError("calibration produced non-finite optimizer diagnostics")
+    if float(rms) < 0.0 or np.any(per_view_errors < 0.0):
+        raise CalibrationError("calibration produced a negative reprojection error")
+    if np.any(intrinsic_standard_deviations < 0.0) or np.any(
+        extrinsic_standard_deviations < 0.0
+    ):
+        raise CalibrationError("calibration produced a negative standard deviation")
+    if camera_matrix.shape != (3, 3) or np.linalg.matrix_rank(camera_matrix) != 3:
+        raise CalibrationError("calibration produced a degenerate camera matrix")
+    if camera_matrix[0, 0] <= 0.0 or camera_matrix[1, 1] <= 0.0:
+        raise CalibrationError("calibration produced a non-positive focal length")
+    if not distortion.size:
+        raise CalibrationError("calibration produced no distortion parameters")
+    if (
+        len(rotations) != sample_count
+        or len(translations) != sample_count
+        or per_view_errors.size != sample_count
+        or extrinsic_standard_deviations.size != sample_count * 6
+        or any(vector.size != 3 for vector in rotations)
+        or any(vector.size != 3 for vector in translations)
+    ):
+        raise CalibrationError("calibration returned inconsistent per-view diagnostics")
+    parameter_count = 4 + distortion.size
+    if intrinsic_standard_deviations.size < parameter_count:
+        raise CalibrationError("calibration omitted intrinsic standard deviations")
+    return _ExtendedCalibration(
+        rms_reprojection_error_px=float(rms),
+        camera_matrix=camera_matrix,
+        distortion=distortion,
+        rotation_vectors=rotations,
+        translation_vectors=translations,
+        intrinsic_standard_deviations=intrinsic_standard_deviations[:parameter_count],
+        per_view_errors_px=per_view_errors,
+    )
+
+
+def _intrinsic_parameter_names(distortion_count: int) -> Tuple[str, ...]:
+    if distortion_count > len(_DISTORTION_PARAMETER_NAMES):
+        raise CalibrationError("calibration returned an unsupported distortion vector")
+    return ("fx", "fy", "cx", "cy") + _DISTORTION_PARAMETER_NAMES[:distortion_count]
+
+
+def _intrinsic_parameter_vector(calibration: _ExtendedCalibration) -> np.ndarray:
+    matrix = calibration.camera_matrix
+    return np.concatenate(
+        (
+            np.asarray((matrix[0, 0], matrix[1, 1], matrix[0, 2], matrix[1, 2])),
+            calibration.distortion,
+        )
+    ).astype(np.float64)
+
+
+def _projected_intrinsic_information(
+    object_points: Sequence[np.ndarray], calibration: _ExtendedCalibration
+) -> Tuple[int, float, float, np.ndarray, np.ndarray]:
+    """Return intrinsic Jacobian evidence after eliminating per-view poses.
+
+    The projection Jacobian contains each view's six nuisance pose columns and
+    the shared intrinsic columns. Projecting the latter onto the orthogonal
+    complement of the former prevents a pose change from masquerading as
+    intrinsic information. Columns are then normalized before the SVD so the
+    reported numerical rank is not an artefact of mixed parameter units.
+    """
+    distortion_count = calibration.distortion.size
+    parameter_count = 4 + distortion_count
+    projected_blocks = []
+    for world, rotation, translation in zip(
+        object_points, calibration.rotation_vectors, calibration.translation_vectors
+    ):
+        try:
+            _projected, jacobian = cv2.projectPoints(
+                np.asarray(world, dtype=np.float64).reshape(-1, 3),
+                rotation,
+                translation,
+                calibration.camera_matrix,
+                calibration.distortion,
+            )
+        except (ValueError, cv2.error) as error:
+            raise CalibrationError("intrinsic projection Jacobian failed") from error
+        jacobian = np.asarray(jacobian, dtype=np.float64)
+        if jacobian.ndim != 2 or jacobian.shape[1] < 10 + distortion_count:
+            raise CalibrationError("OpenCV returned an incomplete projection Jacobian")
+        pose_jacobian = jacobian[:, :6]
+        intrinsic_jacobian = np.concatenate(
+            (jacobian[:, 6:10], jacobian[:, 10 : 10 + distortion_count]), axis=1
+        )
+        try:
+            pose_projection = pose_jacobian @ np.linalg.lstsq(
+                pose_jacobian, intrinsic_jacobian, rcond=None
+            )[0]
+        except np.linalg.LinAlgError as error:
+            raise CalibrationError("intrinsic information projection failed") from error
+        projected_blocks.append(intrinsic_jacobian - pose_projection)
+    projected = np.concatenate(projected_blocks, axis=0)
+    if not np.all(np.isfinite(projected)):
+        raise CalibrationError("intrinsic information matrix is non-finite")
+    column_norms = np.linalg.norm(projected, axis=0)
+    normalized = np.zeros_like(projected)
+    nonzero = column_norms > 0.0
+    normalized[:, nonzero] = projected[:, nonzero] / column_norms[nonzero]
+    try:
+        singular_values = np.linalg.svd(normalized, compute_uv=False)
+    except np.linalg.LinAlgError as error:
+        raise CalibrationError("intrinsic information SVD failed") from error
+    largest = float(singular_values[0]) if singular_values.size else 0.0
+    tolerance = (
+        float(max(normalized.shape) * np.finfo(np.float64).eps * largest)
+        if largest > 0.0
+        else 0.0
+    )
+    rank = int(np.count_nonzero(singular_values > tolerance))
+    condition_number = (
+        float("inf")
+        if rank < parameter_count or singular_values[-1] <= tolerance
+        else float(singular_values[0] / singular_values[-1])
+    )
+    return rank, condition_number, tolerance, singular_values, column_norms
+
+
+def _held_out_reprojection(
+    object_points: np.ndarray,
+    image_points: np.ndarray,
+    calibration: _ExtendedCalibration,
+) -> Tuple[float, float, float, Tuple[float, ...], np.ndarray, np.ndarray]:
+    """Fit only an omitted view's pose under fixed fold K/D and score pixels."""
+    world = np.asarray(object_points, dtype=np.float32).reshape(-1, 3)
+    pixels = np.asarray(image_points, dtype=np.float32).reshape(-1, 1, 2)
+    try:
+        solved, rotation, translation = cv2.solvePnP(
+            world,
+            pixels,
+            calibration.camera_matrix,
+            calibration.distortion,
+            flags=cv2.SOLVEPNP_ITERATIVE,
+        )
+        projected, _jacobian = cv2.projectPoints(
+            world,
+            rotation,
+            translation,
+            calibration.camera_matrix,
+            calibration.distortion,
+        )
+    except cv2.error as error:
+        raise CalibrationError("held-out pose optimization failed") from error
+    rotation = np.asarray(rotation, dtype=np.float64).reshape(-1)
+    translation = np.asarray(translation, dtype=np.float64).reshape(-1)
+    projected = np.asarray(projected, dtype=np.float64).reshape(-1, 2)
+    observed = pixels.astype(np.float64).reshape(-1, 2)
+    errors = np.linalg.norm(projected - observed, axis=1)
+    if (
+        not solved
+        or rotation.size != 3
+        or translation.size != 3
+        or not np.all(np.isfinite(rotation))
+        or not np.all(np.isfinite(translation))
+        or not np.all(np.isfinite(errors))
+    ):
+        raise CalibrationError("held-out pose diagnostics are invalid")
+    rms = float(np.sqrt(np.mean(np.square(errors))))
+    return (
+        rms,
+        float(np.mean(errors)),
+        float(np.max(errors)),
+        tuple(float(value) for value in errors),
+        rotation,
+        translation,
+    )
+
+
+def _undistorted_ray_stability(
+    reference: _ExtendedCalibration,
+    fold: _ExtendedCalibration,
+    image_size: Tuple[int, int],
+) -> Tuple[float, float]:
+    """Compare pixel-to-unit-ray mappings and express chord error in pixels."""
+    width, height = image_size
+    x_coordinates = np.linspace(0.0, float(width - 1), 9, dtype=np.float64)
+    y_coordinates = np.linspace(0.0, float(height - 1), 7, dtype=np.float64)
+    xx, yy = np.meshgrid(x_coordinates, y_coordinates)
+    pixels = np.column_stack((xx.reshape(-1), yy.reshape(-1))).reshape(-1, 1, 2)
+
+    def unit_rays(calibration: _ExtendedCalibration) -> np.ndarray:
+        try:
+            normalized = cv2.undistortPoints(
+                pixels,
+                calibration.camera_matrix,
+                calibration.distortion,
+            ).reshape(-1, 2)
+        except cv2.error as error:
+            raise CalibrationError("undistorted-ray diagnostics failed") from error
+        rays = np.column_stack((normalized, np.ones(len(normalized), dtype=np.float64)))
+        norms = np.linalg.norm(rays, axis=1)
+        if (
+            not np.all(np.isfinite(rays))
+            or not np.all(np.isfinite(norms))
+            or bool(np.any(norms <= 0.0))
+        ):
+            raise CalibrationError("undistorted-ray diagnostics are non-finite")
+        return rays / norms[:, None]
+
+    reference_rays = unit_rays(reference)
+    fold_rays = unit_rays(fold)
+    equivalent_focal_px = math.sqrt(
+        float(reference.camera_matrix[0, 0] * reference.camera_matrix[1, 1])
+    )
+    errors = np.linalg.norm(reference_rays - fold_rays, axis=1) * equivalent_focal_px
+    if not np.all(np.isfinite(errors)):
+        raise CalibrationError("undistorted-ray stability is non-finite")
+    return float(np.sqrt(np.mean(np.square(errors)))), float(np.max(errors))
+
+
+def _select_calibration_views(
+    object_points: Sequence[np.ndarray],
+    image_points: Sequence[np.ndarray],
+    image_size: Tuple[int, int],
+    observation_uncertainty: Optional[float],
+) -> Tuple[
+    _ExtendedCalibration,
+    List[int],
+    List[IntrinsicRejectedView],
+    Tuple[float, ...],
+]:
+    """Iteratively remove only the worst robust per-view RMS outlier."""
+    initial = _run_extended_calibration(object_points, image_points, image_size)
+    initial_errors = tuple(float(value) for value in initial.per_view_errors_px)
+    selected_indices = list(range(len(image_points)))
+    rejected: List[IntrinsicRejectedView] = []
+    calibration = initial
+    detector_sigma = 0.0 if observation_uncertainty is None else float(
+        observation_uncertainty
+    )
+    while len(selected_indices) > 3:
+        errors = np.asarray(calibration.per_view_errors_px, dtype=np.float64)
+        median = float(np.median(errors))
+        mad = float(np.median(np.abs(errors - median)))
+        robust_sigma = 1.482602218505602 * mad
+        numerical_sigma = np.finfo(np.float64).eps * max(1.0, abs(median))
+        sigma = max(math.hypot(robust_sigma, detector_sigma), numerical_sigma)
+        envelope = median + 3.0 * sigma
+        worst_local_index = int(np.argmax(errors))
+        worst_error = float(errors[worst_local_index])
+        if worst_error <= envelope:
+            break
+        original_index = selected_indices[worst_local_index]
+        rejected.append(
+            IntrinsicRejectedView(
+                original_view_index=original_index,
+                reason="per_view_rms_above_robust_3sigma_envelope",
+                initial_rms_reprojection_error_px=initial_errors[original_index],
+                rejection_rms_reprojection_error_px=worst_error,
+                rejection_envelope_px=envelope,
+            )
+        )
+        del selected_indices[worst_local_index]
+        calibration = _run_extended_calibration(
+            [object_points[index] for index in selected_indices],
+            [image_points[index] for index in selected_indices],
+            image_size,
+        )
+    return calibration, selected_indices, rejected, initial_errors
+
+
+def _leave_one_out_stability(
+    object_points: Sequence[np.ndarray],
+    image_points: Sequence[np.ndarray],
+    image_size: Tuple[int, int],
+    reference: _ExtendedCalibration,
+    original_view_indices: Optional[Sequence[int]] = None,
+) -> IntrinsicStabilityDiagnostics:
+    names = _intrinsic_parameter_names(reference.distortion.size)
+    reference_parameters = _intrinsic_parameter_vector(reference)
+    folds: List[IntrinsicFoldEstimate] = []
+    failed: List[int] = []
+    if original_view_indices is None:
+        original_view_indices = tuple(range(len(image_points)))
+    if len(original_view_indices) != len(image_points):
+        raise CalibrationError("LOO original view indices do not match selected views")
+    for omitted in range(len(image_points)):
+        fold_objects = [
+            value for index, value in enumerate(object_points) if index != omitted
+        ]
+        fold_images = [
+            value for index, value in enumerate(image_points) if index != omitted
+        ]
+        try:
+            fold = _run_extended_calibration(fold_objects, fold_images, image_size)
+            parameters = _intrinsic_parameter_vector(fold)
+            if parameters.shape != reference_parameters.shape:
+                raise CalibrationError("fold returned a different intrinsic parameter vector")
+            (
+                held_out_rms,
+                held_out_mean,
+                held_out_max,
+                held_out_errors,
+                held_out_rotation,
+                held_out_translation,
+            ) = _held_out_reprojection(
+                object_points[omitted], image_points[omitted], fold
+            )
+            ray_rms, ray_max = _undistorted_ray_stability(
+                reference, fold, image_size
+            )
+        except CalibrationError:
+            failed.append(int(original_view_indices[omitted]))
+            continue
+        folds.append(
+            IntrinsicFoldEstimate(
+                omitted_view_index=int(original_view_indices[omitted]),
+                rms_reprojection_error_px=fold.rms_reprojection_error_px,
+                parameters=tuple(float(value) for value in parameters),
+                held_out_rms_reprojection_error_px=held_out_rms,
+                held_out_mean_reprojection_error_px=held_out_mean,
+                held_out_max_reprojection_error_px=held_out_max,
+                held_out_point_errors_px=held_out_errors,
+                held_out_rotation_vector=tuple(
+                    float(value) for value in held_out_rotation
+                ),
+                held_out_translation_vector=tuple(
+                    float(value) for value in held_out_translation
+                ),
+                undistorted_ray_rms_equivalent_px=ray_rms,
+                undistorted_ray_max_equivalent_px=ray_max,
+            )
+        )
+    if not folds:
+        standard_deviation = span = maximum_delta = relative_delta = None
+        held_out_rms_mean = held_out_rms_max = None
+        ray_rms = ray_max = None
+    else:
+        estimates = np.asarray([fold.parameters for fold in folds], dtype=np.float64)
+        standard_deviation_array = np.std(estimates, axis=0)
+        span_array = np.ptp(estimates, axis=0)
+        maximum_delta_array = np.max(np.abs(estimates - reference_parameters), axis=0)
+        reference_scale = np.maximum(
+            np.abs(reference_parameters), np.finfo(np.float64).eps
+        )
+        relative_delta_array = maximum_delta_array / reference_scale
+        standard_deviation = tuple(float(value) for value in standard_deviation_array)
+        span = tuple(float(value) for value in span_array)
+        maximum_delta = tuple(float(value) for value in maximum_delta_array)
+        relative_delta = tuple(float(value) for value in relative_delta_array)
+        held_out_values = np.asarray(
+            [fold.held_out_rms_reprojection_error_px for fold in folds],
+            dtype=np.float64,
+        )
+        ray_rms_values = np.asarray(
+            [fold.undistorted_ray_rms_equivalent_px for fold in folds],
+            dtype=np.float64,
+        )
+        ray_max_values = np.asarray(
+            [fold.undistorted_ray_max_equivalent_px for fold in folds],
+            dtype=np.float64,
+        )
+        held_out_rms_mean = float(np.mean(held_out_values))
+        held_out_rms_max = float(np.max(held_out_values))
+        ray_rms = float(np.sqrt(np.mean(np.square(ray_rms_values))))
+        ray_max = float(np.max(ray_max_values))
+    return IntrinsicStabilityDiagnostics(
+        method="leave_one_view_out",
+        parameter_names=names,
+        reference_parameters=tuple(float(value) for value in reference_parameters),
+        folds=tuple(folds),
+        failed_omitted_view_indices=tuple(failed),
+        parameter_standard_deviation=standard_deviation,
+        parameter_span=span,
+        maximum_absolute_delta=maximum_delta,
+        maximum_relative_delta=relative_delta,
+        held_out_rms_mean_px=held_out_rms_mean,
+        held_out_rms_max_px=held_out_rms_max,
+        undistorted_ray_rms_equivalent_px=ray_rms,
+        undistorted_ray_max_equivalent_px=ray_max,
+    )
+
+
 def calibrate_intrinsic(
     image_points: Sequence[np.ndarray],
     board_size: Sequence[int],
     square: float,
     image_size: Sequence[int],
     object_points: Optional[Sequence[np.ndarray]] = None,
+    observation_uncertainty: Optional[float] = None,
 ) -> IntrinsicResult:
-    """Estimate K and distortion from the collected corner sets via cv2.calibrateCamera."""
+    """Batch-estimate free K/D and return continuous solve-quality evidence."""
     if len(image_points) < 3:
         raise CalibrationError("need at least three samples to calibrate")
-    if object_points is None:
-        obj = board_object_points(board_size, square)
-        object_points = [obj for _ in image_points]
-    if len(object_points) != len(image_points):
-        raise CalibrationError("each sample must provide matching image and object points")
-    prepared_object = []
-    corners = []
-    for image, obj in zip(image_points, object_points):
-        pixels = np.asarray(image, dtype=np.float32).reshape(-1, 1, 2)
-        world = np.asarray(obj, dtype=np.float32).reshape(-1, 3)
-        if len(pixels) != len(world) or len(pixels) < 4:
-            raise CalibrationError("each sample must contain at least four corresponding points")
-        corners.append(pixels)
-        prepared_object.append(world)
-    size = (int(image_size[0]), int(image_size[1]))
-    rms, camera_matrix, distortion, _rvecs, _tvecs = cv2.calibrateCamera(
-        prepared_object, corners, size, None, None
+    prepared_object, corners, size = _prepare_calibration_observations(
+        image_points, board_size, square, image_size, object_points
     )
-    camera_matrix = np.asarray(camera_matrix, dtype=np.float64)
-    if not np.all(np.isfinite(camera_matrix)) or camera_matrix[0, 0] <= 0.0:
-        raise CalibrationError("calibration produced a degenerate camera matrix")
+    if observation_uncertainty is not None and (
+        not np.isfinite(float(observation_uncertainty))
+        or float(observation_uncertainty) < 0.0
+    ):
+        raise CalibrationError("observation uncertainty must be finite and non-negative")
+    (
+        calibration,
+        selected_indices,
+        rejected_views,
+        initial_per_view_errors,
+    ) = _select_calibration_views(
+        prepared_object,
+        corners,
+        size,
+        observation_uncertainty,
+    )
+    selected_objects = [prepared_object[index] for index in selected_indices]
+    selected_corners = [corners[index] for index in selected_indices]
+    parameter_names = _intrinsic_parameter_names(calibration.distortion.size)
+    rank, condition, rank_tolerance, singular_values, column_norms = (
+        _projected_intrinsic_information(selected_objects, calibration)
+    )
+    stability = _leave_one_out_stability(
+        selected_objects,
+        selected_corners,
+        size,
+        calibration,
+        original_view_indices=selected_indices,
+    )
+    diagnostics = IntrinsicCalibrationDiagnostics(
+        finite=True,
+        parameter_names=parameter_names,
+        per_view_errors_px=tuple(
+            float(value) for value in calibration.per_view_errors_px
+        ),
+        intrinsic_standard_deviations=tuple(
+            float(value) for value in calibration.intrinsic_standard_deviations
+        ),
+        rotation_vectors=tuple(
+            tuple(float(value) for value in vector)
+            for vector in calibration.rotation_vectors
+        ),
+        translation_vectors=tuple(
+            tuple(float(value) for value in vector)
+            for vector in calibration.translation_vectors
+        ),
+        projected_intrinsic_rank=rank,
+        projected_intrinsic_parameter_count=len(parameter_names),
+        projected_intrinsic_rank_deficient=rank < len(parameter_names),
+        projected_intrinsic_condition_number=condition,
+        projected_intrinsic_rank_tolerance=rank_tolerance,
+        projected_intrinsic_singular_values=tuple(
+            float(value) for value in singular_values
+        ),
+        projected_intrinsic_column_norms=tuple(float(value) for value in column_norms),
+        stability=stability,
+        pool_sample_count=len(image_points),
+        selected_view_indices=tuple(int(value) for value in selected_indices),
+        rejected_views=tuple(rejected_views),
+        initial_per_view_errors_px=initial_per_view_errors,
+        observation_uncertainty_px=(
+            float(observation_uncertainty)
+            if observation_uncertainty is not None
+            else None
+        ),
+    )
     return IntrinsicResult(
-        camera_matrix=camera_matrix,
-        distortion=np.asarray(distortion, dtype=np.float64).reshape(-1),
+        camera_matrix=calibration.camera_matrix,
+        distortion=calibration.distortion,
         image_size=size,
-        rms_reprojection_error_px=float(rms),
-        sample_count=len(image_points),
+        rms_reprojection_error_px=calibration.rms_reprojection_error_px,
+        sample_count=len(selected_indices),
+        diagnostics=diagnostics,
     )
 
 

@@ -712,10 +712,38 @@ class CalibrationRequestHandler(BaseHTTPRequestHandler):
             if path == "/api/v1/solve":
                 self._send_json(HTTPStatus.OK, self._extrinsic().solve(request))
                 return
-            if path == "/api/v1/intrinsic/calibrate":
+            if path == "/api/v1/intrinsic/candidate":
                 if request not in ({}, None):
-                    raise ApiError(HTTPStatus.BAD_REQUEST, "Calibrate request must be an empty object")
+                    raise ApiError(
+                        HTTPStatus.BAD_REQUEST,
+                        "Intrinsic candidate request must be an empty object",
+                    )
                 self._send_json(HTTPStatus.OK, self._intrinsic().calibrate())
+                return
+            if path == "/api/v1/intrinsic/save":
+                if not isinstance(request, dict) or set(request) != {"candidate_id"}:
+                    raise ApiError(
+                        HTTPStatus.BAD_REQUEST,
+                        "Intrinsic save requires only candidate_id",
+                    )
+                candidate_id = request.get("candidate_id")
+                if not isinstance(candidate_id, str) or not candidate_id.strip():
+                    raise ApiError(
+                        HTTPStatus.BAD_REQUEST,
+                        "Intrinsic save candidate_id must be a non-empty string",
+                    )
+                self._send_json(
+                    HTTPStatus.OK,
+                    self._intrinsic().save(candidate_id.strip()),
+                )
+                return
+            if path == "/api/v1/intrinsic/continue":
+                if request not in ({}, None):
+                    raise ApiError(
+                        HTTPStatus.BAD_REQUEST,
+                        "Intrinsic continue request must be an empty object",
+                    )
+                self._send_json(HTTPStatus.OK, self._intrinsic().continue_collection())
                 return
             if path == "/api/v1/intrinsic/reset":
                 if request not in ({}, None):

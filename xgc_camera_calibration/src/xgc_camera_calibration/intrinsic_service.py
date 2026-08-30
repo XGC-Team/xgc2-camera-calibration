@@ -33,11 +33,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 import cv2
 import numpy as np
 
-from xgc_camera_calibration import (
-    intrinsic_pose_coverage,
-    intrinsic_solver,
-    intrinsic_validation,
-)
+from xgc_camera_calibration import intrinsic_solver, intrinsic_validation
 from xgc_camera_calibration.solver import CalibrationError
 from xgc_camera_calibration.web_service import ApiError
 
@@ -50,7 +46,6 @@ _SIM_TARGET_ANGLE_TOLERANCE_RAD = 0.04
 # centimetres covers a compact camera body while keeping a one-time coordinate
 # adjustment well below ordinary camera moves.
 _SIM_TARGET_SENSOR_OFFSET_LIMIT_METERS = 0.08
-_PHYSICAL_APRILGRID_MIN_TILT_DEGREES = 10.0
 _SIM_CAMERA_OPTICAL_ORIGIN_METERS = 0.067
 _SIM_GUIDE_REFERENCE_BOARD_EXTENT_METERS = 0.66
 
@@ -156,7 +151,6 @@ class IntrinsicCalibrationService:
         calibration_mode: str = "sim",
         board_profile_id: str = "",
         jpeg_quality: int = 80,
-        sample_distance: float = intrinsic_solver.SAMPLE_DISTANCE,
         maximum_detect_width: int = 960,
         display_width: int = 960,
         board_center: Sequence[float] = (2.0, 0.0, 2.2),
@@ -203,7 +197,6 @@ class IntrinsicCalibrationService:
         self.checkpoint_file = self.output_file_base + ".session.npz"
         self.media_source = str(media_source).strip()
         self.jpeg_quality = int(jpeg_quality)
-        self.sample_distance = float(sample_distance)
         self.maximum_detect_width = int(maximum_detect_width)
         self.display_width = int(display_width)
         self.lock = threading.RLock()
@@ -213,12 +206,23 @@ class IntrinsicCalibrationService:
         self.image_points: List[np.ndarray] = []
         self.object_points: List[np.ndarray] = []
         self.sample_target_ids: List[Optional[int]] = []
-        self._pose_coverage: Dict[str, Any] = self._empty_pose_coverage()
+        self.sample_snapshot_ids: List[str] = []
         self.image_size: Optional[Tuple[int, int]] = None
         self._display: Optional[np.ndarray] = None
         self.result: Optional[intrinsic_solver.IntrinsicResult] = None
         self.result_payload: Optional[Dict[str, Any]] = None
         self.result_restored = False
+        # ``calibrate`` now produces a diagnostic-only, immutable candidate.
+        # Persisting an intrinsic asset belongs to a later independent
+        # validation/commit transaction; a background capture must never
+        # mutate the observations behind an already-produced candidate.
+        self.candidate_result: Optional[intrinsic_solver.IntrinsicResult] = None
+        self.candidate_payload: Optional[Dict[str, Any]] = None
+        self._candidate_diagnostics_full: Optional[Dict[str, Any]] = None
+        self._candidate_error: Optional[Dict[str, Any]] = None
+        self._saved_candidate_id: Optional[str] = None
+        self.session_revision = 1
+        self.collection_revision = 0
         self.restored_coverage: List[Dict[str, Any]] = []
         self._recovery_error: Optional[str] = None
         self._frame_sequence = 0
@@ -316,159 +320,16 @@ class IntrinsicCalibrationService:
         with self.lock:
             self.frame_capture = capture
 
-    def _empty_pose_coverage(self) -> Dict[str, Any]:
-        return {
-            "status": "estimating" if self.board_type == "aprilgrid" else "not_applicable",
-            "minimum_tilt_degrees": _PHYSICAL_APRILGRID_MIN_TILT_DEGREES,
-            "view_count": 0,
-            "bins": {
-                "x_negative": False,
-                "x_positive": False,
-                "y_negative": False,
-                "y_positive": False,
-                "complete": False,
-            },
-            "views": [],
-            "error": None,
-        }
-
-    def _update_pose_coverage_locked(self) -> None:
-        if self.board_type != "aprilgrid":
-            self._pose_coverage = self._empty_pose_coverage()
-            return
-        if len(self.image_points) < 3 or self.image_size is None:
-            self._pose_coverage = self._empty_pose_coverage()
-            self._pose_coverage["view_count"] = len(self.image_points)
-            return
-        try:
-            provisional = intrinsic_pose_coverage.estimate_provisional_camera_matrix(
-                self.object_points,
-                self.image_points,
-                self.image_size,
-                aspect_ratio=1.0,
-            )
-            orientations = [
-                intrinsic_pose_coverage.estimate_plane_orientation(objects, image, provisional)
-                for image, objects in zip(self.image_points, self.object_points)
-            ]
-            bins = intrinsic_pose_coverage.signed_tilt_bins(
-                orientations, _PHYSICAL_APRILGRID_MIN_TILT_DEGREES
-            )
-            self._pose_coverage = {
-                "status": "ready",
-                "minimum_tilt_degrees": 10.0,
-                "view_count": len(orientations),
-                "bins": bins,
-                "views": [{
-                    "tilt_x_degrees": item.tilt_x_degrees,
-                    "tilt_y_degrees": item.tilt_y_degrees,
-                    "roll_degrees": item.roll_degrees,
-                    "homography_rms_px": item.homography_rms_px,
-                } for item in orientations],
-                "error": None,
-            }
-        except (ValueError, cv2.error, np.linalg.LinAlgError) as error:
-            self._pose_coverage = self._empty_pose_coverage()
-            self._pose_coverage.update({
-                "status": "unavailable",
-                "view_count": len(self.image_points),
-                "error": str(error) or error.__class__.__name__,
-            })
-
-    def _candidate_extends_pose_coverage_locked(
-        self,
-        image_points: np.ndarray,
-        object_points: np.ndarray,
-    ) -> bool:
-        """Return whether one physical AprilGrid view fills a missing signed bin.
-
-        The ordinary image-plane novelty gate remains authoritative for seed and
-        spatial coverage. Once provisional K is available, a near-identical 4D
-        footprint may still carry the missing sign of the board plane normal.
-        Both admission and final coverage use the same K initializer,
-        homography decomposition, tilt threshold, and bin classifier.
-        """
-        if (
-            self.board_type != "aprilgrid"
-            or self.image_size is None
-            or len(self.image_points) < 3
-            or self._pose_coverage.get("status") != "ready"
-        ):
-            return False
-        try:
-            provisional = intrinsic_pose_coverage.estimate_provisional_camera_matrix(
-                self.object_points,
-                self.image_points,
-                self.image_size,
-                aspect_ratio=1.0,
-            )
-            candidate = intrinsic_pose_coverage.estimate_plane_orientation(
-                object_points, image_points, provisional
-            )
-            candidate_bins = intrinsic_pose_coverage.signed_tilt_bins(
-                (candidate,), _PHYSICAL_APRILGRID_MIN_TILT_DEGREES
-            )
-        except (ValueError, cv2.error, np.linalg.LinAlgError):
-            return False
-        covered_bins = self._pose_coverage["bins"]
-        return any(
-            bool(candidate_bins[name]) and not bool(covered_bins[name])
-            for name in ("x_negative", "x_positive", "y_negative", "y_positive")
-        )
-
-    def _candidate_completes_spatial_coverage_locked(
-        self,
-        params: Sequence[float],
-    ) -> bool:
-        """Allow one physical view that directly completes X, Y, or Size.
-
-        Ordinary L1 novelty prevents redundant solve samples, but it must not
-        make an explicit alignment target impossible to satisfy. This override
-        admits only a threshold-crossing candidate; incremental improvements
-        below the completion gate remain subject to ordinary novelty.
-        """
-        if not self.samples:
-            return False
-        current, _complete = intrinsic_solver.coverage(self.samples)
-        extended, _extended_complete = intrinsic_solver.coverage(
-            [*self.samples, tuple(float(value) for value in params)]
-        )
-        return any(
-            current[index]["progress"] < 1.0
-            and extended[index]["progress"] >= 1.0
-            for index in range(3)
-        )
-
     def _coverage_state_locked(self) -> Tuple[List[Dict[str, Any]], bool]:
-        bars, generic_complete = intrinsic_solver.coverage(self.samples)
-        if self.result is not None:
-            return bars, True
-        if self.camera is not None:
-            return bars, (
-                all(self.target_done)
-                and len(self.samples) == len(self.views)
-                and self._simulation_target_ids_complete_locked()
-            )
-        if self.board_type != "aprilgrid":
-            return bars, generic_complete
-        pose = self._pose_coverage
-        bins = pose["bins"]
-        tilt_progress = sum(bool(bins[key]) for key in (
-            "x_negative", "x_positive", "y_negative", "y_positive",
-        )) / 4.0
-        bars = [
-            {**bar, "progress": tilt_progress} if bar["label"] == "Skew" else bar
-            for bar in bars
-        ]
-        spatial_complete = all(
-            bar["progress"] >= 1.0 for bar in bars if bar["label"] != "Skew"
-        )
-        return bars, (
-            len(self.samples) >= 10
-            and pose["status"] == "ready"
-            and bool(bins["complete"])
-            and spatial_complete
-        )
+        """Return monotonic, advisory image-plane collection coverage.
+
+        Coverage is deliberately not a solve/save invariant.  In particular,
+        physical AprilGrid Skew no longer reclassifies historical views through
+        a provisional K/D-free pose estimate: adding a valid observation cannot
+        make a displayed bar go backwards.
+        """
+        bars, advisory_complete = intrinsic_solver.coverage(self.samples)
+        return bars, advisory_complete
 
     def _simulation_target_ids_complete_locked(self) -> bool:
         captured = [int(value) for value in self.sample_target_ids if value is not None]
@@ -607,7 +468,7 @@ class IntrinsicCalibrationService:
 
     def _recovery_fingerprint(self) -> Dict[str, Any]:
         return {
-            "schema": 3,
+            "schema": 4,
             "feature_model": (
                 intrinsic_solver.APRILGRID_FEATURE_MODEL
                 if self.board_type == "aprilgrid"
@@ -624,6 +485,17 @@ class IntrinsicCalibrationService:
         }
 
     def _saved_board_matches(self, document: Dict[str, Any]) -> bool:
+        metadata = document.get("metadata")
+        if (
+            not isinstance(metadata, dict)
+            or metadata.get("quality_contract")
+            != "xgc2.camera.intrinsic-quality.v2"
+            or not isinstance(metadata.get("candidate_id"), str)
+            or not str(metadata["candidate_id"]).strip()
+            or not isinstance(metadata.get("stability_assessment"), dict)
+            or metadata["stability_assessment"].get("passed") is not True
+        ):
+            return False
         board = document.get("board")
         if not isinstance(board, dict):
             return False
@@ -652,7 +524,12 @@ class IntrinsicCalibrationService:
             and start_id == self.tag_start_id
         )
 
-    def _result_document(self, result: intrinsic_solver.IntrinsicResult) -> Dict[str, Any]:
+    def _result_document(
+        self,
+        result: intrinsic_solver.IntrinsicResult,
+        *,
+        saved: bool = True,
+    ) -> Dict[str, Any]:
         matrix = result.camera_matrix
         return {
             "camera_matrix": [float(value) for value in matrix.reshape(-1)],
@@ -665,8 +542,236 @@ class IntrinsicCalibrationService:
             "image_height": result.image_size[1],
             "rms_reprojection_error_px": result.rms_reprojection_error_px,
             "sample_count": result.sample_count,
-            "output_file": self.output_file,
+            "output_file": self.output_file if saved else None,
         }
+
+    @staticmethod
+    def _diagnostics_document(
+        result: intrinsic_solver.IntrinsicResult,
+    ) -> Dict[str, Any]:
+        diagnostics = result.diagnostics
+        if diagnostics is None:
+            return {
+                "available": False,
+                "finite": False,
+                "pool_sample_count": 0,
+                "selected_view_indices": [],
+                "rejected_views": [],
+                "initial_per_view_errors_px": [],
+                "observation_uncertainty_px": None,
+                "projected_intrinsic_rank": None,
+                "projected_intrinsic_parameter_count": None,
+                "projected_intrinsic_rank_deficient": True,
+                "projected_intrinsic_condition_number": None,
+                "per_view_errors_px": [],
+                "intrinsic_standard_deviations": [],
+                "stability": {
+                    "method": "leave_one_view_out",
+                    "fold_count": 0,
+                    "folds": [],
+                    "failed_omitted_view_indices": [],
+                    "maximum_relative_delta": None,
+                    "held_out_rms_mean_px": None,
+                    "held_out_rms_max_px": None,
+                    "undistorted_ray_rms_equivalent_px": None,
+                    "undistorted_ray_max_equivalent_px": None,
+                },
+            }
+
+        condition = float(diagnostics.projected_intrinsic_condition_number)
+        stability = diagnostics.stability
+
+        def optional_finite(value: Any) -> Optional[float]:
+            if value is None:
+                return None
+            number = float(value)
+            return number if math.isfinite(number) else None
+
+        folds = [{
+            "omitted_view_index": int(fold.omitted_view_index),
+            "training_rms_reprojection_error_px": float(
+                fold.rms_reprojection_error_px
+            ),
+            "held_out_rms_reprojection_error_px": optional_finite(
+                fold.held_out_rms_reprojection_error_px
+            ),
+            "held_out_mean_reprojection_error_px": optional_finite(
+                fold.held_out_mean_reprojection_error_px
+            ),
+            "held_out_max_reprojection_error_px": optional_finite(
+                fold.held_out_max_reprojection_error_px
+            ),
+            "held_out_point_errors_px": [
+                optional_finite(value) for value in fold.held_out_point_errors_px
+            ],
+            "held_out_rotation_vector": (
+                [optional_finite(value) for value in fold.held_out_rotation_vector]
+                if fold.held_out_rotation_vector is not None else None
+            ),
+            "held_out_translation_vector": (
+                [optional_finite(value) for value in fold.held_out_translation_vector]
+                if fold.held_out_translation_vector is not None else None
+            ),
+            "undistorted_ray_rms_equivalent_px": optional_finite(
+                fold.undistorted_ray_rms_equivalent_px
+            ),
+            "undistorted_ray_max_equivalent_px": optional_finite(
+                fold.undistorted_ray_max_equivalent_px
+            ),
+        } for fold in stability.folds]
+        return {
+            "available": True,
+            "finite": bool(diagnostics.finite),
+            "pool_sample_count": int(diagnostics.pool_sample_count),
+            "selected_view_indices": [
+                int(value) for value in diagnostics.selected_view_indices
+            ],
+            "rejected_views": [
+                {
+                    "original_view_index": int(item.original_view_index),
+                    "reason": str(item.reason),
+                    "initial_rms_reprojection_error_px": float(
+                        item.initial_rms_reprojection_error_px
+                    ),
+                    "rejection_rms_reprojection_error_px": float(
+                        item.rejection_rms_reprojection_error_px
+                    ),
+                    "rejection_envelope_px": float(item.rejection_envelope_px),
+                }
+                for item in diagnostics.rejected_views
+            ],
+            "initial_per_view_errors_px": [
+                float(value) for value in diagnostics.initial_per_view_errors_px
+            ],
+            "observation_uncertainty_px": optional_finite(
+                diagnostics.observation_uncertainty_px
+            ),
+            "parameter_names": list(diagnostics.parameter_names),
+            "projected_intrinsic_rank": int(diagnostics.projected_intrinsic_rank),
+            "projected_intrinsic_parameter_count": int(
+                diagnostics.projected_intrinsic_parameter_count
+            ),
+            "projected_intrinsic_rank_deficient": bool(
+                diagnostics.projected_intrinsic_rank_deficient
+            ),
+            "projected_intrinsic_condition_number": (
+                condition if math.isfinite(condition) else None
+            ),
+            "per_view_errors_px": [
+                float(value) for value in diagnostics.per_view_errors_px
+            ],
+            "intrinsic_standard_deviations": [
+                float(value) for value in diagnostics.intrinsic_standard_deviations
+            ],
+            "stability": {
+                "method": str(stability.method),
+                "fold_count": len(stability.folds),
+                "folds": folds,
+                "failed_omitted_view_indices": [
+                    int(value) for value in stability.failed_omitted_view_indices
+                ],
+                "parameter_names": list(stability.parameter_names),
+                "parameter_standard_deviation": (
+                    list(stability.parameter_standard_deviation)
+                    if stability.parameter_standard_deviation is not None
+                    else None
+                ),
+                "parameter_span": (
+                    list(stability.parameter_span)
+                    if stability.parameter_span is not None
+                    else None
+                ),
+                "maximum_absolute_delta": (
+                    list(stability.maximum_absolute_delta)
+                    if stability.maximum_absolute_delta is not None
+                    else None
+                ),
+                "maximum_relative_delta": (
+                    list(stability.maximum_relative_delta)
+                    if stability.maximum_relative_delta is not None
+                    else None
+                ),
+                "held_out_rms_mean_px": optional_finite(
+                    stability.held_out_rms_mean_px
+                ),
+                "held_out_rms_max_px": optional_finite(
+                    stability.held_out_rms_max_px
+                ),
+                "undistorted_ray_rms_equivalent_px": optional_finite(
+                    stability.undistorted_ray_rms_equivalent_px
+                ),
+                "undistorted_ray_max_equivalent_px": optional_finite(
+                    stability.undistorted_ray_max_equivalent_px
+                ),
+            },
+        }
+
+    @staticmethod
+    def _point_digest(image: np.ndarray, objects: np.ndarray) -> str:
+        digest = hashlib.sha256()
+        for value in (
+            np.asarray(image, dtype="<f4").reshape(-1, 2),
+            np.asarray(objects, dtype="<f4").reshape(-1, 3),
+        ):
+            digest.update(json.dumps(list(value.shape), separators=(",", ":")).encode("ascii"))
+            digest.update(np.ascontiguousarray(value).tobytes())
+        return digest.hexdigest()
+
+    def _candidate_id_locked(self, diagnostics: Mapping[str, Any]) -> str:
+        if self.image_size is None:
+            raise CalibrationError("candidate observation pool has no image size")
+        identity = {
+            "schema": "xgc2.camera.intrinsic-candidate.v1",
+            "board_fingerprint": self._recovery_fingerprint(),
+            "session_revision": self.session_revision,
+            "image_size": list(self.image_size),
+            "collection_revision": self.collection_revision,
+            "observation_snapshot_ids": list(self.sample_snapshot_ids),
+            "observation_point_digests": [
+                self._point_digest(image, objects)
+                for image, objects in zip(self.image_points, self.object_points)
+            ],
+            "solver_diagnostics": diagnostics,
+        }
+        encoded = json.dumps(
+            identity,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        return "intrinsic-candidate-{}".format(hashlib.sha256(encoded).hexdigest())
+
+    @staticmethod
+    def _compact_diagnostics_document(diagnostics: Mapping[str, Any]) -> Dict[str, Any]:
+        compact = dict(diagnostics)
+        stability = dict(diagnostics.get("stability", {}))
+        stability["folds"] = [{
+            "omitted_view_index": fold.get("omitted_view_index"),
+            "training_rms_reprojection_error_px": fold.get(
+                "training_rms_reprojection_error_px"
+            ),
+            "held_out_rms_reprojection_error_px": fold.get(
+                "held_out_rms_reprojection_error_px"
+            ),
+            "held_out_max_reprojection_error_px": fold.get(
+                "held_out_max_reprojection_error_px"
+            ),
+            "undistorted_ray_rms_equivalent_px": fold.get(
+                "undistorted_ray_rms_equivalent_px"
+            ),
+            "undistorted_ray_max_equivalent_px": fold.get(
+                "undistorted_ray_max_equivalent_px"
+            ),
+        } for fold in stability.get("folds", [])]
+        compact["stability"] = stability
+        return compact
+
+    def _phase_locked(self) -> str:
+        if self.result is not None:
+            return "saved"
+        if self.candidate_result is not None:
+            return "candidate_ready"
+        return "collecting"
 
     def _versioned_output_path(self) -> Path:
         base = Path(self.output_file_base)
@@ -708,6 +813,7 @@ class IntrinsicCalibrationService:
                 continue
             if document.get("camera_name") != self.camera_name:
                 continue
+            validated = self._saved_board_matches(document)
             items.append({
                 "id": path.name,
                 "created_at": str(document.get("created_at", "")),
@@ -718,14 +824,19 @@ class IntrinsicCalibrationService:
                     document.get("rms_reprojection_error_px", 0.0)
                 ),
                 "sample_count": int(document.get("sample_count", 0)),
+                "validated": validated,
             })
         items.sort(key=lambda item: (item["created_time"], item["id"]), reverse=True)
-        for index, item in enumerate(items):
-            item["latest"] = index == 0
+        selected = next(
+            (item["id"] for item in items if item["validated"]),
+            None,
+        )
+        for item in items:
+            item["latest"] = item["id"] == selected
             del item["created_time"]
         return {
             "items": items,
-            "selected": items[0]["id"] if items else None,
+            "selected": selected,
         }
 
     def _calibration_document(self, calibration_id: str) -> Tuple[Path, Dict[str, Any]]:
@@ -926,12 +1037,30 @@ class IntrinsicCalibrationService:
             rms_reprojection_error_px=float(document["rms_reprojection_error_px"]),
             sample_count=int(document["sample_count"]),
         )
+        metadata = document.get("metadata")
+        raw_candidate_id = metadata.get("candidate_id") if isinstance(metadata, dict) else None
+        candidate_id = raw_candidate_id.strip() if isinstance(raw_candidate_id, str) else ""
+        if not candidate_id:
+            raise CalibrationError(
+                "saved intrinsic result has no validated candidate identity"
+            )
         self.result = result
-        self.result_payload = self._result_document(result)
         self.result_restored = True
         self._auto_capture_completed = True
         self.image_size = image_size
-        metadata = document.get("metadata")
+        self._saved_candidate_id = candidate_id
+        self.collection_revision = (
+            int(metadata.get("collection_revision", result.sample_count))
+            if isinstance(metadata, dict) else result.sample_count
+        )
+        self.result_payload = {
+            **self._result_document(result),
+            "candidate_id": candidate_id,
+            "phase": "saved",
+            "session_revision": self.session_revision,
+            "collection_revision": self.collection_revision,
+            "saved": True,
+        }
         coverage = metadata.get("coverage") if isinstance(metadata, dict) else None
         if isinstance(coverage, list):
             self.restored_coverage = [
@@ -956,10 +1085,19 @@ class IntrinsicCalibrationService:
             samples = np.asarray(archive["samples"], dtype=np.float64)
             image_size_values = np.asarray(archive["image_size"], dtype=np.int64).reshape(-1)
             target_ids = np.asarray(archive["sample_target_ids"], dtype=np.int64).reshape(-1)
+            snapshot_ids = np.asarray(archive["sample_snapshot_ids"], dtype=np.str_).reshape(-1)
+            collection_revision = int(np.asarray(archive["collection_revision"]).item())
             if samples.ndim != 2 or samples.shape[1] != 4 or len(image_size_values) != 2:
                 raise CalibrationError("calibration checkpoint shape is invalid")
             if len(target_ids) != len(samples):
                 raise CalibrationError("calibration checkpoint target identities do not match")
+            if len(snapshot_ids) != len(samples):
+                raise CalibrationError("calibration checkpoint snapshot identities do not match")
+            if collection_revision != len(samples):
+                raise CalibrationError("calibration checkpoint collection revision is invalid")
+            nonempty_snapshot_ids = [str(value) for value in snapshot_ids if str(value)]
+            if len(nonempty_snapshot_ids) != len(set(nonempty_snapshot_ids)):
+                raise CalibrationError("calibration checkpoint snapshot identities are duplicated")
             simulation_ids = [int(value) for value in target_ids if int(value) >= 0]
             if (
                 any(value >= len(self.views) for value in simulation_ids)
@@ -981,9 +1119,10 @@ class IntrinsicCalibrationService:
         self.sample_target_ids = [
             None if int(value) < 0 else int(value) for value in target_ids
         ]
+        self.sample_snapshot_ids = [str(value) for value in snapshot_ids]
         self.target_done = [index in simulation_ids for index in range(len(self.views))]
         self.image_size = (int(image_size_values[0]), int(image_size_values[1]))
-        self._update_pose_coverage_locked()
+        self.collection_revision = collection_revision
         return bool(self.samples)
 
     def _load_recovery(self) -> None:
@@ -1008,6 +1147,10 @@ class IntrinsicCalibrationService:
             return
         if len(self.sample_target_ids) != len(self.samples):
             raise CalibrationError("calibration sample target identities do not match")
+        if len(self.sample_snapshot_ids) != len(self.samples):
+            raise CalibrationError("calibration sample snapshot identities do not match")
+        if self.collection_revision != len(self.samples):
+            raise CalibrationError("calibration collection revision does not match samples")
         destination = Path(self.checkpoint_file)
         destination.parent.mkdir(parents=True, exist_ok=True)
         payload: Dict[str, Any] = {
@@ -1018,6 +1161,8 @@ class IntrinsicCalibrationService:
                 [-1 if value is None else int(value) for value in self.sample_target_ids],
                 dtype=np.int64,
             ),
+            "sample_snapshot_ids": np.asarray(self.sample_snapshot_ids, dtype=np.str_),
+            "collection_revision": np.asarray(self.collection_revision, dtype=np.int64),
         }
         for index, (image, objects) in enumerate(zip(self.image_points, self.object_points)):
             payload["image_points_{:03d}".format(index)] = np.asarray(image, dtype=np.float32)
@@ -1168,15 +1313,19 @@ class IntrinsicCalibrationService:
 
     def _evidence_document_locked(self) -> Dict[str, Any]:
         available = bool(
-            self.result is not None
+            (self.candidate_result is not None or self.result is not None)
             and not self.result_restored
             and self._evidence_samples
             and len(self._evidence_samples) == len(self.image_points)
-            and Path(self.output_file).is_file()
         )
         filename = ""
         if available:
-            filename = "{}-evidence.zip".format(Path(self.output_file).stem)
+            identity = (
+                str(self._saved_candidate_id)
+                if self.result is not None
+                else str((self.candidate_payload or {}).get("candidate_id", "candidate"))
+            )
+            filename = "{}-evidence.zip".format(identity)
         return {
             "available": available,
             "sample_count": len(self._evidence_samples),
@@ -1194,28 +1343,40 @@ class IntrinsicCalibrationService:
                 )
             if self._evidence_bundle_path is not None and self._evidence_bundle_path.is_file():
                 return str(evidence["filename"]), self._evidence_bundle_path
-            result_path = Path(self.output_file)
-            result_payload = result_path.read_bytes()
-            result_document = intrinsic_solver.load_intrinsic(result_path)
+            result_path = Path(self.output_file) if self.result is not None else None
+            result_payload = result_path.read_bytes() if result_path is not None else None
+            result_document = (
+                intrinsic_solver.load_intrinsic(result_path)
+                if result_path is not None else None
+            )
             manifest = {
-                "schema": "xgc2.camera.intrinsic-evidence.v1",
-                "created_at": str(result_document.get("created_at", "")),
+                "schema": "xgc2.camera.intrinsic-evidence.v2",
+                "created_at": (
+                    str(result_document.get("created_at", ""))
+                    if result_document is not None else ""
+                ),
                 "mode": self.calibration_mode,
                 "camera_name": self.camera_name,
                 "media_source": self.media_source,
                 "board_profile": self.board_profile_id,
                 "board": self._board_document(),
-                "result": {
-                    "path": "intrinsics.yaml",
-                    "original_filename": result_path.name,
-                    "sha256": hashlib.sha256(result_payload).hexdigest(),
-                    "image_width": int(self.result.image_size[0]),
-                    "image_height": int(self.result.image_size[1]),
-                    "rms_reprojection_error_px": float(
-                        self.result.rms_reprojection_error_px
-                    ),
-                    "sample_count": int(self.result.sample_count),
-                },
+                "candidate": dict(self.candidate_payload or {}),
+                "solver_diagnostics": dict(self._candidate_diagnostics_full or {}),
+                "result": (
+                    {
+                        "path": "intrinsics.yaml",
+                        "original_filename": result_path.name,
+                        "sha256": hashlib.sha256(result_payload).hexdigest(),
+                        "image_width": int(self.result.image_size[0]),
+                        "image_height": int(self.result.image_size[1]),
+                        "rms_reprojection_error_px": float(
+                            self.result.rms_reprojection_error_px
+                        ),
+                        "sample_count": int(self.result.sample_count),
+                    }
+                    if result_path is not None and result_payload is not None
+                    else None
+                ),
                 "samples": [dict(sample) for sample in self._evidence_samples],
             }
             temporary = self._evidence_root / ".evidence.zip.tmp"
@@ -1223,7 +1384,8 @@ class IntrinsicCalibrationService:
             with zipfile.ZipFile(
                 str(temporary), "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6
             ) as archive:
-                archive.writestr("intrinsics.yaml", result_payload)
+                if result_payload is not None:
+                    archive.writestr("intrinsics.yaml", result_payload)
                 archive.writestr(
                     "manifest.json",
                     (json.dumps(manifest, indent=2, sort_keys=True, allow_nan=False) + "\n")
@@ -1556,7 +1718,6 @@ class IntrinsicCalibrationService:
             display = bgr.copy()
 
         with self.lock:
-            self.image_size = (source_width, source_height)
             self._frame_sequence += 1
             # A frame that began while the camera was moving may acknowledge the
             # new pose, but its missing capture token prevents that same frame
@@ -1564,8 +1725,6 @@ class IntrinsicCalibrationService:
             self._acknowledge_target_pose_locked()
             accepted = False
             duplicate = False
-            pose_coverage_override = False
-            spatial_coverage_override = False
             if detection is not None:
                 corners = detection.image_points
                 params = detection.coverage
@@ -1590,7 +1749,7 @@ class IntrinsicCalibrationService:
                         )
                 else:
                     cv2.drawChessboardCorners(display, self.board_size, scaled, True)
-                if self.result is None:
+                if self.result is None and self.candidate_result is None:
                     target_index = self._explicit_target_index_locked()
                     if target_index is not None:
                         accepted = self._target_frame_is_admissible_locked(
@@ -1599,34 +1758,24 @@ class IntrinsicCalibrationService:
                             render_orientation,
                             capture_token,
                         )
-                        duplicate = self.target_done[target_index]
                     elif self.camera is not None:
                         # Simulation samples belong to authored target identity;
                         # an arbitrary visible pose is not calibration evidence.
                         accepted = False
-                        duplicate = False
                     else:
-                        image_plane_novel = intrinsic_solver.is_new_sample(
-                            params, self.samples, self.sample_distance
-                        )
-                        spatial_coverage_override = (
-                            not image_plane_novel
-                            and self._candidate_completes_spatial_coverage_locked(params)
-                        )
-                        pose_coverage_override = (
-                            not image_plane_novel
-                            and not spatial_coverage_override
-                            and self.board_type == "aprilgrid"
-                            and self._candidate_extends_pose_coverage_locked(
-                                calibration_corners, calibration_objects
-                            )
-                        )
-                        accepted = (
-                            image_plane_novel
-                            or spatial_coverage_override
-                            or pose_coverage_override
-                        )
-                        duplicate = not accepted
+                        # Every strict observation belongs to the candidate
+                        # pool. X/Y/Size/Skew and geometric proximity are
+                        # advisory only; batch diagnostics decide whether the
+                        # pool can produce a trustworthy candidate.
+                        accepted = True
+                    snapshot_identity = str(source_snapshot_id).strip()
+                    if (
+                        accepted
+                        and snapshot_identity
+                        and snapshot_identity in self.sample_snapshot_ids
+                    ):
+                        accepted = False
+                        duplicate = True
                     if accepted:
                         if self.board_type == "aprilgrid" and source_jpeg:
                             try:
@@ -1663,28 +1812,7 @@ class IntrinsicCalibrationService:
                                     raise CalibrationError(
                                         "AprilGrid source-resolution correspondences are missing"
                                     )
-                                source_params = source_detection.coverage
-                                if (
-                                    spatial_coverage_override
-                                    and not self._candidate_completes_spatial_coverage_locked(
-                                        source_params
-                                    )
-                                ):
-                                    raise CalibrationError(
-                                        "AprilGrid source correspondences do not complete "
-                                        "the requested spatial coverage axis"
-                                    )
-                                if (
-                                    pose_coverage_override
-                                    and not self._candidate_extends_pose_coverage_locked(
-                                        calibration_corners, calibration_objects
-                                    )
-                                ):
-                                    raise CalibrationError(
-                                        "AprilGrid source correspondences do not fill a missing "
-                                        "signed plane-normal bin"
-                                    )
-                                params = source_params
+                                params = source_detection.coverage
                             except Exception as error:
                                 # Keep the live detection, but never admit a
                                 # solve sample containing mixed refined/raw
@@ -1692,10 +1820,33 @@ class IntrinsicCalibrationService:
                                 self._recovery_error = str(error) or error.__class__.__name__
                                 accepted = False
                         if accepted:
+                            candidate_image_size = (source_width, source_height)
+                            if (
+                                self.image_size is not None
+                                and self.image_size != candidate_image_size
+                            ):
+                                self._recovery_error = (
+                                    "Calibration candidate image dimensions {}x{} do not match "
+                                    "the frozen {}x{} observation pool".format(
+                                        source_width,
+                                        source_height,
+                                        self.image_size[0],
+                                        self.image_size[1],
+                                    )
+                                )
+                                accepted = False
+                        if accepted:
+                            previous_image_size = self.image_size
+                            if previous_image_size is None:
+                                # Freeze only when this observation actually
+                                # enters the pool. Undetected frames and failed
+                                # evidence transactions cannot poison it.
+                                self.image_size = (source_width, source_height)
                             self.samples.append(params)
                             self.image_points.append(calibration_corners)
                             self.object_points.append(calibration_objects)
                             self.sample_target_ids.append(target_index)
+                            self.sample_snapshot_ids.append(snapshot_identity)
                             if source_jpeg:
                                 try:
                                     self._record_evidence_sample_locked(
@@ -1717,9 +1868,12 @@ class IntrinsicCalibrationService:
                                     self.image_points.pop()
                                     self.object_points.pop()
                                     self.sample_target_ids.pop()
+                                    self.sample_snapshot_ids.pop()
+                                    if previous_image_size is None:
+                                        self.image_size = None
                                     accepted = False
                             if accepted:
-                                self._update_pose_coverage_locked()
+                                self.collection_revision += 1
                                 try:
                                     self._save_checkpoint_locked()
                                 except Exception as error:
@@ -1821,41 +1975,12 @@ class IntrinsicCalibrationService:
             bars, sample_goodenough = self._coverage_state_locked()
             if not self.samples and self.restored_coverage:
                 bars = [dict(item) for item in self.restored_coverage]
-            if self.result is not None:
-                bars = [
-                    {"label": label, "progress": 1.0}
-                    for label in intrinsic_solver.PARAM_NAMES
-                ]
-            goodenough = self.result is not None or sample_goodenough
-            # Guidance must use the same final bars presented to the operator.
-            # Physical AprilGrid coverage replaces generic image-plane Skew with
-            # signed plane-normal bins; recomputing the generic bars here could
-            # recommend tilt while the visible incomplete axis is X or Y.
-            guidance_bars = bars
-            if self.result is None and self.calibration_mode == "phy":
-                spatial_incomplete = any(
-                    item["label"] != "Skew" and item["progress"] < 1.0
-                    for item in bars
+                sample_goodenough = bool(bars) and all(
+                    float(item["progress"]) >= 1.0 for item in bars
                 )
-                if spatial_incomplete:
-                    guidance_bars = [
-                        {**item, "progress": 1.0}
-                        if item["label"] == "Skew"
-                        else item
-                        for item in bars
-                    ]
-            guidance = (
-                {
-                    "complete": True,
-                    "dimension": None,
-                    "direction": "complete",
-                    "progress": 1.0,
-                }
-                if self.result is not None
-                else intrinsic_solver.next_view_guidance(
-                    self.samples,
-                    coverage_bars=guidance_bars,
-                )
+            guidance = intrinsic_solver.next_view_guidance(
+                self.samples,
+                coverage_bars=bars,
             )
             targets = [{
                 "name": view["name"],
@@ -1865,24 +1990,19 @@ class IntrinsicCalibrationService:
             } for index, view in enumerate(self.views)]
             next_index = next((i for i, done in enumerate(self.target_done) if not done), None)
             pose = self.camera.current() if self.camera is not None else None
-            return {
+            phase = self._phase_locked()
+            document = {
                 "mode": "intrinsic",
+                "phase": phase,
+                "session_revision": self.session_revision,
+                "collection_revision": self.collection_revision,
                 "samples": len(self.samples) if self.samples else (
                     self.result.sample_count if self.result is not None else 0
                 ),
                 "sample_target_ids": list(self.sample_target_ids),
                 "coverage": bars,
-                "pose_coverage": {
-                    **self._pose_coverage,
-                    "bins": dict(self._pose_coverage["bins"]),
-                    "views": [dict(item) for item in self._pose_coverage["views"]],
-                },
                 "guidance": guidance,
-                "goodenough": bool(goodenough),
-                "calibrated": self.result is not None,
-                "result_restored": self.result_restored,
-                "result": self.result_payload,
-                "output_file": self.output_file,
+                "goodenough": bool(sample_goodenough),
                 "image_ready": self._display is not None,
                 "media_source": self.media_source,
                 "board": self._board_document(),
@@ -1904,6 +2024,27 @@ class IntrinsicCalibrationService:
                     "metrics": [dict(metric) for metric in self.latest_detection["metrics"]],
                 },
             }
+            if phase == "candidate_ready":
+                document["candidate_pool"] = {
+                    "count": len(self.image_points),
+                    "image_size": list(self.image_size) if self.image_size is not None else None,
+                    "solve_frozen": True,
+                }
+                document["candidate"] = dict(self.candidate_payload or {})
+            elif phase == "saved":
+                document.update({
+                    "result": dict(self.result_payload or {}),
+                    "output_file": self.output_file,
+                    "saved_candidate_id": self._saved_candidate_id,
+                    "result_restored": self.result_restored,
+                })
+            else:
+                document["candidate_pool"] = {
+                    "count": len(self.image_points),
+                    "image_size": list(self.image_size) if self.image_size is not None else None,
+                    "solve_frozen": False,
+                }
+            return document
 
     # -- sim camera guidance actions -----------------------------------------
     def _require_idle_locked(self) -> None:
@@ -1926,10 +2067,18 @@ class IntrinsicCalibrationService:
         self.image_points = []
         self.object_points = []
         self.sample_target_ids = []
-        self._pose_coverage = self._empty_pose_coverage()
+        self.sample_snapshot_ids = []
+        self.image_size = None
         self.result = None
         self.result_payload = None
         self.result_restored = False
+        self.candidate_result = None
+        self.candidate_payload = None
+        self._candidate_diagnostics_full = None
+        self._candidate_error = None
+        self._saved_candidate_id = None
+        self.session_revision += 1
+        self.collection_revision = 0
         self.restored_coverage = []
         self.output_file = self.output_file_base
         self.refs = {}
@@ -2163,7 +2312,10 @@ class IntrinsicCalibrationService:
                     "target_index": len(self.views) - 1,
                     "target_name": self.views[-1]["name"],
                     "error": None,
-                    "result": dict(result),
+                    "result": {
+                        "candidate_id": result.get("candidate_id"),
+                        "quality": dict(result.get("quality", {})),
+                    },
                 }
                 self._auto_run_thread = None
                 self._target_capture_phase = "idle"
@@ -2231,12 +2383,298 @@ class IntrinsicCalibrationService:
             self._require_idle_locked()
             return self._calibrate_locked()
 
+    def continue_collection(self) -> Dict[str, Any]:
+        """Discard the current solve candidate while retaining observations."""
+        with self.lock:
+            self._require_idle_locked()
+            if self.result is not None:
+                raise ApiError(
+                    HTTPStatus.CONFLICT,
+                    "A saved calibration must be reset before collecting again",
+                )
+            if self.candidate_result is None:
+                raise ApiError(
+                    HTTPStatus.CONFLICT,
+                    "No intrinsic candidate is ready to discard",
+                )
+            self.candidate_result = None
+            self.candidate_payload = None
+            self._candidate_diagnostics_full = None
+            self._candidate_error = None
+            self._evidence_bundle_path = None
+            self.session_revision += 1
+        return self.state()
+
+    def _candidate_save_assessment_locked(self) -> Tuple[Dict[str, Any], List[str]]:
+        if self.candidate_result is None or self.candidate_payload is None:
+            return {}, ["candidate_missing"]
+        diagnostics = self._candidate_diagnostics_full or {}
+        stability = diagnostics["stability"]
+        reasons: List[str] = []
+        selected_indices = diagnostics.get("selected_view_indices")
+        if (
+            diagnostics.get("pool_sample_count") != len(self.image_points)
+            or not isinstance(selected_indices, list)
+            or not selected_indices
+            or len(set(selected_indices)) != len(selected_indices)
+            or any(
+                not isinstance(index, int)
+                or isinstance(index, bool)
+                or index < 0
+                or index >= len(self.image_points)
+                for index in (selected_indices or [])
+            )
+        ):
+            reasons.append("solver_selection_invalid")
+            selected_indices = []
+        selected_count = len(selected_indices)
+        if self.candidate_result.sample_count != selected_count:
+            reasons.append("solver_selection_count_mismatch")
+        if not diagnostics["available"] or not diagnostics["finite"]:
+            reasons.append("optimizer_diagnostics_unavailable")
+        if diagnostics["projected_intrinsic_rank_deficient"]:
+            reasons.append("projected_intrinsic_rank_deficient")
+        if stability["failed_omitted_view_indices"]:
+            reasons.append("leave_one_view_out_failed")
+        if int(stability["fold_count"]) != selected_count:
+            reasons.append("leave_one_view_out_incomplete")
+
+        training = np.asarray(diagnostics["per_view_errors_px"], dtype=np.float64)
+        if (
+            training.size != selected_count
+            or not np.all(np.isfinite(training))
+            or bool(np.any(training < 0.0))
+        ):
+            reasons.append("training_residuals_invalid")
+            training_median = robust_sigma = confidence_limit = ray_confidence_limit = None
+        else:
+            training_median_value = float(np.median(training))
+            mad = float(np.median(np.abs(training - training_median_value)))
+            robust_sigma_value = 1.4826 * mad
+            detector_uncertainty = intrinsic_solver.observation_uncertainty_px(
+                self.board_type
+            )
+            confidence_limit_value = training_median_value + 3.0 * math.hypot(
+                detector_uncertainty, robust_sigma_value
+            )
+            observed_point_count = sum(
+                len(np.asarray(self.image_points[index]).reshape(-1, 2))
+                for index in selected_indices
+            )
+            # ``ray_max`` is a maximum over the calibrated image field, not an
+            # RMS observation. Apply the Gaussian extreme-value factor for the
+            # actual number of measured points instead of inventing a camera-
+            # specific pixel bound.
+            ray_confidence_limit_value = training_median_value + (
+                3.0
+                * math.hypot(detector_uncertainty, robust_sigma_value)
+                * math.sqrt(2.0 * math.log(float(max(2, observed_point_count))))
+            )
+            training_median = training_median_value
+            robust_sigma = robust_sigma_value
+            confidence_limit = confidence_limit_value
+            ray_confidence_limit = ray_confidence_limit_value
+        held_out_rms_max = stability.get("held_out_rms_max_px")
+        ray_max = stability.get("undistorted_ray_max_equivalent_px")
+        folds = stability.get("folds")
+        if not isinstance(folds, list) or len(folds) != selected_count:
+            reasons.append("cross_validation_structure_incomplete")
+        else:
+            required_fold_fields = (
+                "held_out_rms_reprojection_error_px",
+                "held_out_mean_reprojection_error_px",
+                "held_out_max_reprojection_error_px",
+                "undistorted_ray_rms_equivalent_px",
+                "undistorted_ray_max_equivalent_px",
+            )
+            for fold in folds:
+                values = [fold.get(name) for name in required_fold_fields]
+                points = fold.get("held_out_point_errors_px")
+                rotation = fold.get("held_out_rotation_vector")
+                translation = fold.get("held_out_translation_vector")
+                if (
+                    any(value is None or not math.isfinite(float(value)) for value in values)
+                    or not isinstance(points, list)
+                    or not points
+                    or any(value is None or not math.isfinite(float(value)) for value in points)
+                    or not isinstance(rotation, list)
+                    or len(rotation) != 3
+                    or any(value is None or not math.isfinite(float(value)) for value in rotation)
+                    or not isinstance(translation, list)
+                    or len(translation) != 3
+                    or any(value is None or not math.isfinite(float(value)) for value in translation)
+                ):
+                    reasons.append("cross_validation_structure_non_finite")
+                    break
+        if (
+            held_out_rms_max is None
+            or ray_max is None
+            or not math.isfinite(float(held_out_rms_max))
+            or not math.isfinite(float(ray_max))
+        ):
+            reasons.append("cross_validation_summary_non_finite")
+        elif confidence_limit is not None:
+            if float(held_out_rms_max) > confidence_limit:
+                reasons.append("held_out_residual_exceeds_confidence_envelope")
+            if (
+                ray_confidence_limit is not None
+                and float(ray_max) > ray_confidence_limit
+            ):
+                reasons.append("normalized_ray_stability_exceeds_confidence_envelope")
+
+        assessment = {
+            "method": "detector_uncertainty_plus_three_sigma_mad",
+            "detector_uncertainty_px": intrinsic_solver.observation_uncertainty_px(
+                self.board_type
+            ),
+            "training_per_view_median_px": training_median,
+            "training_robust_sigma_px": robust_sigma,
+            "confidence_limit_px": confidence_limit,
+            "normalized_ray_confidence_limit_px": ray_confidence_limit,
+            "held_out_rms_max_px": held_out_rms_max,
+            "undistorted_ray_max_equivalent_px": ray_max,
+            "passed": not reasons,
+        }
+        return assessment, list(dict.fromkeys(reasons))
+
+    def save(self, candidate_id: str) -> Dict[str, Any]:
+        """CAS-commit one validated candidate to a versioned intrinsic YAML."""
+        identity = str(candidate_id).strip()
+        if not identity:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "candidate_id must not be empty")
+        with self.lock:
+            self._require_idle_locked()
+            if self.result is not None:
+                if identity == self._saved_candidate_id:
+                    return self.result_payload  # type: ignore[return-value]
+                raise ApiError(
+                    HTTPStatus.CONFLICT,
+                    "A different intrinsic candidate is already saved",
+                )
+            current_id = (
+                str(self.candidate_payload.get("candidate_id"))
+                if self.candidate_payload is not None else ""
+            )
+            if not current_id:
+                raise ApiError(HTTPStatus.CONFLICT, "No intrinsic candidate is ready")
+            if identity != current_id:
+                raise ApiError(
+                    HTTPStatus.CONFLICT,
+                    "Intrinsic candidate changed; solve the current observation pool again",
+                    details={"expected_candidate_id": current_id},
+                )
+            assessment, reasons = self._candidate_save_assessment_locked()
+            if reasons:
+                raise ApiError(
+                    HTTPStatus.UNPROCESSABLE_ENTITY,
+                    "Intrinsic candidate failed independent stability validation",
+                    details={
+                        "code": "intrinsic_candidate_not_save_ready",
+                        "candidate_id": current_id,
+                        "quality_contract": "xgc2.camera.intrinsic-quality.v2",
+                        "reasons": reasons,
+                        "assessment": assessment,
+                    },
+                )
+            result = self.candidate_result
+            if result is None:
+                raise ApiError(HTTPStatus.CONFLICT, "No intrinsic candidate is ready")
+            try:
+                output_file = self._versioned_output_path()
+                intrinsic_solver.save_intrinsic(
+                    output_file,
+                    result,
+                    camera_name=self.camera_name,
+                    board_size=self.board_size,
+                    square=self.square,
+                    metadata={
+                        "media_source": self.media_source,
+                        "camera_name": self.camera_name,
+                        "web_calibrator": True,
+                        "feature_model": (
+                            intrinsic_solver.APRILGRID_FEATURE_MODEL
+                            if self.board_type == "aprilgrid"
+                            else "checkerboard_corners_v1"
+                        ),
+                        "candidate_id": current_id,
+                        "quality_contract": "xgc2.camera.intrinsic-quality.v2",
+                        "session_revision": self.session_revision,
+                        "collection_revision": self.collection_revision,
+                        "coverage": intrinsic_solver.coverage(self.samples)[0],
+                        "sample_target_ids": list(self.sample_target_ids),
+                        "solver_selection": {
+                            "pool_sample_count": self._candidate_diagnostics_full.get(
+                                "pool_sample_count"
+                            ),
+                            "selected_view_indices": list(
+                                self._candidate_diagnostics_full.get(
+                                    "selected_view_indices", []
+                                )
+                            ),
+                            "rejected_views": list(
+                                self._candidate_diagnostics_full.get(
+                                    "rejected_views", []
+                                )
+                            ),
+                        },
+                        "stability_assessment": assessment,
+                    },
+                    board=self._board_document(),
+                )
+            except OSError as error:
+                raise ApiError(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    "Could not save calibration result: {}".format(error),
+                ) from error
+            self.output_file = str(output_file)
+            self.result = result
+            self.result_restored = False
+            self._saved_candidate_id = current_id
+            self.session_revision += 1
+            self.result_payload = {
+                **self._result_document(result),
+                "candidate_id": current_id,
+                "phase": "saved",
+                "session_revision": self.session_revision,
+                "collection_revision": self.collection_revision,
+                "saved": True,
+            }
+            self._evidence_bundle_path = None
+            self._remove_checkpoint_locked()
+            return self.result_payload
+
     def _calibrate_locked(self) -> Dict[str, Any]:
-        """Solve and atomically save while the caller owns ``self.lock``."""
+        """Produce one immutable diagnostic candidate from the current pool.
+
+        This endpoint deliberately does not persist a versioned intrinsic file.
+        Rank/LOO failures are rejected immediately; even a numerically complete
+        candidate remains blocked until an independent holdout-validation and
+        explicit commit API exists.
+        """
         if self.result is not None:
             return self.result_payload  # type: ignore[return-value]
+        if self.candidate_result is not None:
+            if self._candidate_error is not None:
+                raise ApiError(
+                    HTTPStatus.UNPROCESSABLE_ENTITY,
+                    "Intrinsic calibration candidate is unstable and was not saved",
+                    details=self._candidate_error,
+                )
+            return self.candidate_payload  # type: ignore[return-value]
         if not self.image_points or self.image_size is None:
             raise ApiError(HTTPStatus.CONFLICT, "No calibration-board samples collected yet")
+        candidate_count = len(self.image_points)
+        if (
+            len(self.object_points) != candidate_count
+            or len(self.samples) != candidate_count
+            or len(self.sample_target_ids) != candidate_count
+            or len(self.sample_snapshot_ids) != candidate_count
+            or self.collection_revision != candidate_count
+        ):
+            raise ApiError(
+                HTTPStatus.CONFLICT,
+                "Intrinsic candidate pool revision is inconsistent",
+            )
         try:
             result = intrinsic_solver.calibrate_intrinsic(
                 self.image_points,
@@ -2244,47 +2682,62 @@ class IntrinsicCalibrationService:
                 self.square,
                 self.image_size,
                 object_points=self.object_points or None,
+                observation_uncertainty=intrinsic_solver.observation_uncertainty_px(
+                    self.board_type
+                ),
             )
         except (CalibrationError, cv2.error) as error:
             raise ApiError(HTTPStatus.UNPROCESSABLE_ENTITY, str(error)) from error
-        try:
-            output_file = self._versioned_output_path()
-            intrinsic_solver.save_intrinsic(
-                output_file,
-                result,
-                camera_name=self.camera_name,
-                board_size=self.board_size,
-                square=self.square,
-                metadata={
-                    "media_source": self.media_source,
-                    "camera_name": self.camera_name,
-                    "web_calibrator": True,
-                    "feature_model": (
-                        intrinsic_solver.APRILGRID_FEATURE_MODEL
-                        if self.board_type == "aprilgrid"
-                        else "checkerboard_corners_v1"
-                    ),
-                    "coverage": intrinsic_solver.coverage(self.samples)[0],
-                    "sample_target_ids": list(self.sample_target_ids),
-                },
-                board=self._board_document(),
-            )
-        except OSError as error:
+        diagnostics = self._diagnostics_document(result)
+        self.session_revision += 1
+        candidate_id = self._candidate_id_locked(diagnostics)
+        candidate = {
+            **self._result_document(result, saved=False),
+            "candidate_id": candidate_id,
+            "phase": "candidate_ready",
+            "session_revision": self.session_revision,
+            "collection_revision": self.collection_revision,
+            "saved": False,
+            "diagnostics": self._compact_diagnostics_document(diagnostics),
+        }
+        self.candidate_result = result
+        self.candidate_payload = candidate
+        self._candidate_diagnostics_full = diagnostics
+        assessment, quality_reasons = self._candidate_save_assessment_locked()
+        candidate["quality"] = {
+            "status": "save_ready" if not quality_reasons else "unstable",
+            "reasons": quality_reasons,
+            "assessment": assessment,
+        }
+        candidate["save_blocked"] = (
+            "explicit_save_required"
+            if not quality_reasons else "stability_validation_failed"
+        )
+
+        stability = diagnostics["stability"]
+        unstable_reasons = []
+        if not diagnostics["available"] or not diagnostics["finite"]:
+            unstable_reasons.append("optimizer_diagnostics_unavailable")
+        if diagnostics["projected_intrinsic_rank_deficient"]:
+            unstable_reasons.append("projected_intrinsic_rank_deficient")
+        if stability["failed_omitted_view_indices"]:
+            unstable_reasons.append("leave_one_view_out_failed")
+        if int(stability["fold_count"]) != result.sample_count:
+            unstable_reasons.append("leave_one_view_out_incomplete")
+        if unstable_reasons:
+            self._candidate_error = {
+                "code": "intrinsic_candidate_unstable",
+                "reasons": unstable_reasons,
+                "save_blocked": "stability_validation_failed",
+                "candidate": candidate,
+            }
             raise ApiError(
-                HTTPStatus.INTERNAL_SERVER_ERROR,
-                "Could not save calibration result: {}".format(error),
-            ) from error
-        self.output_file = str(output_file)
-        self.result = result
-        self.result_restored = False
-        self.result_payload = self._result_document(result)
-        try:
-            Path(self.checkpoint_file).unlink()
-        except FileNotFoundError:
-            pass
-        except OSError as error:
-            self._recovery_error = str(error) or error.__class__.__name__
-        return self.result_payload
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                "Intrinsic calibration candidate is unstable and was not saved",
+                details=self._candidate_error,
+            )
+        self._candidate_error = None
+        return candidate
 
     def reset(self) -> Dict[str, Any]:
         with self.lock:

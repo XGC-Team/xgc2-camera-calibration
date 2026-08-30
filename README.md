@@ -51,23 +51,27 @@ polled through this calibration HTTP path.
 The product-facing intrinsic service is available under
 `/api/v1/intrinsic/`: `state`, `targets`, `ref/<index>.jpg`, and
 `evidence.zip` are read
-endpoints; `capture`, `goto`, `reset_pose`, `auto_run`, `calibrate`, and
-`reset` are JSON actions. `capture` performs one explicit immutable snapshot;
+endpoints; `capture`, `goto`, `reset_pose`, `auto_run`, `candidate`, `save`,
+`continue`, and `reset` are JSON actions. `capture` performs one explicit
+immutable snapshot;
 `auto_run` returns HTTP 202 immediately and exposes its authoritative progress
 in `state.action`. Conflicting mutation requests return HTTP 409 until the
-sweep finishes; the OpenCV solver itself remains unchanged. `image.jpg` remains
-a compatibility view of the most recently processed sample, not a live-video
-transport.
+sweep finishes. `candidate` freezes the strict observation pool and performs
+the robust batch solve plus leave-one-view-out validation without writing a
+file. `save` accepts only that candidate's exact ID and is the sole operation
+that creates a timestamped YAML; `continue` discards the candidate while
+retaining its observations. There is no `calibrate` alias. `image.jpg` is the
+most recently annotated detector snapshot, not a live-video transport.
 
 Every solver-admitted sample retains the exact source JPEG from its immutable
 Media Edge transaction plus a full-resolution annotated derivative in a
-session-local temporary directory. After a successful solve, `evidence.zip`
-streams a reproducibility package containing those paired images, the exact
-saved intrinsic YAML, and a SHA-256 manifest with camera, run mode, board
-profile, snapshot identity, timestamp, coverage and target/pose evidence. This
-contract is identical for `sim` and `phy`. Images are never automatically
-persisted under Documents; Reset or process exit removes the temporary set,
-while the timestamped YAML remains versioned as before.
+session-local temporary directory. A candidate already makes `evidence.zip`
+available with the paired images, full solver/held-out diagnostics and a
+SHA-256 manifest; it intentionally contains no YAML. After explicit Save the
+bundle is rebuilt with the exact timestamped intrinsic YAML. This contract is
+identical for `sim` and `phy`. Images are never automatically persisted under
+Documents; Reset or process exit removes the temporary set, while a saved YAML
+remains versioned as before.
 
 ### Fixed-world-camera extrinsic calibration
 
