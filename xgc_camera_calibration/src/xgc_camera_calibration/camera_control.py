@@ -30,7 +30,7 @@ def select_gazebo_board_profile(
     """Replace the calibration target with the selected exact-size model."""
     import rospkg
     import rospy
-    from gazebo_msgs.srv import DeleteModel, SpawnModel
+    from gazebo_msgs.srv import DeleteModel, GetWorldProperties, SpawnModel
     from geometry_msgs.msg import Pose
 
     package_root = rospkg.RosPack().get_path("gazebo_sim_worlds")
@@ -40,15 +40,24 @@ def select_gazebo_board_profile(
     if not model_path.is_file():
         raise RuntimeError("Gazebo calibration board model is unavailable: {}".format(model_path))
     delete_name = "/gazebo/delete_model"
+    world_name = "/gazebo/get_world_properties"
     spawn_name = "/gazebo/spawn_sdf_model"
     rospy.wait_for_service(delete_name, timeout=connection_timeout)
+    rospy.wait_for_service(world_name, timeout=connection_timeout)
     rospy.wait_for_service(spawn_name, timeout=connection_timeout)
     delete = rospy.ServiceProxy(delete_name, DeleteModel)
+    world = rospy.ServiceProxy(world_name, GetWorldProperties)
     spawn = rospy.ServiceProxy(spawn_name, SpawnModel)
     try:
         delete("intrinsic_aprilgrid")
     except Exception:
         pass
+    _wait_for_gazebo_model_presence(
+        world,
+        model_name="intrinsic_aprilgrid",
+        expected=False,
+        timeout=connection_timeout,
+    )
     pose = Pose()
     pose.position.x, pose.position.y, pose.position.z = (
         float(board_center[0]), float(board_center[1]), float(board_center[2])
@@ -59,10 +68,51 @@ def select_gazebo_board_profile(
     )
     if not response.success:
         raise RuntimeError("Could not spawn Gazebo calibration board: {}".format(response.status_message))
+    _wait_for_gazebo_model_presence(
+        world,
+        model_name="intrinsic_aprilgrid",
+        expected=True,
+        timeout=connection_timeout,
+    )
     rospy.loginfo(
         "Gazebo calibration board selected: profile=%s model=%s",
         profile.profile_id,
         profile.gazebo_model,
+    )
+
+
+def _wait_for_gazebo_model_presence(
+    get_world_properties,
+    model_name: str,
+    expected: bool,
+    timeout: float,
+    poll_interval: float = 0.05,
+    stable_observations: int = 4,
+) -> None:
+    """Wait until Gazebo has stably committed an asynchronous model mutation."""
+    deadline = time.monotonic() + float(timeout)
+    last_error = None
+    matching_observations = 0
+    while time.monotonic() < deadline:
+        try:
+            present = model_name in get_world_properties().model_names
+            if present is expected:
+                matching_observations += 1
+                if matching_observations >= int(stable_observations):
+                    return
+            else:
+                matching_observations = 0
+            last_error = None
+        except Exception as exc:
+            matching_observations = 0
+            last_error = exc
+        time.sleep(poll_interval)
+    detail = " ({})".format(last_error) if last_error is not None else ""
+    state = "appear in" if expected else "disappear from"
+    raise RuntimeError(
+        "Gazebo calibration board '{}' did not {} world state within {:.1f}s{}".format(
+            model_name, state, float(timeout), detail
+        )
     )
 
 

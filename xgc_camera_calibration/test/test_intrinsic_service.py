@@ -217,7 +217,7 @@ class IntrinsicServiceTest(unittest.TestCase):
         self.assertGreaterEqual(max(abs(view["roll"]) for view in views), 0.46)
 
     def test_field_aprilgrid_scales_simulation_views_to_target_extent(self):
-        views = recommended_views((2.0, 0.0, 2.2), 0.66)
+        views = recommended_views((2.0, 0.0, 2.2), 0.66, camera_optical_origin=0.067)
         left = next(view for view in views if view["name"] == "left edge")
         near = next(view for view in views if view["name"] == "near maximum")
         self.assertEqual(left["position"], [0.8, 0.02, 2.2])
@@ -225,6 +225,24 @@ class IntrinsicServiceTest(unittest.TestCase):
         self.assertEqual(near["position"], [1.46, 0.0, 2.2])
         self.assertGreaterEqual(min(view["position"][2] for view in views), 2.01)
         self.assertEqual(len({tuple(view["position"]) for view in views}), len(views))
+
+    def test_a4_aprilgrid_scales_optical_distance_instead_of_camera_link_distance(self):
+        field = recommended_views(
+            (2.0, 0.0, 2.2), 0.66, camera_optical_origin=0.067
+        )
+        a4 = recommended_views(
+            (2.0, 0.0, 2.2), 0.18, camera_optical_origin=0.067
+        )
+        field_near = next(view for view in field if view["name"] == "near maximum")
+        a4_near = next(view for view in a4 if view["name"] == "near maximum")
+        field_optical_distance = 2.0 - field_near["position"][0] - 0.067
+        a4_optical_distance = 2.0 - a4_near["position"][0] - 0.067
+        self.assertAlmostEqual(
+            a4_optical_distance / field_optical_distance,
+            0.18 / 0.66,
+            delta=0.015,
+        )
+        self.assertEqual(a4_near["position"], [1.81, 0.0, 2.2])
 
     def test_web_assets_use_proxy_safe_relative_urls(self):
         index = (WEB_ROOT / "index.html").read_text(encoding="utf-8")

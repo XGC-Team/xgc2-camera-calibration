@@ -48,6 +48,8 @@ _SIM_TARGET_ANGLE_TOLERANCE_RAD = 0.04
 # adjustment well below ordinary camera moves.
 _SIM_TARGET_SENSOR_OFFSET_LIMIT_METERS = 0.08
 _PHYSICAL_APRILGRID_MIN_TILT_DEGREES = 10.0
+_SIM_CAMERA_OPTICAL_ORIGIN_METERS = 0.067
+_SIM_GUIDE_REFERENCE_BOARD_EXTENT_METERS = 0.66
 
 
 def intrinsic_calibration_directory(root: str, mode: str, camera_name: str) -> Path:
@@ -64,7 +66,10 @@ def intrinsic_calibration_directory(root: str, mode: str, camera_name: str) -> P
 
 
 def recommended_views(
-    board_center: Sequence[float], board_extent: float = 1.6
+    board_center: Sequence[float],
+    board_extent: float = 1.6,
+    camera_optical_origin: float = 0.0,
+    reference_board_extent: float = _SIM_GUIDE_REFERENCE_BOARD_EXTENT_METERS,
 ) -> List[Dict[str, Any]]:
     """Spatially-distinct sample poses that together fill X / Y / Size / Skew.
 
@@ -82,11 +87,27 @@ def recommended_views(
     extent = float(board_extent)
     if extent <= 0.0:
         raise ValueError("board extent must be positive")
+    optical_origin = float(camera_optical_origin)
+    reference_extent = float(reference_board_extent)
+    if optical_origin < 0.0:
+        raise ValueError("camera optical origin must be non-negative")
+    if reference_extent <= 0.0:
+        raise ValueError("reference board extent must be positive")
     view_scale = extent / 1.6
+    # The authored field-board poses locate the camera link, while rendering
+    # happens at a pinhole 67 mm ahead of that link.  Scale pinhole-to-board
+    # distance, not link-to-board distance, otherwise a small board places the
+    # sensor inside its near view even though the raw translation was scaled.
+    optical_correction = optical_origin * (1.0 - extent / reference_extent)
 
     def position(dx: float, dy: float, dz: float) -> Tuple[float, float, float]:
+        scaled_dx = dx * view_scale
+        if dx < 0.0:
+            scaled_dx -= optical_correction
+        elif dx > 0.0:
+            scaled_dx += optical_correction
         return (
-            tx + dx * view_scale,
+            tx + scaled_dx,
             ty + dy * view_scale,
             tz + dz * view_scale,
         )
@@ -220,7 +241,13 @@ class IntrinsicCalibrationService:
             "height": board_height,
         }
         self.views: List[Dict[str, Any]] = recommended_views(
-            self.board_center, max(board_width, board_height)
+            self.board_center,
+            max(board_width, board_height),
+            camera_optical_origin=(
+                _SIM_CAMERA_OPTICAL_ORIGIN_METERS
+                if self.board_type == "aprilgrid"
+                else 0.0
+            ),
         )
         distinct_separations = [
             sum(
