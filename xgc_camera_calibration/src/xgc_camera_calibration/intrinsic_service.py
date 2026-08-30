@@ -43,6 +43,10 @@ APRILGRID_ADAPTIVE_DETECTION_WIDTH = 2200
 CAMERA_NAME_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9._-]{0,63}$")
 _TARGET_CAPTURE_TOKEN_UNSET = object()
 _SIM_TARGET_ANGLE_TOLERANCE_RAD = 0.04
+# A rendered optical frame may sit ahead of the Gazebo model origin.  Eight
+# centimetres covers a compact camera body while keeping a one-time coordinate
+# adjustment well below ordinary camera moves.
+_SIM_TARGET_SENSOR_OFFSET_LIMIT_METERS = 0.08
 _PHYSICAL_APRILGRID_MIN_TILT_DEGREES = 10.0
 
 
@@ -245,7 +249,7 @@ class IntrinsicCalibrationService:
         self._selected_target_index: Optional[int] = None
         self._target_capture_phase = "idle"
         self._target_capture_epoch = 0
-        self._target_expected_pose: Optional[Dict[str, Tuple[float, ...]]] = None
+        self._target_expected_pose: Optional[Dict[str, Any]] = None
         self._target_pose_ack_enabled = False
         self._auto_run_thread: Optional[threading.Thread] = None
         self._auto_capture_thread: Optional[threading.Thread] = None
@@ -1043,8 +1047,10 @@ class IntrinsicCalibrationService:
         if orientation_norm <= 1e-12:
             return False
         self._target_expected_pose = {
+            "model_position": tuple(float(value) for value in position),
             "position": tuple(float(value) for value in position),
             "orientation": tuple(float(value) for value in orientation / orientation_norm),
+            "render_pose_anchored": False,
         }
         self._target_capture_phase = "awaiting_detection"
         self._target_pose_ack_enabled = False
@@ -1078,9 +1084,64 @@ class IntrinsicCalibrationService:
             or render_orientation is None
         ):
             return False
-        return self._render_pose_matches_expected_locked(
+        if self._render_pose_matches_expected_locked(
             render_position, render_orientation
+        ):
+            return True
+        # Gazebo acknowledges the authored model origin, while snapshot
+        # metadata describes the optical render frame.  Bind that fixed link
+        # offset only from a fresh, tokened transaction, and never use the
+        # anchoring image as calibration evidence.
+        self._anchor_target_render_pose_locked(render_position, render_orientation)
+        return False
+
+    def _anchor_target_render_pose_locked(
+        self,
+        render_position: Sequence[float],
+        render_orientation: Sequence[float],
+    ) -> bool:
+        expected = self._target_expected_pose
+        if expected is None or bool(expected.get("render_pose_anchored")):
+            return False
+        try:
+            position = np.asarray(render_position, dtype=np.float64).reshape(-1)
+            orientation = np.asarray(render_orientation, dtype=np.float64).reshape(-1)
+            model_position = np.asarray(
+                expected["model_position"], dtype=np.float64
+            ).reshape(-1)
+        except (KeyError, TypeError, ValueError):
+            return False
+        if (
+            len(position) != 3
+            or len(model_position) != 3
+            or len(orientation) != 4
+            or not bool(np.all(np.isfinite(position)))
+            or not bool(np.all(np.isfinite(model_position)))
+            or not bool(np.all(np.isfinite(orientation)))
+        ):
+            return False
+        orientation_norm = float(np.linalg.norm(orientation))
+        if orientation_norm <= 1e-12:
+            return False
+        normalized_orientation = orientation / orientation_norm
+        sensor_offset = float(np.linalg.norm(position - model_position))
+        dot = abs(float(np.dot(
+            normalized_orientation,
+            np.asarray(expected["orientation"], dtype=np.float64),
+        )))
+        angle_error = 2.0 * math.acos(min(1.0, max(0.0, dot)))
+        if (
+            not math.isfinite(sensor_offset)
+            or sensor_offset > _SIM_TARGET_SENSOR_OFFSET_LIMIT_METERS
+            or angle_error > _SIM_TARGET_ANGLE_TOLERANCE_RAD
+        ):
+            return False
+        expected["position"] = tuple(float(value) for value in position)
+        expected["orientation"] = tuple(
+            float(value) for value in normalized_orientation
         )
+        expected["render_pose_anchored"] = True
+        return True
 
     def _complete_target_sample_locked(
         self,

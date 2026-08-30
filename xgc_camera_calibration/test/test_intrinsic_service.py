@@ -295,6 +295,115 @@ class IntrinsicServiceTest(unittest.TestCase):
             service._capture_frame()
             self.assertTrue(service.target_done[0])
 
+    def test_production_capture_anchors_real_sensor_offset_then_accepts_next_frame(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = make_service(Path(directory) / "intrinsics.yaml")
+            camera = FakeCameraControl()
+            service.attach_camera_control(camera)
+            service.views[0]["position"] = [0.8, 0.02, 2.2]
+            render_position = (0.862546, -0.00401979, 2.2)
+            frame = SimpleNamespace(
+                bgr=render_board(),
+                render_position=render_position,
+                render_orientation=(0.0, 0.0, 0.0, 1.0),
+            )
+            service.attach_frame_capture(lambda: frame)
+
+            service.goto(0)
+            service._capture_frame()
+            self.assertEqual(service.samples, [])
+            self.assertFalse(service.target_done[0])
+            self.assertEqual(service._target_expected_pose["position"], render_position)
+            self.assertTrue(service._target_expected_pose["render_pose_anchored"])
+
+            service._capture_frame()
+            self.assertTrue(service.target_done[0])
+            self.assertEqual(service.sample_target_ids, [0])
+
+    def test_sensor_offset_anchor_rejects_far_and_stale_orientation_frames(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = make_service(Path(directory) / "intrinsics.yaml")
+            camera = FakeCameraControl()
+            service.attach_camera_control(camera)
+            target = np.asarray(service.views[0]["position"], dtype=np.float64)
+            good_position = tuple(target + np.asarray((0.062546, -0.02401979, 0.0)))
+            frames = iter((
+                SimpleNamespace(
+                    bgr=render_board(),
+                    render_position=tuple(target + np.asarray((0.2, 0.0, 0.0))),
+                    render_orientation=(0.0, 0.0, 0.0, 1.0),
+                ),
+                SimpleNamespace(
+                    bgr=render_board(),
+                    render_position=good_position,
+                    render_orientation=(0.0, 0.0, np.sin(0.05), np.cos(0.05)),
+                ),
+                SimpleNamespace(
+                    bgr=render_board(),
+                    render_position=good_position,
+                    render_orientation=(0.0, 0.0, 0.0, 1.0),
+                ),
+                SimpleNamespace(
+                    bgr=render_board(),
+                    render_position=good_position,
+                    render_orientation=(0.0, 0.0, 0.0, 1.0),
+                ),
+            ))
+            service.attach_frame_capture(lambda: next(frames))
+            service.goto(0)
+
+            service._capture_frame()
+            service._capture_frame()
+            self.assertEqual(service.samples, [])
+            self.assertFalse(service._target_expected_pose["render_pose_anchored"])
+            self.assertEqual(
+                service._target_expected_pose["position"], tuple(target)
+            )
+
+            service._capture_frame()
+            self.assertEqual(service.samples, [])
+            self.assertTrue(service._target_expected_pose["render_pose_anchored"])
+            service._capture_frame()
+            self.assertEqual(service.sample_target_ids, [0])
+
+    def test_sensor_offset_anchor_requires_the_current_target_capture_token(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = make_service(Path(directory) / "intrinsics.yaml")
+            camera = FakeCameraControl()
+            service.attach_camera_control(camera)
+            capture_started = threading.Event()
+            release_capture = threading.Event()
+
+            def delayed_capture():
+                capture_started.set()
+                self.assertTrue(release_capture.wait(timeout=1.0))
+                target = np.asarray(camera.current_position(), dtype=np.float64)
+                return SimpleNamespace(
+                    bgr=render_board(),
+                    render_position=tuple(
+                        target + np.asarray((0.062546, -0.02401979, 0.0))
+                    ),
+                    render_orientation=(0.0, 0.0, 0.0, 1.0),
+                )
+
+            service.goto(0)
+            service.attach_frame_capture(delayed_capture)
+            capture_thread = threading.Thread(target=service._capture_frame)
+            capture_thread.start()
+            self.assertTrue(capture_started.wait(timeout=1.0))
+            service.goto(1)
+            release_capture.set()
+            capture_thread.join(timeout=1.0)
+            self.assertFalse(capture_thread.is_alive())
+            self.assertEqual(service.samples, [])
+            self.assertFalse(service._target_expected_pose["render_pose_anchored"])
+
+            service._capture_frame()
+            self.assertEqual(service.samples, [])
+            self.assertTrue(service._target_expected_pose["render_pose_anchored"])
+            service._capture_frame()
+            self.assertEqual(service.sample_target_ids, [1])
+
     def test_manual_goto_marks_the_explicit_target_when_guide_positions_overlap(self):
         with tempfile.TemporaryDirectory() as directory:
             service = make_service(Path(directory) / "intrinsics.yaml")
