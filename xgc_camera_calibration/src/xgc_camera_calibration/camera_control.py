@@ -59,6 +59,11 @@ def select_gazebo_board_profile(
     )
     if not response.success:
         raise RuntimeError("Could not spawn Gazebo calibration board: {}".format(response.status_message))
+    rospy.loginfo(
+        "Gazebo calibration board selected: profile=%s model=%s",
+        profile.profile_id,
+        profile.gazebo_model,
+    )
 
 
 def look_at_orientation(position, target, yaw_offset=0.0, pitch_offset=0.0, roll=0.0):
