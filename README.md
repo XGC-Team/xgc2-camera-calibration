@@ -30,6 +30,18 @@ Open `http://127.0.0.1:8766/`. The optional `camera_control:=true` adapter can
 move a named Gazebo camera through the sample guide, but simulation control is
 not required by the intrinsic algorithm.
 
+`board_profile` accepts exactly two atomic profiles:
+
+- `field_6x6_88mm_30pct`;
+- `a4_6x6_24mm_30pct_kalibr_v1`.
+
+Both are 6×6 tag36h11 grids with ID 0 at the lower-left, IDs increasing along
++X then +Y, and every tag rendered with Kalibr `rotation=2` relative to
+OpenCV's raw marker image. This datum matches the established Gazebo textures;
+it does not select the Kalibr solver or require rosbag. Detection and solving
+remain on the same XGC OpenCV path for both profiles. The retired pre-datum A4
+identifier is rejected rather than translated or restored.
+
 The Media Edge must run on the same host and expose the configured source
 before the calibrator starts. Each manual or automatic sample creates one
 immutable snapshot, reads its RGB8 pixels and intrinsic metadata from that same

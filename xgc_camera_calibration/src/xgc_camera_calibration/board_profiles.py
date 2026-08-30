@@ -7,7 +7,7 @@ from typing import Dict
 
 
 FIELD_6X6_88MM_30PCT = "field_6x6_88mm_30pct"
-A4_6X6_24MM_30PCT = "a4_6x6_24mm_30pct"
+A4_6X6_24MM_30PCT_KALIBR_V1 = "a4_6x6_24mm_30pct_kalibr_v1"
 
 
 @dataclass(frozen=True)
@@ -32,8 +32,8 @@ PROFILES: Dict[str, AprilGridProfile] = {
         tag_gap_m=0.0264,
         gazebo_model="aprilgrid_6x6_tag36h11_88mm",
     ),
-    A4_6X6_24MM_30PCT: AprilGridProfile(
-        profile_id=A4_6X6_24MM_30PCT,
+    A4_6X6_24MM_30PCT_KALIBR_V1: AprilGridProfile(
+        profile_id=A4_6X6_24MM_30PCT_KALIBR_V1,
         columns=6,
         rows=6,
         tag_size_m=0.024,
