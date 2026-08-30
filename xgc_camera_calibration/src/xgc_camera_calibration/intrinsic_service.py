@@ -291,6 +291,7 @@ class IntrinsicCalibrationService:
         self._auto_run_thread: Optional[threading.Thread] = None
         self._auto_capture_thread: Optional[threading.Thread] = None
         self._auto_capture_stop = threading.Event()
+        self._auto_capture_requested = False
         self._auto_capture_interval = 0.0
         self._auto_capture_error: Optional[str] = None
         self._auto_capture_completed = False
@@ -488,10 +489,15 @@ class IntrinsicCalibrationService:
                     HTTPStatus.SERVICE_UNAVAILABLE,
                     "No calibration frame source is available",
                 )
+            self._auto_capture_requested = True
+            self._auto_capture_interval = interval
+            if self.result_restored:
+                self._auto_capture_error = None
+                self._auto_capture_completed = True
+                return {"ok": True, "auto_capture": self._auto_capture_document_locked()}
             current = self._auto_capture_thread
             if current is not None and current.is_alive():
                 return {"ok": True, "auto_capture": self._auto_capture_document_locked()}
-            self._auto_capture_interval = interval
             self._auto_capture_error = None
             self._auto_capture_completed = False
             self._auto_capture_stop.clear()
@@ -554,6 +560,7 @@ class IntrinsicCalibrationService:
     def stop_auto_capture(self) -> Dict[str, Any]:
         with self.lock:
             thread = self._auto_capture_thread
+            self._auto_capture_requested = False
             self._auto_capture_stop.set()
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=6.0)
@@ -895,6 +902,7 @@ class IntrinsicCalibrationService:
         self.result = result
         self.result_payload = self._result_document(result)
         self.result_restored = True
+        self._auto_capture_completed = True
         self.image_size = image_size
         metadata = document.get("metadata")
         coverage = metadata.get("coverage") if isinstance(metadata, dict) else None
@@ -1757,14 +1765,28 @@ class IntrinsicCalibrationService:
             bars, sample_goodenough = self._coverage_state_locked()
             if not self.samples and self.restored_coverage:
                 bars = [dict(item) for item in self.restored_coverage]
+            if self.result is not None:
+                bars = [
+                    {"label": label, "progress": 1.0}
+                    for label in intrinsic_solver.PARAM_NAMES
+                ]
             goodenough = self.result is not None or sample_goodenough
             # Guidance must use the same final bars presented to the operator.
             # Physical AprilGrid coverage replaces generic image-plane Skew with
             # signed plane-normal bins; recomputing the generic bars here could
             # recommend tilt while the visible incomplete axis is X or Y.
-            guidance = intrinsic_solver.next_view_guidance(
-                self.samples,
-                coverage_bars=bars,
+            guidance = (
+                {
+                    "complete": True,
+                    "dimension": None,
+                    "direction": "complete",
+                    "progress": 1.0,
+                }
+                if self.result is not None
+                else intrinsic_solver.next_view_guidance(
+                    self.samples,
+                    coverage_bars=bars,
+                )
             )
             targets = [{
                 "name": view["name"],
@@ -2200,4 +2222,8 @@ class IntrinsicCalibrationService:
             self._require_idle_locked()
             self._clear_session_locked()
             self.action = None
+            restart_auto_capture = self._auto_capture_requested
+            auto_capture_interval = self._auto_capture_interval
+        if restart_auto_capture:
+            self.start_auto_capture(auto_capture_interval)
         return self.state()

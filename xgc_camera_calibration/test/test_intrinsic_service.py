@@ -983,13 +983,23 @@ class IntrinsicServiceTest(unittest.TestCase):
             self.assertTrue(state["result_restored"])
             self.assertEqual(state["samples"], 40)
             self.assertAlmostEqual(state["result"]["fx"], 638.0)
-            self.assertTrue(restored.start_auto_capture(interval=0.1)["auto_capture"]["enabled"])
-            restored.stop_auto_capture()
+            self.assertTrue(all(item["progress"] == 1.0 for item in state["coverage"]))
+            self.assertEqual(state["guidance"], {
+                "complete": True,
+                "dimension": None,
+                "direction": "complete",
+                "progress": 1.0,
+            })
+            restored_capture = restored.start_auto_capture(interval=0.1)["auto_capture"]
+            self.assertFalse(restored_capture["enabled"])
+            self.assertTrue(restored_capture["coverage_complete"])
 
             restored.reset()
             self.assertTrue(output.exists())
             self.assertFalse(restored.state()["calibrated"])
             self.assertEqual(restored.state()["samples"], 0)
+            self.assertTrue(restored.state()["auto_capture"]["enabled"])
+            restored.stop_auto_capture()
 
     def test_latest_timestamped_result_restores_by_created_time(self):
         with tempfile.TemporaryDirectory() as directory:
