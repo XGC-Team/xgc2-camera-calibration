@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 
+import hashlib
+import io
 import json
 import tempfile
 import threading
 import unittest
 import urllib.error
 import urllib.request
+import zipfile
 from http import HTTPStatus
 from pathlib import Path
 from time import monotonic, sleep
@@ -152,12 +155,13 @@ def render_aprilgrid_view(center_pixel, depth_m, rotation_vector):
     return cv2.cvtColor(decoded, cv2.COLOR_GRAY2BGR)
 
 
-def make_service(output_file):
+def make_service(output_file, **kwargs):
     # 8x6 squares -> 7x5 interior corners.
     return IntrinsicCalibrationService(
         board_size=(7, 5), square=0.20, output_file=str(output_file),
         camera_name="usb_cam",
         media_source="usb_cam", display_width=640,
+        **kwargs,
     )
 
 
@@ -1017,6 +1021,123 @@ class IntrinsicServiceTest(unittest.TestCase):
             self.assertFalse(reset["calibrated"])
             self.assertTrue(saved.is_file())
             self.assertEqual(reset["output_file"], str(base))
+
+    def test_evidence_download_contains_exact_sources_annotations_manifest_and_yaml(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = make_service(
+                Path(directory) / "intrinsics.yaml",
+                calibration_mode="phy",
+                board_profile_id="field_6x6_88mm_30pct",
+            )
+            frame = render_board()
+            encoded, jpeg = cv2.imencode(
+                ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 96]
+            )
+            self.assertTrue(encoded)
+            source_jpeg = jpeg.tobytes()
+            service.process_frame(
+                frame,
+                source_image_size=(frame.shape[1], frame.shape[0]),
+                source_jpeg=source_jpeg,
+                source_snapshot_id="snapshot-1",
+                source_frame_id="usb_cam",
+                source_timestamp_nanoseconds=123456789,
+            )
+            self.assertEqual(service.state()["samples"], 1)
+            self.assertFalse(service.state()["evidence"]["available"])
+
+            result = intrinsic_solver.IntrinsicResult(
+                camera_matrix=np.array([
+                    [638.0, 0.0, 200.0],
+                    [0.0, 637.0, 160.0],
+                    [0.0, 0.0, 1.0],
+                ]),
+                distortion=np.array([-0.18, 0.04, 0.0, 0.0, 0.0]),
+                image_size=(frame.shape[1], frame.shape[0]),
+                rms_reprojection_error_px=0.42,
+                sample_count=1,
+            )
+            with patch.object(intrinsic_solver, "calibrate_intrinsic", return_value=result):
+                solved = service.calibrate()
+            evidence = service.state()["evidence"]
+            self.assertTrue(evidence["available"])
+            self.assertEqual(evidence["sample_count"], 1)
+            self.assertRegex(evidence["filename"], r"^intrinsics-.*-evidence\.zip$")
+
+            server = CalibrationHttpServer(
+                ("127.0.0.1", 0), object(), WEB_ROOT,
+                frame_ancestors="'self'", intrinsic_service=service,
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                url = "http://127.0.0.1:{}/api/v1/intrinsic/evidence.zip".format(
+                    server.server_address[1]
+                )
+                with urllib.request.urlopen(url) as response:
+                    self.assertEqual(response.headers.get_content_type(), "application/zip")
+                    self.assertEqual(
+                        response.headers["Content-Disposition"],
+                        'attachment; filename="{}"'.format(evidence["filename"]),
+                    )
+                    archive_payload = response.read()
+            finally:
+                server.shutdown()
+                server.server_close()
+
+            with zipfile.ZipFile(io.BytesIO(archive_payload)) as archive:
+                self.assertEqual(
+                    sorted(archive.namelist()),
+                    ["annotated/000.jpg", "intrinsics.yaml", "manifest.json", "source/000.jpg"],
+                )
+                self.assertEqual(archive.read("source/000.jpg"), source_jpeg)
+                self.assertEqual(
+                    archive.read("intrinsics.yaml"), Path(solved["output_file"]).read_bytes()
+                )
+                annotated = cv2.imdecode(
+                    np.frombuffer(archive.read("annotated/000.jpg"), dtype=np.uint8),
+                    cv2.IMREAD_COLOR,
+                )
+                self.assertEqual(annotated.shape, frame.shape)
+                manifest = json.loads(archive.read("manifest.json"))
+            self.assertEqual(manifest["schema"], "xgc2.camera.intrinsic-evidence.v1")
+            self.assertEqual(manifest["mode"], "phy")
+            self.assertEqual(manifest["camera_name"], "usb_cam")
+            self.assertEqual(manifest["board_profile"], "field_6x6_88mm_30pct")
+            self.assertEqual(manifest["samples"][0]["snapshot_id"], "snapshot-1")
+            self.assertEqual(manifest["samples"][0]["timestamp_nanoseconds"], 123456789)
+            self.assertEqual(
+                manifest["samples"][0]["source_sha256"],
+                hashlib.sha256(source_jpeg).hexdigest(),
+            )
+
+            old_evidence_root = service._evidence_root
+            service.reset()
+            self.assertFalse(old_evidence_root.exists())
+            with self.assertRaisesRegex(ApiError, "evidence is unavailable"):
+                service.evidence_bundle()
+
+    def test_source_sample_is_not_admitted_when_evidence_cannot_be_recorded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = make_service(Path(directory) / "intrinsics.yaml")
+            frame = render_board()
+            encoded, jpeg = cv2.imencode(".jpg", frame)
+            self.assertTrue(encoded)
+            with patch.object(
+                service,
+                "_record_evidence_sample_locked",
+                side_effect=OSError("evidence disk unavailable"),
+            ):
+                service.process_frame(
+                    frame,
+                    source_image_size=(frame.shape[1], frame.shape[0]),
+                    source_jpeg=jpeg.tobytes(),
+                )
+            state = service.state()
+            self.assertEqual(state["samples"], 0)
+            self.assertFalse(state["detection"]["accepted"])
+            self.assertEqual(state["evidence"]["sample_count"], 0)
+            self.assertEqual(state["recovery"]["last_error"], "evidence disk unavailable")
 
     def test_continuous_detection_keeps_running_after_coverage_is_ready(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -17,12 +17,14 @@ camera through the catalogue (goto / auto-run / reset).
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import os
 import re
 import tempfile
 import threading
 import time
+import zipfile
 from datetime import datetime, timezone
 from http import HTTPStatus
 from pathlib import Path
@@ -150,6 +152,8 @@ class IntrinsicCalibrationService:
         square: float,
         output_file: str,
         camera_name: str,
+        calibration_mode: str = "sim",
+        board_profile_id: str = "",
         jpeg_quality: int = 80,
         sample_distance: float = intrinsic_solver.SAMPLE_DISTANCE,
         maximum_detect_width: int = 960,
@@ -168,6 +172,10 @@ class IntrinsicCalibrationService:
             raise ValueError("output_file must not be empty")
         if not CAMERA_NAME_PATTERN.fullmatch(str(camera_name).strip()):
             raise ValueError("camera_name must be a stable identifier")
+        if str(calibration_mode).strip() not in ("sim", "phy"):
+            raise ValueError("calibration_mode must be sim or phy")
+        if board_profile_id and not CAMERA_NAME_PATTERN.fullmatch(str(board_profile_id).strip()):
+            raise ValueError("board_profile_id must be a stable identifier")
         if int(board_size[0]) < 2 or int(board_size[1]) < 2:
             raise ValueError("board_size must be at least 2x2")
         if float(square) <= 0.0:
@@ -188,6 +196,8 @@ class IntrinsicCalibrationService:
         self.square = float(square)
         self.output_file_base = str(Path(output_file).expanduser())
         self.camera_name = str(camera_name).strip()
+        self.calibration_mode = str(calibration_mode).strip()
+        self.board_profile_id = str(board_profile_id).strip()
         self.output_file = self.output_file_base
         self.checkpoint_file = self.output_file_base + ".session.npz"
         self.media_source = str(media_source).strip()
@@ -284,6 +294,12 @@ class IntrinsicCalibrationService:
         self._auto_capture_interval = 0.0
         self._auto_capture_error: Optional[str] = None
         self._auto_capture_completed = False
+        self._evidence_temporary = tempfile.TemporaryDirectory(
+            prefix="xgc2-intrinsic-evidence-"
+        )
+        self._evidence_root = Path(self._evidence_temporary.name)
+        self._evidence_samples: List[Dict[str, Any]] = []
+        self._evidence_bundle_path: Optional[Path] = None
         self._load_refs()
         self._load_recovery()
 
@@ -1001,6 +1017,190 @@ class IntrinsicCalibrationService:
         except OSError:
             pass
 
+    @staticmethod
+    def _write_evidence_file(path: Path, payload: bytes) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary = tempfile.mkstemp(
+            prefix="." + path.name + ".", suffix=".tmp", dir=str(path.parent)
+        )
+        try:
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, str(path))
+        except Exception:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+            raise
+
+    def _record_evidence_sample_locked(
+        self,
+        *,
+        source_jpeg: bytes,
+        source_width: int,
+        source_height: int,
+        image_points: np.ndarray,
+        coverage: Sequence[float],
+        target_index: Optional[int],
+        render_position: Optional[Sequence[float]],
+        render_orientation: Optional[Sequence[float]],
+        snapshot_id: str,
+        frame_id: str,
+        timestamp_nanoseconds: Optional[int],
+    ) -> None:
+        """Persist one solver-admitted source frame and its full-resolution overlay."""
+        if not source_jpeg:
+            raise CalibrationError("accepted calibration sample has no source JPEG evidence")
+        source = cv2.imdecode(np.frombuffer(source_jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if (
+            not isinstance(source, np.ndarray)
+            or source.shape[:2] != (int(source_height), int(source_width))
+        ):
+            raise CalibrationError("accepted calibration sample JPEG dimensions are invalid")
+        annotated = source.copy()
+        points = np.asarray(image_points, dtype=np.float32).reshape(-1, 1, 2)
+        if self.board_type == "aprilgrid":
+            for point in points.reshape(-1, 2):
+                cv2.circle(
+                    annotated,
+                    (int(round(point[0])), int(round(point[1]))),
+                    8,
+                    (0, 255, 0),
+                    2,
+                )
+        else:
+            cv2.drawChessboardCorners(annotated, self.board_size, points, True)
+        ok, encoded = cv2.imencode(
+            ".jpg",
+            annotated,
+            [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality],
+        )
+        if not ok:
+            raise CalibrationError("could not encode annotated calibration evidence")
+
+        index = len(self.samples) - 1
+        source_name = "source/{:03d}.jpg".format(index)
+        annotated_name = "annotated/{:03d}.jpg".format(index)
+        annotated_jpeg = encoded.tobytes()
+        self._write_evidence_file(self._evidence_root / source_name, source_jpeg)
+        self._write_evidence_file(self._evidence_root / annotated_name, annotated_jpeg)
+        target = self.views[target_index] if target_index is not None else None
+        self._evidence_samples.append({
+            "index": index,
+            "source_path": source_name,
+            "source_sha256": hashlib.sha256(source_jpeg).hexdigest(),
+            "source_bytes": len(source_jpeg),
+            "annotated_path": annotated_name,
+            "annotated_sha256": hashlib.sha256(annotated_jpeg).hexdigest(),
+            "annotated_bytes": len(annotated_jpeg),
+            "image_width": int(source_width),
+            "image_height": int(source_height),
+            "point_count": int(len(points)),
+            "coverage": {
+                label: float(value)
+                for label, value in zip(intrinsic_solver.PARAM_NAMES, coverage)
+            },
+            "target_index": target_index,
+            "target_name": target["name"] if target is not None else None,
+            "target_position": list(target["position"]) if target is not None else None,
+            "render_position": (
+                [float(value) for value in render_position]
+                if render_position is not None else None
+            ),
+            "render_orientation": (
+                [float(value) for value in render_orientation]
+                if render_orientation is not None else None
+            ),
+            "snapshot_id": str(snapshot_id),
+            "frame_id": str(frame_id),
+            "timestamp_nanoseconds": (
+                int(timestamp_nanoseconds)
+                if isinstance(timestamp_nanoseconds, int) else None
+            ),
+        })
+        self._evidence_bundle_path = None
+
+    def _evidence_document_locked(self) -> Dict[str, Any]:
+        available = bool(
+            self.result is not None
+            and not self.result_restored
+            and self._evidence_samples
+            and len(self._evidence_samples) == len(self.image_points)
+            and Path(self.output_file).is_file()
+        )
+        filename = ""
+        if available:
+            filename = "{}-evidence.zip".format(Path(self.output_file).stem)
+        return {
+            "available": available,
+            "sample_count": len(self._evidence_samples),
+            "filename": filename,
+        }
+
+    def evidence_bundle(self) -> Tuple[str, Path]:
+        """Build one immutable, session-local reproducibility archive on demand."""
+        with self.lock:
+            evidence = self._evidence_document_locked()
+            if not evidence["available"]:
+                raise ApiError(
+                    HTTPStatus.CONFLICT,
+                    "Calibration evidence is unavailable for this result",
+                )
+            if self._evidence_bundle_path is not None and self._evidence_bundle_path.is_file():
+                return str(evidence["filename"]), self._evidence_bundle_path
+            result_path = Path(self.output_file)
+            result_payload = result_path.read_bytes()
+            result_document = intrinsic_solver.load_intrinsic(result_path)
+            manifest = {
+                "schema": "xgc2.camera.intrinsic-evidence.v1",
+                "created_at": str(result_document.get("created_at", "")),
+                "mode": self.calibration_mode,
+                "camera_name": self.camera_name,
+                "media_source": self.media_source,
+                "board_profile": self.board_profile_id,
+                "board": self._board_document(),
+                "result": {
+                    "path": "intrinsics.yaml",
+                    "original_filename": result_path.name,
+                    "sha256": hashlib.sha256(result_payload).hexdigest(),
+                    "image_width": int(self.result.image_size[0]),
+                    "image_height": int(self.result.image_size[1]),
+                    "rms_reprojection_error_px": float(
+                        self.result.rms_reprojection_error_px
+                    ),
+                    "sample_count": int(self.result.sample_count),
+                },
+                "samples": [dict(sample) for sample in self._evidence_samples],
+            }
+            temporary = self._evidence_root / ".evidence.zip.tmp"
+            destination = self._evidence_root / str(evidence["filename"])
+            with zipfile.ZipFile(
+                str(temporary), "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6
+            ) as archive:
+                archive.writestr("intrinsics.yaml", result_payload)
+                archive.writestr(
+                    "manifest.json",
+                    (json.dumps(manifest, indent=2, sort_keys=True, allow_nan=False) + "\n")
+                    .encode("utf-8"),
+                )
+                for sample in self._evidence_samples:
+                    archive.write(
+                        self._evidence_root / str(sample["source_path"]),
+                        str(sample["source_path"]),
+                    )
+                    archive.write(
+                        self._evidence_root / str(sample["annotated_path"]),
+                        str(sample["annotated_path"]),
+                    )
+            os.chmod(temporary, 0o600)
+            os.replace(str(temporary), str(destination))
+            self._evidence_bundle_path = destination
+            return str(evidence["filename"]), destination
+
     def ref(self, index: int) -> Optional[bytes]:
         with self.lock:
             return self.refs.get(index)
@@ -1239,6 +1439,9 @@ class IntrinsicCalibrationService:
         render_orientation: Optional[Sequence[float]] = None,
         source_image_size: Optional[Sequence[int]] = None,
         source_jpeg: Optional[bytes] = None,
+        source_snapshot_id: str = "",
+        source_frame_id: str = "",
+        source_timestamp_nanoseconds: Optional[int] = None,
         _target_capture_token: Any = _TARGET_CAPTURE_TOKEN_UNSET,
     ) -> None:
         """Ingest one decoded BGR frame: detect the board, auto-collect, annotate."""
@@ -1429,13 +1632,36 @@ class IntrinsicCalibrationService:
                             self.image_points.append(calibration_corners)
                             self.object_points.append(calibration_objects)
                             self.sample_target_ids.append(target_index)
-                            self._update_pose_coverage_locked()
-                            try:
-                                self._save_checkpoint_locked()
-                            except Exception as error:
-                                self._recovery_error = str(error) or error.__class__.__name__
-                            if target_index is not None:
-                                self._complete_target_sample_locked(target_index, display)
+                            if source_jpeg:
+                                try:
+                                    self._record_evidence_sample_locked(
+                                        source_jpeg=source_jpeg,
+                                        source_width=source_width,
+                                        source_height=source_height,
+                                        image_points=calibration_corners,
+                                        coverage=params,
+                                        target_index=target_index,
+                                        render_position=render_position,
+                                        render_orientation=render_orientation,
+                                        snapshot_id=source_snapshot_id,
+                                        frame_id=source_frame_id,
+                                        timestamp_nanoseconds=source_timestamp_nanoseconds,
+                                    )
+                                except Exception as error:
+                                    self._recovery_error = str(error) or error.__class__.__name__
+                                    self.samples.pop()
+                                    self.image_points.pop()
+                                    self.object_points.pop()
+                                    self.sample_target_ids.pop()
+                                    accepted = False
+                            if accepted:
+                                self._update_pose_coverage_locked()
+                                try:
+                                    self._save_checkpoint_locked()
+                                except Exception as error:
+                                    self._recovery_error = str(error) or error.__class__.__name__
+                                if target_index is not None:
+                                    self._complete_target_sample_locked(target_index, display)
                 self.latest_detection = {
                     "status": "detected",
                     "corner_count": int(len(corners)),
@@ -1573,6 +1799,7 @@ class IntrinsicCalibrationService:
                     "result_restored": self.result_restored,
                     "last_error": self._recovery_error,
                 },
+                "evidence": self._evidence_document_locked(),
                 "action": dict(self.action) if self.action is not None else None,
                 "detection": {
                     **self.latest_detection,
@@ -1615,6 +1842,13 @@ class IntrinsicCalibrationService:
         self._target_expected_pose = None
         self._target_pose_ack_enabled = False
         self._auto_capture_completed = False
+        self._evidence_temporary.cleanup()
+        self._evidence_temporary = tempfile.TemporaryDirectory(
+            prefix="xgc2-intrinsic-evidence-"
+        )
+        self._evidence_root = Path(self._evidence_temporary.name)
+        self._evidence_samples = []
+        self._evidence_bundle_path = None
 
     def _require_camera(self) -> Any:
         if self.camera is None:
@@ -1645,6 +1879,9 @@ class IntrinsicCalibrationService:
             source_width = getattr(frame, "width", None)
             source_height = getattr(frame, "height", None)
             source_jpeg = getattr(frame, "jpeg", None)
+            source_snapshot_id = getattr(frame, "id", "")
+            source_frame_id = getattr(frame, "frame_id", "")
+            source_timestamp_nanoseconds = getattr(frame, "timestamp_nanoseconds", None)
             if not isinstance(frame, np.ndarray):
                 frame = getattr(frame, "bgr", None)
             if not isinstance(frame, np.ndarray):
@@ -1663,6 +1900,16 @@ class IntrinsicCalibrationService:
                 render_orientation,
                 source_image_size=source_image_size,
                 source_jpeg=source_jpeg if isinstance(source_jpeg, bytes) else None,
+                source_snapshot_id=(
+                    source_snapshot_id if isinstance(source_snapshot_id, str) else ""
+                ),
+                source_frame_id=(
+                    source_frame_id if isinstance(source_frame_id, str) else ""
+                ),
+                source_timestamp_nanoseconds=(
+                    source_timestamp_nanoseconds
+                    if isinstance(source_timestamp_nanoseconds, int) else None
+                ),
                 _target_capture_token=capture_token,
             )
         with self.lock:

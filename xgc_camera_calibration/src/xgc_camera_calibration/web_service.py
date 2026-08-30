@@ -500,6 +500,31 @@ class CalibrationRequestHandler(BaseHTTPRequestHandler):
         if self.command != "HEAD":
             self.wfile.write(payload)
 
+    def _send_file(
+        self,
+        status: int,
+        content_type: str,
+        path: Path,
+        download_name: str,
+    ) -> None:
+        if Path(download_name).name != download_name or not download_name:
+            raise ApiError(HTTPStatus.INTERNAL_SERVER_ERROR, "Download filename is invalid")
+        size = path.stat().st_size
+        self.send_response(int(status))
+        self._common_headers(content_type, size)
+        self.send_header(
+            "Content-Disposition", 'attachment; filename="{}"'.format(download_name)
+        )
+        self.end_headers()
+        if self.command == "HEAD":
+            return
+        with path.open("rb") as stream:
+            while True:
+                chunk = stream.read(1024 * 1024)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+
     def _send_json(self, status: int, payload: Dict[str, Any]) -> None:
         encoded = json.dumps(payload, separators=(",", ":"), allow_nan=False).encode("utf-8")
         self._send_bytes(status, "application/json; charset=utf-8", encoded)
@@ -640,6 +665,15 @@ class CalibrationRequestHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/v1/intrinsic/calibrations":
                 self._send_json(HTTPStatus.OK, self._intrinsic().calibration_history())
+                return
+            if path == "/api/v1/intrinsic/evidence.zip":
+                filename, evidence_path = self._intrinsic().evidence_bundle()
+                self._send_file(
+                    HTTPStatus.OK,
+                    "application/zip",
+                    evidence_path,
+                    filename,
+                )
                 return
             if path.startswith("/api/v1/intrinsic/validation/image/"):
                 self._send_bytes(

@@ -22,7 +22,7 @@ roslaunch xgc_camera_calibration intrinsic_calibrator.launch \
   media_source_id:=usb_cam snapshot_timeout:=5.0 \
   calibration_root:=/home/user/Documents/XGC/Calibration/camera \
   calibration_mode:=phy camera_name:=usb_cam \
-  board_cols:=7 board_rows:=5 square_size:=0.20 \
+  board_profile:=field_6x6_88mm_30pct \
   bind_address:=127.0.0.1 http_port:=8766
 ```
 
@@ -37,7 +37,8 @@ capture, then deletes it immediately. Live video remains WebRTC and is never
 polled through this calibration HTTP path.
 
 The product-facing intrinsic service is available under
-`/api/v1/intrinsic/`: `state`, `targets`, and `ref/<index>.jpg` are read
+`/api/v1/intrinsic/`: `state`, `targets`, `ref/<index>.jpg`, and
+`evidence.zip` are read
 endpoints; `capture`, `goto`, `reset_pose`, `auto_run`, `calibrate`, and
 `reset` are JSON actions. `capture` performs one explicit immutable snapshot;
 `auto_run` returns HTTP 202 immediately and exposes its authoritative progress
@@ -45,6 +46,16 @@ in `state.action`. Conflicting mutation requests return HTTP 409 until the
 sweep finishes; the OpenCV solver itself remains unchanged. `image.jpg` remains
 a compatibility view of the most recently processed sample, not a live-video
 transport.
+
+Every solver-admitted sample retains the exact source JPEG from its immutable
+Media Edge transaction plus a full-resolution annotated derivative in a
+session-local temporary directory. After a successful solve, `evidence.zip`
+streams a reproducibility package containing those paired images, the exact
+saved intrinsic YAML, and a SHA-256 manifest with camera, run mode, board
+profile, snapshot identity, timestamp, coverage and target/pose evidence. This
+contract is identical for `sim` and `phy`. Images are never automatically
+persisted under Documents; Reset or process exit removes the temporary set,
+while the timestamped YAML remains versioned as before.
 
 ### Fixed-world-camera extrinsic calibration
 
