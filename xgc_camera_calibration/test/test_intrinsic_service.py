@@ -888,6 +888,42 @@ class IntrinsicServiceTest(unittest.TestCase):
                 "progress": 0.817,
             })
 
+    def test_physical_guidance_finishes_spatial_coverage_before_signed_tilt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = IntrinsicCalibrationService(
+                board_size=(2, 2),
+                square=0.088,
+                output_file=str(Path(directory) / "intrinsics.yaml"),
+                camera_name="usb_cam",
+                board_type="aprilgrid",
+                tag_spacing=0.0264,
+                min_tags=4,
+                calibration_mode="phy",
+            )
+            service.samples = [
+                (0.06, 0.31, 0.24, 0.01),
+                (0.86, 0.96, 0.42, 0.29),
+            ]
+            final_bars = [
+                {"label": "X", "progress": 1.0},
+                {"label": "Y", "progress": 0.92},
+                {"label": "Size", "progress": 0.97},
+                {"label": "Skew", "progress": 0.5},
+            ]
+            with patch.object(
+                service,
+                "_coverage_state_locked",
+                return_value=(final_bars, False),
+            ):
+                state = service.state()
+            self.assertEqual(state["coverage"], final_bars)
+            self.assertEqual(state["guidance"], {
+                "complete": False,
+                "dimension": "Y",
+                "direction": "top",
+                "progress": 0.92,
+            })
+
     def test_accepted_corner_checkpoint_restores_an_interrupted_stage(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "intrinsics.yaml"
@@ -1029,6 +1065,44 @@ class IntrinsicServiceTest(unittest.TestCase):
             self.assertEqual(state["output_file"], str(newer))
             self.assertEqual(state["result"]["output_file"], str(newer))
             self.assertAlmostEqual(state["result"]["fx"], 742.0)
+
+    def test_in_progress_checkpoint_takes_precedence_over_an_older_saved_result(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory) / "intrinsics.yaml"
+            stage = make_service(base)
+            stage.samples = [(0.2, 0.3, 0.25, 0.1)]
+            stage.image_points = [np.zeros((35, 1, 2), dtype=np.float32)]
+            stage.object_points = [np.zeros((35, 3), dtype=np.float32)]
+            stage.sample_target_ids = [None]
+            stage.image_size = (1280, 720)
+            with stage.lock:
+                stage._save_checkpoint_locked()
+
+            saved = Path(directory) / "intrinsics-20260829T120000.000000Z.yaml"
+            saved_result = intrinsic_solver.IntrinsicResult(
+                camera_matrix=np.array(
+                    [[638.0, 0.0, 600.0], [0.0, 637.0, 390.0], [0.0, 0.0, 1.0]]
+                ),
+                distortion=np.array([0.01, -0.02, 0.0, 0.0, 0.0]),
+                image_size=(1280, 720),
+                rms_reprojection_error_px=0.9,
+                sample_count=40,
+            )
+            intrinsic_solver.save_intrinsic(
+                saved,
+                saved_result,
+                camera_name="usb_cam",
+                board_size=(7, 5),
+                square=0.20,
+            )
+
+            restored = make_service(base)
+            state = restored.state()
+            self.assertFalse(state["calibrated"])
+            self.assertFalse(state["result_restored"])
+            self.assertEqual(state["samples"], 1)
+            self.assertEqual(restored.samples, stage.samples)
+            self.assertEqual(state["output_file"], str(base))
 
     def test_calibrate_writes_timestamped_version_and_reset_preserves_it(self):
         with tempfile.TemporaryDirectory() as directory:

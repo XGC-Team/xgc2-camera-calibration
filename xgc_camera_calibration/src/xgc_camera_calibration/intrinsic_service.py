@@ -960,14 +960,21 @@ class IntrinsicCalibrationService:
         return bool(self.samples)
 
     def _load_recovery(self) -> None:
+        # An in-progress stage is newer operator intent than any previously
+        # saved versioned result. Successful calibration removes its
+        # checkpoint, so a valid checkpoint must win whenever both exist.
         try:
-            if self._load_saved_result():
+            if self._load_checkpoint():
                 return
-            self._load_checkpoint()
-        # A damaged or stale recovery artifact must never prevent the camera
-        # service from starting a fresh stage; expose the problem through state.
         except Exception as error:
             self._recovery_error = str(error) or error.__class__.__name__
+        try:
+            self._load_saved_result()
+        # A damaged recovery artifact must never prevent the camera service
+        # from starting a fresh stage; expose the first problem through state.
+        except Exception as error:
+            if self._recovery_error is None:
+                self._recovery_error = str(error) or error.__class__.__name__
 
     def _save_checkpoint_locked(self) -> None:
         if not self.samples or self.image_size is None or self.result is not None:
@@ -1775,6 +1782,19 @@ class IntrinsicCalibrationService:
             # Physical AprilGrid coverage replaces generic image-plane Skew with
             # signed plane-normal bins; recomputing the generic bars here could
             # recommend tilt while the visible incomplete axis is X or Y.
+            guidance_bars = bars
+            if self.result is None and self.calibration_mode == "phy":
+                spatial_incomplete = any(
+                    item["label"] != "Skew" and item["progress"] < 1.0
+                    for item in bars
+                )
+                if spatial_incomplete:
+                    guidance_bars = [
+                        {**item, "progress": 1.0}
+                        if item["label"] == "Skew"
+                        else item
+                        for item in bars
+                    ]
             guidance = (
                 {
                     "complete": True,
@@ -1785,7 +1805,7 @@ class IntrinsicCalibrationService:
                 if self.result is not None
                 else intrinsic_solver.next_view_guidance(
                     self.samples,
-                    coverage_bars=bars,
+                    coverage_bars=guidance_bars,
                 )
             )
             targets = [{
