@@ -787,114 +787,22 @@ class IntrinsicSolverTest(unittest.TestCase):
         ), self.assertRaisesRegex(ValueError, "too nearly parallel"):
             solver._refine_aprilgrid_quad_edges(gray, raw)
 
-    def test_contour_fallback_supports_opencv_42_aprilgrid_detection(self):
-        if not hasattr(cv2, "aruco") or not hasattr(cv2.aruco, "DICT_APRILTAG_36h11"):
-            self.skipTest("OpenCV AprilTag 36h11 dictionary is unavailable")
-        gray = _render_aprilgrid((6, 6), tag_pixels=45, gap_pixels=14, border=40)
-        # OpenCV 4.2 frequently returns rejected quads but no decoded ids for
-        # the real station plate. Force that result so the compatibility path
-        # remains covered even when tests run with a newer host OpenCV.
-        with mock.patch.object(
-            solver, "_detect_aruco_markers", return_value=([], None, [])
-        ):
-            detection = solver.detect_aprilgrid(
-                gray,
-                (6, 6),
-                square=0.088,
-                tag_spacing=0.0264,
-                min_tags=6,
-                maximum_width=960,
-            )
-        self.assertIsNotNone(detection)
-        self.assertEqual(len(detection.image_points), 144)
-        self.assertEqual(len(detection.object_points), 144)
-
-    def test_contour_fallback_never_assigns_an_undecoded_tag_by_lattice_position(self):
-        decoded_ids = (0, 1, 2, 6, 7, 8)
-        _objects, decoded_images = _project_standard_aprilgrid_tags(decoded_ids)
-        candidates = [
-            {
-                "quad": image,
-                "marker_id": marker_id,
-                "rotation": 0,
-                "payload_errors": 0,
-                "border_errors": 0,
-            }
-            for marker_id, image in zip(decoded_ids, decoded_images)
-        ]
-        # This quad lies at the next lattice location but failed independent
-        # payload decoding. Geometry must never promote it to id 3.
-        _objects, undecoded_image = _project_standard_aprilgrid_tags((3,))
-        candidates.append({
-            "quad": undecoded_image[0],
-            "marker_id": 3,
-            "rotation": 0,
-            "payload_errors": solver._APRILGRID_FALLBACK_MAX_PAYLOAD_ERRORS + 1,
-            "border_errors": 0,
-        })
-        gray = np.indices((240, 320)).sum(axis=0).astype(np.uint8) * 255
-        dictionary = cv2.aruco.getPredefinedDictionary(
-            cv2.aruco.DICT_APRILTAG_36h11
-        )
-        with mock.patch.object(
-            solver, "_extract_aprilgrid_quads", return_value=candidates
-        ):
-            recovered = solver._aprilgrid_contour_fallback(
-                gray,
-                dictionary,
-                (6, 6),
-                0.088,
-                0.0264,
-                0,
-                6,
-            )
-        self.assertIsNotNone(recovered)
-        _images, _objects, recovered_ids = recovered
-        self.assertEqual(tuple(recovered_ids), decoded_ids)
-        self.assertNotIn(3, recovered_ids)
-
-    def test_contour_fallback_stays_at_detection_width_and_restores_full_coordinates(self):
-        if not hasattr(cv2, "aruco") or not hasattr(cv2.aruco, "DICT_APRILTAG_36h11"):
-            self.skipTest("OpenCV AprilTag 36h11 dictionary is unavailable")
-        source = _render_aprilgrid((6, 6), tag_pixels=45, gap_pixels=14, border=40)
-        gray = cv2.resize(source, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_NEAREST)
-        fallback_widths = []
-        fallback = solver._aprilgrid_contour_fallback
-
-        def observed_fallback(image, *args, **kwargs):
-            fallback_widths.append(image.shape[1])
-            return fallback(image, *args, **kwargs)
-
-        with mock.patch.object(
-            solver, "_detect_aruco_markers", return_value=([], None, [])
-        ) as detect_markers, mock.patch.object(
-            solver, "_aprilgrid_contour_fallback", side_effect=observed_fallback
-        ):
-            detection = solver.detect_aprilgrid(
-                gray,
-                (6, 6),
-                square=0.088,
-                tag_spacing=0.0264,
-                min_tags=6,
-                maximum_width=960,
-            )
-        self.assertIsNotNone(detection)
-        self.assertEqual(fallback_widths, [960])
-        self.assertEqual(detect_markers.call_count, 1)
-        points = detection.image_points.reshape(-1, 2)
-        self.assertGreater(float(points[:, 0].max()), 960.0)
-        self.assertLessEqual(float(points[:, 0].max()), float(gray.shape[1]))
-        self.assertLessEqual(float(points[:, 1].max()), float(gray.shape[0]))
-
-    def test_board_absent_frame_does_not_run_large_recovery_pyramid(self):
+    def test_rejected_quads_only_trigger_source_retry_and_never_enter_solve(self):
         if not hasattr(cv2, "aruco") or not hasattr(cv2.aruco, "DICT_APRILTAG_36h11"):
             self.skipTest("OpenCV AprilTag 36h11 dictionary is unavailable")
         gray = np.full((540, 960), 127, np.uint8)
+        rejected = [
+            np.asarray(
+                (((10.0 + index, 10.0), (20.0 + index, 10.0),
+                  (20.0 + index, 20.0), (10.0 + index, 20.0)),),
+                dtype=np.float32,
+            )
+            for index in range(6)
+        ]
         with mock.patch.object(
-            solver, "_detect_aruco_markers", return_value=([], None, [])
-        ) as detect_markers, mock.patch.object(
-            solver, "_aprilgrid_contour_fallback", return_value=None
-        ) as fallback:
+            solver, "_detect_aruco_markers", return_value=([], None, rejected)
+        ) as detect_markers:
+            self.assertTrue(solver.aprilgrid_has_candidate_evidence(gray))
             detection = solver.detect_aprilgrid(
                 gray,
                 (6, 6),
@@ -904,30 +812,52 @@ class IntrinsicSolverTest(unittest.TestCase):
                 maximum_width=960,
             )
         self.assertIsNone(detection)
-        self.assertEqual(detect_markers.call_count, 1)
-        fallback.assert_called_once()
+        self.assertEqual(detect_markers.call_count, 2)
 
-    def test_retired_top_left_raw_marker_datum_is_rejected(self):
-        if not hasattr(cv2, "aruco") or not hasattr(cv2.aruco, "DICT_APRILTAG_36h11"):
-            self.skipTest("OpenCV AprilTag 36h11 dictionary is unavailable")
-        gray = _render_aprilgrid(
-            (6, 6),
-            tag_pixels=45,
-            gap_pixels=14,
-            border=40,
-            kalibr_datum=False,
+    def test_direct_decode_below_minimum_never_promotes_random_quads(self):
+        decoded_ids = (0, 1, 6, 7, 8)
+        _objects, decoded_images = _project_standard_aprilgrid_tags(decoded_ids)
+        opencv_order = np.asarray(
+            solver._APRILGRID_OPENCV_TO_KALIBR_CORNER_ORDER
         )
+        corners = [image[opencv_order].reshape(1, 4, 2) for image in decoded_images]
+        ids = np.asarray(decoded_ids, dtype=np.int32).reshape(-1, 1)
+        rejected = [np.random.default_rng(7).random((1, 4, 2)).astype(np.float32)] * 20
+        gray = np.full((800, 1200), 127, dtype=np.uint8)
         with mock.patch.object(
-            solver, "_detect_aruco_markers", return_value=([], None, [])
-        ):
+            solver, "_detect_aruco_markers", return_value=(corners, ids, rejected)
+        ), mock.patch.object(
+            solver, "refine_aprilgrid_calibration_corners"
+        ) as refinement:
             detection = solver.detect_aprilgrid(
                 gray,
                 (6, 6),
                 square=0.088,
                 tag_spacing=0.0264,
                 min_tags=6,
-                maximum_width=960,
+                maximum_width=1200,
             )
+        self.assertIsNone(detection)
+        refinement.assert_not_called()
+
+    def test_retired_top_left_raw_marker_datum_is_rejected(self):
+        if not hasattr(cv2, "aruco") or not hasattr(cv2.aruco, "DICT_APRILTAG_36h11"):
+            self.skipTest("OpenCV AprilTag 36h11 dictionary is unavailable")
+        gray = _render_aprilgrid(
+            (6, 6),
+            tag_pixels=80,
+            gap_pixels=24,
+            border=60,
+            kalibr_datum=False,
+        )
+        detection = solver.detect_aprilgrid(
+            gray,
+            (6, 6),
+            square=0.088,
+            tag_spacing=0.0264,
+            min_tags=6,
+            maximum_width=960,
+        )
         self.assertIsNone(detection)
 
     def test_canonical_kalibr_datum_accepts_all_global_image_quarter_turns(self):
@@ -990,10 +920,9 @@ def _render_aprilgrid(
         for col in range(cols):
             tag_row = rows - 1 - row if kalibr_datum else row
             tag_id = tag_row * cols + col
-            if hasattr(cv2.aruco, "generateImageMarker"):
-                tag = cv2.aruco.generateImageMarker(dictionary, tag_id, tag_pixels, None, 2)
-            else:
-                tag = cv2.aruco.drawMarker(dictionary, tag_id, tag_pixels, borderBits=2)
+            tag = cv2.aruco.generateImageMarker(
+                dictionary, tag_id, tag_pixels, None, 2
+            )
             if kalibr_datum:
                 tag = np.rot90(tag, 2)
             y0 = border + row * pitch

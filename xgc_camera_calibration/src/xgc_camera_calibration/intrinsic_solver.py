@@ -35,10 +35,6 @@ _APRILTAG_DICTIONARIES = {
     "36h11": "DICT_APRILTAG_36h11",
 }
 _APRILGRID_MARKER_BORDER_BITS = 2
-_APRILGRID_FALLBACK_MIN_SHARPNESS = 160.0
-_APRILGRID_FALLBACK_MARKER_PIXELS = 100
-_APRILGRID_FALLBACK_MAX_PAYLOAD_ERRORS = 5
-_APRILGRID_FALLBACK_MAX_BORDER_ERRORS = 2
 APRILGRID_FEATURE_MODEL = "aprilgrid_kalibr_tag_corners_v2"
 APRILGRID_CORNER_DATUM = "kalibr_id0_lower_left_opencv_rotated_180_v1"
 _APRILGRID_OPENCV_TO_KALIBR_CORNER_ORDER: Tuple[int, int, int, int] = (1, 0, 3, 2)
@@ -78,9 +74,8 @@ class BoardDetection:
     image_points: np.ndarray
     object_points: np.ndarray
     coverage: Tuple[float, float, float, float]
-    # Keep every decoded outer corner for annotation and coverage. Calibration
-    # points may be a quality-gated subset, but image/object arrays always use
-    # the same per-corner mask and ordering.
+    # Keep every decoded outer corner for annotation only. Coverage and solve
+    # both use this same quality-gated image/object mask and corner ordering.
     calibration_image_points: Optional[np.ndarray] = None
     calibration_object_points: Optional[np.ndarray] = None
 
@@ -257,19 +252,16 @@ def detect_board(
 
 
 def _detect_aruco_markers(image: np.ndarray, dictionary: Any):
-    if hasattr(cv2.aruco, "DetectorParameters"):
-        parameters = cv2.aruco.DetectorParameters()
-    elif hasattr(cv2.aruco, "DetectorParameters_create"):
-        parameters = cv2.aruco.DetectorParameters_create()
-    else:
-        raise CalibrationError("OpenCV aruco detector parameters are unavailable")
+    if not hasattr(cv2.aruco, "DetectorParameters") or not hasattr(
+        cv2.aruco, "ArucoDetector"
+    ):
+        raise CalibrationError(
+            "OpenCV contrib 4.12 ArUcoDetector contract is unavailable"
+        )
+    parameters = cv2.aruco.DetectorParameters()
     parameters.markerBorderBits = _APRILGRID_MARKER_BORDER_BITS
-    if hasattr(cv2.aruco, "ArucoDetector"):
-        detector = cv2.aruco.ArucoDetector(dictionary, parameters)
-        return detector.detectMarkers(image)
-    if hasattr(cv2.aruco, "detectMarkers"):
-        return cv2.aruco.detectMarkers(image, dictionary, parameters=parameters)
-    raise CalibrationError("OpenCV aruco marker detection is unavailable")
+    detector = cv2.aruco.ArucoDetector(dictionary, parameters)
+    return detector.detectMarkers(image)
 
 
 def aprilgrid_has_candidate_evidence(
@@ -556,234 +548,10 @@ def _refine_aprilgrid_quad_edges(gray: np.ndarray, quad: np.ndarray) -> np.ndarr
     return refined
 
 
-def _draw_aruco_marker(dictionary: Any, marker_id: int, size: int) -> np.ndarray:
-    """Render one marker across the OpenCV 4.2 and 4.7+ Python APIs."""
-    if hasattr(cv2.aruco, "generateImageMarker"):
-        return cv2.aruco.generateImageMarker(
-            dictionary, marker_id, size, None, _APRILGRID_MARKER_BORDER_BITS
-        )
-    if hasattr(cv2.aruco, "drawMarker"):
-        return cv2.aruco.drawMarker(
-            dictionary, marker_id, size,
-            borderBits=_APRILGRID_MARKER_BORDER_BITS,
-        )
-    raise CalibrationError("OpenCV aruco marker rendering is unavailable")
-
-
-def _ordered_quad(points: np.ndarray) -> np.ndarray:
-    """Return a convex quad in image TL, TR, BR, BL order."""
-    quad = np.asarray(points, dtype=np.float32).reshape(4, 2)
-    center = np.mean(quad, axis=0)
-    angles = np.arctan2(quad[:, 1] - center[1], quad[:, 0] - center[0])
-    quad = quad[np.argsort(angles)]
-    return np.roll(quad, -int(np.argmin(np.sum(quad, axis=1))), axis=0)
-
-
-def _aprilgrid_marker_templates(
-    dictionary: Any, start_id: int, count: int
-) -> List[np.ndarray]:
-    """Build Kalibr 10x10 templates: two black borders plus 6x6 payload."""
-    marker_pixels = _APRILGRID_FALLBACK_MARKER_PIXELS
-    cells = 6 + 2 * _APRILGRID_MARKER_BORDER_BITS
-    cell = marker_pixels // cells
-    templates: List[np.ndarray] = []
-    for marker_id in range(int(start_id), int(start_id) + int(count)):
-        marker = _draw_aruco_marker(dictionary, marker_id, marker_pixels)
-        bits = np.zeros((cells, cells), dtype=np.uint8)
-        for row in range(cells):
-            for col in range(cells):
-                patch = marker[
-                    row * cell + 2 : (row + 1) * cell - 2,
-                    col * cell + 2 : (col + 1) * cell - 2,
-                ]
-                bits[row, col] = int(float(np.mean(patch)) > 127.0)
-        templates.append(bits)
-    return templates
-
-
-def _decode_aprilgrid_quad(
-    gray: np.ndarray,
-    quad: np.ndarray,
-    templates: Sequence[np.ndarray],
-    start_id: int,
-) -> Tuple[int, int, int, int]:
-    """Return payload errors, marker id, rotation and border errors."""
-    marker_pixels = _APRILGRID_FALLBACK_MARKER_PIXELS
-    destination = np.array(
-        (
-            (0, 0),
-            (marker_pixels - 1, 0),
-            (marker_pixels - 1, marker_pixels - 1),
-            (0, marker_pixels - 1),
-        ),
-        dtype=np.float32,
-    )
-    transform = cv2.getPerspectiveTransform(quad, destination)
-    marker = cv2.warpPerspective(gray, transform, (marker_pixels, marker_pixels))
-    _threshold, marker = cv2.threshold(
-        marker, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU
-    )
-    cells = 6 + 2 * _APRILGRID_MARKER_BORDER_BITS
-    cell = marker_pixels // cells
-    bits = np.zeros((cells, cells), dtype=np.uint8)
-    for row in range(cells):
-        for col in range(cells):
-            patch = marker[
-                row * cell + 2 : (row + 1) * cell - 2,
-                col * cell + 2 : (col + 1) * cell - 2,
-            ]
-            bits[row, col] = int(float(np.mean(patch)) > 127.0)
-    payload = slice(_APRILGRID_MARKER_BORDER_BITS, cells - _APRILGRID_MARKER_BORDER_BITS)
-    border_mask = np.ones_like(bits, dtype=bool)
-    border_mask[payload, payload] = False
-    border = bits[border_mask]
-    border_errors = int(np.sum(border))
-    best = (37, int(start_id), 0, border_errors)
-    for offset, template in enumerate(templates):
-        for rotation in range(4):
-            rotated = np.rot90(template, rotation)
-            errors = int(np.count_nonzero(bits[payload, payload] != rotated[payload, payload]))
-            if errors < best[0]:
-                best = (errors, int(start_id) + offset, rotation, border_errors)
-    return best
-
-
-def _extract_aprilgrid_quads(
-    gray: np.ndarray, dictionary: Any, start_id: int, tag_count: int
-) -> List[Dict[str, Any]]:
-    """Extract and softly decode black AprilTag outer quads."""
-    templates = _aprilgrid_marker_templates(dictionary, start_id, tag_count)
-    binary = cv2.adaptiveThreshold(
-        gray,
-        255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV,
-        31,
-        7,
-    )
-    contours, _hierarchy = cv2.findContours(
-        binary, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE
-    )
-    image_area = float(gray.shape[0] * gray.shape[1])
-    candidates: List[Dict[str, Any]] = []
-    for contour in contours:
-        area = float(cv2.contourArea(contour))
-        if not image_area * 0.00035 < area < image_area * 0.03:
-            continue
-        perimeter = float(cv2.arcLength(contour, True))
-        approximate = cv2.approxPolyDP(contour, 0.04 * perimeter, True)
-        if len(approximate) != 4 or not cv2.isContourConvex(approximate):
-            continue
-        _center, dimensions, _angle = cv2.minAreaRect(approximate)
-        short_edge, long_edge = sorted((float(dimensions[0]), float(dimensions[1])))
-        if short_edge < 8.0 or long_edge / short_edge > 2.0:
-            continue
-        if area / max(1.0, short_edge * long_edge) < 0.6:
-            continue
-        quad = _ordered_quad(approximate)
-        payload_errors, marker_id, rotation, border_errors = _decode_aprilgrid_quad(
-            gray, quad, templates, start_id
-        )
-        candidates.append(
-            {
-                "quad": quad,
-                "center": np.mean(quad, axis=0),
-                "edge": float(
-                    np.mean(
-                        [
-                            np.linalg.norm(quad[(index + 1) % 4] - quad[index])
-                            for index in range(4)
-                        ]
-                    )
-                ),
-                "payload_errors": payload_errors,
-                "marker_id": marker_id,
-                "rotation": rotation,
-                "border_errors": border_errors,
-            }
-        )
-    return candidates
-
-
 def _project_points(homography: np.ndarray, points: np.ndarray) -> np.ndarray:
     return cv2.perspectiveTransform(
         np.asarray(points, dtype=np.float32).reshape(-1, 1, 2), homography
     ).reshape(-1, 2)
-
-
-def _aprilgrid_contour_fallback(
-    gray: np.ndarray,
-    dictionary: Any,
-    board_size: Sequence[int],
-    square: float,
-    tag_spacing: float,
-    start_id: int,
-    min_tags: int,
-    corner_datum: str = APRILGRID_CORNER_DATUM,
-) -> Optional[Tuple[List[np.ndarray], List[np.ndarray], List[int]]]:
-    """Recover a decoded lattice when OpenCV 4.2 rejects small real tags."""
-    sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
-    if sharpness < _APRILGRID_FALLBACK_MIN_SHARPNESS:
-        return None
-    tag_count = int(board_size[0]) * int(board_size[1])
-    candidates = _extract_aprilgrid_quads(gray, dictionary, start_id, tag_count)
-    anchors = [
-        candidate
-        for candidate in candidates
-        if int(candidate["payload_errors"])
-        <= _APRILGRID_FALLBACK_MAX_PAYLOAD_ERRORS
-        and int(candidate["border_errors"])
-        <= _APRILGRID_FALLBACK_MAX_BORDER_ERRORS
-    ]
-    if not anchors:
-        return None
-    unique_anchors: Dict[int, Dict[str, Any]] = {}
-    for anchor in anchors:
-        marker_offset = int(anchor["marker_id"]) - int(start_id)
-        if marker_offset < 0 or marker_offset >= tag_count:
-            return None
-        current = unique_anchors.get(marker_offset)
-        quality = (int(anchor["payload_errors"]), int(anchor["border_errors"]))
-        current_quality = (
-            (int(current["payload_errors"]), int(current["border_errors"]))
-            if current is not None
-            else None
-        )
-        if current_quality is None or quality < current_quality:
-            unique_anchors[marker_offset] = anchor
-    independently_decoded_ids = [
-        int(start_id) + marker_offset for marker_offset in sorted(unique_anchors)
-    ]
-    if len(unique_anchors) < int(min_tags) or not _aprilgrid_tag_lattice_is_two_dimensional(
-        independently_decoded_ids, board_size, start_id
-    ):
-        return None
-
-    image_points: List[np.ndarray] = []
-    object_points: List[np.ndarray] = []
-    tag_ids: List[int] = []
-    for marker_offset, candidate in sorted(unique_anchors.items()):
-        marker_id = int(start_id) + int(marker_offset)
-        tag_object = aprilgrid_tag_object_points(
-            board_size, square, tag_spacing, start_id, marker_id
-        )
-        if tag_object is None:
-            return None
-        # The decoder rotation identifies the canonical marker corner datum.
-        # It is not a geometry-driven D4 guess: an observation whose decoded
-        # canonical order disagrees with the board is rejected downstream.
-        decoded_opencv = np.roll(
-            np.asarray(candidate["quad"], dtype=np.float32),
-            int(candidate["rotation"]),
-            axis=0,
-        )
-        canonical = _opencv_corners_to_aprilgrid_datum(
-            decoded_opencv, corner_datum
-        )
-        image_points.append(canonical)
-        object_points.append(tag_object)
-        tag_ids.append(marker_id)
-    return image_points, object_points, tag_ids
 
 
 def aprilgrid_tag_object_points(
@@ -1010,25 +778,6 @@ def detect_aprilgrid(
         or any(value < first_id or value >= last_id for value in decoded_ids)
     ):
         return None
-    best_count = len(decoded_ids)
-    base_scale = scale
-    recovered = None
-    if best_count < int(min_tags):
-        # The contour/lattice path works at the already bounded search plane
-        # and is the compatibility path for older OpenCV AprilTag decoders.
-        # Try it before enlarging that plane through the recovery pyramid: a
-        # missing or motion-blurred board is common during physical movement
-        # and must not pay for ten large ArUco scans on every live cycle.
-        recovered = _aprilgrid_contour_fallback(
-            search,
-            dictionary,
-            board_size,
-            square,
-            tag_spacing,
-            start_id,
-            min_tags,
-            corner_datum,
-        )
     # Do not upscale this search image. AprilTag payload bits discarded by the
     # low-resolution decode cannot be reconstructed by interpolation. The
     # service uses rejected quads as evidence and retries by decoding the
@@ -1050,14 +799,7 @@ def detect_aprilgrid(
             image_points.append(image)
             object_points.append(obj)
             tag_ids.append(int(marker_id))
-    if recovered is not None:
-        image_points, object_points, tag_ids = recovered
-        if base_scale != 1.0:
-            image_points = [
-                (np.asarray(points, dtype=np.float32) / base_scale).astype(np.float32)
-                for points in image_points
-            ]
-    elif len(image_points) < int(min_tags):
+    if len(image_points) < int(min_tags):
         return None
     if not _aprilgrid_tag_lattice_is_two_dimensional(
         tag_ids, board_size, start_id
