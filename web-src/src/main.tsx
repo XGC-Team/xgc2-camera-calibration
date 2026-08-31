@@ -306,7 +306,10 @@ function ExtrinsicPage() {
 
                 <section className="calibration-control-section">
                   <SectionHeader title="3. Solve" />
-                  <Button id="solve-button" className="calibration-wide" tone="primary" appearance="solid" disabled>Solve and save</Button>
+                  <div className="calibration-actions">
+                    <Button id="solve-button" className="calibration-action" tone="primary" appearance="solid" disabled>Solve</Button>
+                    <Button id="save-button" className="calibration-action" tone="primary" appearance="solid" disabled>Save result</Button>
+                  </div>
                   <LegacyCodeResult id="result-box" initial="Select at least four markers." />
                 </section>
 

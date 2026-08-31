@@ -18,6 +18,7 @@ const ui = {
   remove: document.getElementById("remove-button"),
   clear: document.getElementById("clear-button"),
   solve: document.getElementById("solve-button"),
+  save: document.getElementById("save-button"),
   imageTopic: document.getElementById("image-topic"),
   intrinsicFile: document.getElementById("intrinsic-file"),
   posePrefix: document.getElementById("pose-prefix"),
@@ -36,6 +37,7 @@ const state = {
   liveTimer: null,
   stateTimer: null,
   restoredResultGeneration: null,
+  candidate: null,
 };
 
 function showBanner(element, message) {
@@ -129,6 +131,7 @@ function renderControls() {
   ui.remove.disabled = state.busy || !state.points.length;
   ui.clear.disabled = state.busy || !state.points.length;
   ui.solve.disabled = state.busy || !frozen || state.points.length < 4;
+  ui.save.disabled = state.busy || !state.candidate || state.candidate.saved;
   renderMarkerSelect();
   renderTable();
 }
@@ -201,6 +204,7 @@ function renderState(serverState) {
       error: point.reprojection_error_px,
     }));
     state.projections = serverState.result.projections || [];
+    state.candidate = serverState.result;
     ui.result.textContent = formatResult(serverState.result, serverState);
     state.restoredResultGeneration = serverState.generation;
   }
@@ -253,6 +257,7 @@ async function freezeFrame() {
     const serverState = await post("api/v1/freeze");
     state.points = [];
     state.projections = [];
+    state.candidate = null;
     state.restoredResultGeneration = serverState.generation;
     renderState(serverState);
     await loadFrame();
@@ -270,6 +275,7 @@ async function liveFrame() {
     renderState(await post("api/v1/live"));
     state.points = [];
     state.projections = [];
+    state.candidate = null;
     state.restoredResultGeneration = null;
     ui.result.textContent = "Select at least four markers.";
   } catch (error) {
@@ -282,6 +288,7 @@ async function liveFrame() {
 function clearPoints() {
   state.points = [];
   state.projections = [];
+  state.candidate = null;
   state.restoredResultGeneration = state.server ? state.server.generation : null;
   ui.result.textContent = "Select at least four markers.";
   renderControls();
@@ -297,6 +304,7 @@ async function solve() {
       points: state.points.map((point) => ({ marker: point.marker, pixel: point.pixel })),
     });
     state.projections = result.projections || [];
+    state.candidate = result;
     const pointByName = new Map((result.points || []).map((point) => [point.marker, point]));
     for (const point of state.points) {
       const solved = pointByName.get(point.marker);
@@ -304,9 +312,27 @@ async function solve() {
     }
     ui.result.textContent = formatResult(result, state.server);
     state.restoredResultGeneration = state.server.generation;
-    showBanner(ui.success, `Calibration saved to ${result.output_file}`);
+    showBanner(ui.success, "Extrinsic candidate ready; save it explicitly after review.");
     renderControls();
     fitCanvas();
+  } catch (error) {
+    showBanner(ui.error, error.message);
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function save() {
+  if (!state.candidate || state.candidate.saved) return;
+  clearMessages();
+  setBusy(true);
+  try {
+    const result = await post("api/v1/save", { candidate_id: state.candidate.candidate_id });
+    state.candidate = result;
+    state.projections = result.projections || [];
+    ui.outputFile.textContent = result.output_file || "—";
+    showBanner(ui.success, `Calibration saved to ${result.output_file}`);
+    renderControls();
   } catch (error) {
     showBanner(ui.error, error.message);
   } finally {
@@ -347,6 +373,7 @@ ui.remove.addEventListener("click", () => {
 });
 ui.clear.addEventListener("click", clearPoints);
 ui.solve.addEventListener("click", solve);
+ui.save.addEventListener("click", save);
 window.addEventListener("resize", fitCanvas);
 
 async function tickLiveFrame() {

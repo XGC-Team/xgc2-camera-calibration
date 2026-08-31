@@ -162,7 +162,11 @@ class WebCalibrationServiceTest(unittest.TestCase):
         result = self.service.solve(self.point_request())
         self.assertLess(result["max_reprojection_error_px"], 1e-3)
         self.assertEqual(len(result["projections"]), 6)
-        output = Path(result["output_file"])
+        self.assertFalse(result["saved"])
+        self.assertIsNone(result["output_file"])
+        self.assertEqual(list(self.output_directory.glob("extrinsics-*.yaml")), [])
+        saved = self.service.save(result["candidate_id"])
+        output = Path(saved["output_file"])
         self.assertEqual(output.parent, self.output_directory)
         self.assertRegex(
             output.name,
@@ -175,7 +179,9 @@ class WebCalibrationServiceTest(unittest.TestCase):
         self.assertEqual(document["calibration_mode"], "sim")
         self.assertEqual(document["camera_name"], "usb_cam")
         self.assertTrue(document["metadata"]["web_calibrator"])
+        self.assertEqual(document["metadata"]["candidate_id"], result["candidate_id"])
         self.assertEqual(document["metadata"]["image_topic"], FakeSource.image_topic)
+        self.assertEqual(self.service.save(result["candidate_id"]), saved)
 
     def test_state_has_no_fabricated_output_alias_before_solve(self):
         state = self.service.state()
@@ -183,12 +189,18 @@ class WebCalibrationServiceTest(unittest.TestCase):
         self.assertEqual(state["calibration_mode"], "sim")
         self.assertEqual(state["camera_name"], "usb_cam")
 
-    def test_each_solve_creates_a_new_concrete_result(self):
+    def test_solve_is_a_fixed_point_and_save_is_the_only_writer(self):
         self.service.freeze()
         first = self.service.solve(self.point_request())
         second = self.service.solve(self.point_request())
-        self.assertNotEqual(first["output_file"], second["output_file"])
-        self.assertEqual(len(list(self.output_directory.glob("extrinsics-*.yaml"))), 2)
+        self.assertEqual(first["candidate_id"], second["candidate_id"])
+        self.assertEqual(len(list(self.output_directory.glob("extrinsics-*.yaml"))), 0)
+        with self.assertRaises(ApiError) as context:
+            self.service.save("extrinsic-candidate-stale")
+        self.assertEqual(context.exception.status, 409)
+        saved = self.service.save(first["candidate_id"])
+        self.assertTrue(saved["saved"])
+        self.assertEqual(len(list(self.output_directory.glob("extrinsics-*.yaml"))), 1)
 
     def test_live_preview_reuses_compressed_jpeg_without_reencoding(self):
         with patch.object(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import mimetypes
@@ -198,6 +199,9 @@ class CalibrationService:
         self.frozen_jpeg: Optional[bytes] = None
         self.result: Optional[ExtrinsicResult] = None
         self.result_payload: Optional[Dict[str, Any]] = None
+        self.candidate_id: Optional[str] = None
+        self.saved_candidate_id: Optional[str] = None
+        self.candidate_points: Optional[Sequence[Dict[str, Any]]] = None
 
     def _encode_jpeg(self, image: np.ndarray) -> bytes:
         ok, encoded = cv2.imencode(
@@ -269,6 +273,10 @@ class CalibrationService:
             self.frozen_jpeg = encoded
             self.result = None
             self.result_payload = None
+            self.candidate_id = None
+            self.saved_candidate_id = None
+            self.candidate_points = None
+            self.output_file = None
         return self.state()
 
     def live(self) -> Dict[str, Any]:
@@ -370,17 +378,74 @@ class CalibrationService:
                         "reprojection_error_px": float(result.reprojection_errors_px[index]),
                     }
                 )
+            all_names = sorted(snapshot.markers)
+            all_world = np.asarray(
+                [snapshot.markers[name].position for name in all_names], dtype=np.float64
+            )
+            payload = _result_payload(
+                result,
+                all_names,
+                all_world,
+                np.asarray(snapshot.camera_matrix, dtype=np.float64),
+                np.asarray(snapshot.distortion, dtype=np.float64),
+            )
+            payload["points"] = persisted_points
+            candidate_document = {
+                "generation": self.generation,
+                "points": persisted_points,
+                "translation": payload["translation"],
+                "quaternion_xyzw": payload["quaternion_xyzw"],
+                "parent_frame": self.parent_frame,
+                "child_frame": self.child_frame,
+            }
+            encoded = json.dumps(
+                candidate_document, sort_keys=True, separators=(",", ":"), allow_nan=False
+            ).encode("utf-8")
+            candidate_id = "extrinsic-candidate-{}".format(hashlib.sha256(encoded).hexdigest())
+            payload["candidate_id"] = candidate_id
+            payload["saved"] = False
+            payload["output_file"] = None
+            payload["save_blocked"] = "explicit_save_required"
+            self.output_file = None
+            self.result = result
+            self.result_payload = payload
+            self.candidate_id = candidate_id
+            self.saved_candidate_id = None
+            self.candidate_points = persisted_points
+            return payload
+
+    def save(self, candidate_id: str) -> Dict[str, Any]:
+        identity = str(candidate_id).strip()
+        if not identity:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "candidate_id must not be empty")
+        with self.lock:
+            if self.saved_candidate_id is not None:
+                if identity == self.saved_candidate_id and self.result_payload is not None:
+                    return dict(self.result_payload)
+                raise ApiError(HTTPStatus.CONFLICT, "A different extrinsic candidate is already saved")
+            if self.result is None or self.result_payload is None or self.candidate_points is None:
+                raise ApiError(HTTPStatus.CONFLICT, "No extrinsic candidate is ready")
+            if identity != self.candidate_id:
+                raise ApiError(
+                    HTTPStatus.CONFLICT,
+                    "Extrinsic candidate changed; solve the frozen correspondences again",
+                    details={"expected_candidate_id": self.candidate_id},
+                )
+            snapshot = self.frozen
+            if snapshot is None:
+                raise ApiError(HTTPStatus.CONFLICT, "Frozen frame is unavailable")
             try:
                 output_file = versioned_extrinsic_path(self.output_directory)
                 save_extrinsic(
                     output_file,
-                    result,
+                    self.result,
                     calibration_mode=self.calibration_mode,
                     camera_name=self.camera_name,
                     parent_frame=self.parent_frame,
                     child_frame=self.child_frame,
-                    points=persisted_points,
+                    points=self.candidate_points,
                     metadata={
+                        "candidate_id": identity,
                         "image_topic": self.source.image_topic,
                         "intrinsic_file": str(self.source.intrinsic_file),
                         "pose_prefix": self.source.pose_prefix,
@@ -394,24 +459,15 @@ class CalibrationService:
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     "Could not save calibration result: {}".format(error),
                 ) from error
-
-            all_names = sorted(snapshot.markers)
-            all_world = np.asarray(
-                [snapshot.markers[name].position for name in all_names], dtype=np.float64
-            )
-            payload = _result_payload(
-                result,
-                all_names,
-                all_world,
-                np.asarray(snapshot.camera_matrix, dtype=np.float64),
-                np.asarray(snapshot.distortion, dtype=np.float64),
-            )
-            payload["points"] = persisted_points
             self.output_file = str(output_file)
-            payload["output_file"] = self.output_file
-            self.result = result
-            self.result_payload = payload
-            return payload
+            self.saved_candidate_id = identity
+            self.result_payload = {
+                **self.result_payload,
+                "saved": True,
+                "output_file": self.output_file,
+                "save_blocked": None,
+            }
+            return dict(self.result_payload)
 
 
 class CalibrationHttpServer(ThreadingHTTPServer):
@@ -711,6 +767,23 @@ class CalibrationRequestHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/v1/solve":
                 self._send_json(HTTPStatus.OK, self._extrinsic().solve(request))
+                return
+            if path == "/api/v1/save":
+                if not isinstance(request, dict) or set(request) != {"candidate_id"}:
+                    raise ApiError(
+                        HTTPStatus.BAD_REQUEST,
+                        "Extrinsic save requires only candidate_id",
+                    )
+                candidate_id = request.get("candidate_id")
+                if not isinstance(candidate_id, str) or not candidate_id.strip():
+                    raise ApiError(
+                        HTTPStatus.BAD_REQUEST,
+                        "Extrinsic save candidate_id must be a non-empty string",
+                    )
+                self._send_json(
+                    HTTPStatus.OK,
+                    self._extrinsic().save(candidate_id.strip()),
+                )
                 return
             if path == "/api/v1/intrinsic/candidate":
                 if request not in ({}, None):

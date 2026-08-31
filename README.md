@@ -101,6 +101,13 @@ those values are an input contract rather than a package dependency. They may
 come from the intrinsic tool above, a vendor calibration, or an existing
 calibration asset.
 
+The extrinsic HTTP contract separates computation from persistence. `freeze`
+captures one immutable image plus the latest static marker map; `solve`
+returns an in-memory candidate with a content-bound `candidate_id` and writes
+nothing; `save` accepts only that exact candidate ID and is the sole operation
+that creates a timestamped YAML. A stale candidate is rejected and repeating
+Save for the same candidate is idempotent. There is no solve-and-save alias.
+
 For a managed Gazebo world camera, use the snapshot mode instead:
 
 ```bash
@@ -146,7 +153,7 @@ roslaunch xgc_camera_calibration extrinsic_tf.launch \
 ```
 
 The calibrator writes exactly one immutable
-`<root>/<sim|phy>/<cameraName>/extrinsics-<UTC>.yaml` per solve. It does not
+`<root>/<sim|phy>/<cameraName>/extrinsics-<UTC>.yaml` per explicit Save. It does not
 create or update an `extrinsics.yaml` alias. `require_file_update` ignores every
 timestamped result that existed when the node started; the directory watcher
 then activates the concrete result from the current run. `watch_file` also
