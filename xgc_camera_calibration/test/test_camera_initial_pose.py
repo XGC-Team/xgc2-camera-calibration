@@ -19,6 +19,7 @@ from xgc_camera_calibration.solver import (
 from xgc_camera_calibration.transforms import (
     link_to_optical_rotation,
     quaternion_to_rotation_matrix,
+    split_parent_to_optical_pose,
 )
 
 
@@ -76,6 +77,16 @@ class CameraInitialPoseTest(unittest.TestCase):
             replace_roslaunch_pose_arguments(
                 ["/opt/ros/noetic/bin/roslaunch", "x:=0", "y:=0", "z:=0", "roll:=0", "pitch:=0"],
                 {"x": 0, "y": 0, "z": 0, "roll": 0, "pitch": 0, "yaw": 0},
+            )
+
+    def test_rejects_nonfinite_extrinsic_and_link_offsets(self):
+        with self.assertRaisesRegex(CalibrationError, "non-finite"):
+            split_parent_to_optical_pose(
+                (1.0, 2.0, 3.0), (0.0, 0.0, 0.0, 1.0), (float("nan"), 0.0, 0.0)
+            )
+        with self.assertRaisesRegex(CalibrationError, "non-finite"):
+            split_parent_to_optical_pose(
+                (float("inf"), 2.0, 3.0), (0.0, 0.0, 0.0, 1.0), (0.0, 0.0, 0.0)
             )
 
 

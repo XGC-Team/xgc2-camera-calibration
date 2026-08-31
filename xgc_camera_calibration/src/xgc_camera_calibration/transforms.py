@@ -12,6 +12,8 @@ CAMERA_LINK_TO_OPTICAL_TRANSLATION = np.zeros(3, dtype=np.float64)
 
 def quaternion_to_rotation_matrix(quaternion_xyzw):
     quaternion = np.asarray(quaternion_xyzw, dtype=np.float64).reshape(4)
+    if not np.all(np.isfinite(quaternion)):
+        raise CalibrationError("quaternion contains a non-finite value")
     norm = float(np.linalg.norm(quaternion))
     if norm < 1e-12:
         raise CalibrationError("quaternion has zero norm")
@@ -74,6 +76,8 @@ def split_parent_to_optical_pose(
     parent_r_link = parent_r_optical.dot(link_r_optical.T)
     link_t_optical = np.asarray(link_to_optical_translation, dtype=np.float64).reshape(3)
     parent_t_optical = np.asarray(translation, dtype=np.float64).reshape(3)
+    if not np.all(np.isfinite(link_t_optical)) or not np.all(np.isfinite(parent_t_optical)):
+        raise CalibrationError("camera translation contains a non-finite value")
     return {
         "parent_t_link": parent_t_optical - parent_r_link.dot(link_t_optical),
         "parent_q_link_xyzw": rotation_matrix_to_quaternion(parent_r_link),

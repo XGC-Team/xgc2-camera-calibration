@@ -50,6 +50,10 @@ def load_transform_chain(
     optical_frame = rospy.get_param(
         "~optical_frame", document.get("child_frame", "usb_cam_optical_frame")
     )
+    if expected_parent_frame and parent_frame != expected_parent_frame:
+        raise ValueError("extrinsic output parent frame cannot relabel the selected source frame")
+    if expected_optical_frame and optical_frame != expected_optical_frame:
+        raise ValueError("extrinsic output optical frame cannot relabel the selected source frame")
     camera_link_frame = rospy.get_param("~camera_link_frame", "usb_cam_link")
     offsets = tuple(
         float(rospy.get_param("~{}_offset".format(axis), 0.0)) for axis in ("x", "y", "z")
