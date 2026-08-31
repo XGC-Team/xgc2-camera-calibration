@@ -50,6 +50,40 @@ _SIM_CAMERA_OPTICAL_ORIGIN_METERS = 0.067
 _SIM_GUIDE_REFERENCE_BOARD_EXTENT_METERS = 0.66
 
 
+def intrinsic_feature_model(board_type: str) -> str:
+    return (
+        intrinsic_solver.APRILGRID_FEATURE_MODEL
+        if str(board_type).strip() == "aprilgrid"
+        else "checkerboard_corners_v1"
+    )
+
+
+def intrinsic_algorithm_provenance(
+    feature_model: str = intrinsic_solver.APRILGRID_FEATURE_MODEL,
+) -> Dict[str, str]:
+    """Fingerprint the exact installed modules that produce and validate K/D."""
+
+    package = Path(__file__).resolve().parent
+    names = (
+        "board_profiles.py",
+        "intrinsic_service.py",
+        "intrinsic_solver.py",
+        "intrinsic_validation.py",
+    )
+    digest = hashlib.sha256()
+    for name in names:
+        payload = (package / name).read_bytes()
+        digest.update(name.encode("utf-8"))
+        digest.update(b"\x00")
+        digest.update(hashlib.sha256(payload).digest())
+    return {
+        "contract": "xgc2.camera.intrinsic-algorithm.v1",
+        "sha256": digest.hexdigest(),
+        "opencv_version": str(cv2.__version__),
+        "feature_model": str(feature_model),
+    }
+
+
 def intrinsic_calibration_directory(root: str, mode: str, camera_name: str) -> Path:
     calibration_root = Path(str(root)).expanduser()
     calibration_mode = str(mode).strip()
@@ -814,6 +848,10 @@ class IntrinsicCalibrationService:
             if document.get("camera_name") != self.camera_name:
                 continue
             validated = self._saved_board_matches(document)
+            metadata = document.get("metadata", {})
+            if not isinstance(metadata, dict):
+                metadata = {}
+            file_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
             items.append({
                 "id": path.name,
                 "created_at": str(document.get("created_at", "")),
@@ -825,6 +863,16 @@ class IntrinsicCalibrationService:
                 ),
                 "sample_count": int(document.get("sample_count", 0)),
                 "validated": validated,
+                "file_sha256": file_sha256,
+                "board_profile": str(metadata.get("board_profile", "")),
+                "feature_model": str(metadata.get("feature_model", "")),
+                "quality_contract": str(metadata.get("quality_contract", "")),
+                "quality_passed": bool(
+                    isinstance(metadata.get("stability_assessment"), dict)
+                    and metadata["stability_assessment"].get("passed") is True
+                ),
+                "algorithm": dict(metadata.get("algorithm", {}))
+                if isinstance(metadata.get("algorithm"), dict) else {},
             })
         items.sort(key=lambda item: (item["created_time"], item["id"]), reverse=True)
         selected = next(
@@ -859,6 +907,8 @@ class IntrinsicCalibrationService:
                 HTTPStatus.UNPROCESSABLE_ENTITY,
                 "Selected intrinsic calibration belongs to another camera",
             )
+        document = dict(document)
+        document["xgc_file_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
         return path, document
 
     def _capture_validation_frame(self) -> np.ndarray:
@@ -1060,6 +1110,16 @@ class IntrinsicCalibrationService:
             "session_revision": self.session_revision,
             "collection_revision": self.collection_revision,
             "saved": True,
+            "quality_contract": str(metadata.get("quality_contract", "")),
+            "board_profile": str(metadata.get("board_profile", "")),
+            "feature_model": str(metadata.get("feature_model", "")),
+            "algorithm": dict(metadata.get("algorithm", {}))
+            if isinstance(metadata.get("algorithm"), dict) else {},
+            "quality": {
+                "status": "save_ready",
+                "reasons": [],
+                "assessment": dict(metadata.get("stability_assessment", {})),
+            },
         }
         coverage = metadata.get("coverage") if isinstance(metadata, dict) else None
         if isinstance(coverage, list):
@@ -1362,6 +1422,9 @@ class IntrinsicCalibrationService:
                 "board": self._board_document(),
                 "candidate": dict(self.candidate_payload or {}),
                 "solver_diagnostics": dict(self._candidate_diagnostics_full or {}),
+                "algorithm": intrinsic_algorithm_provenance(
+                    intrinsic_feature_model(self.board_type)
+                ),
                 "result": (
                     {
                         "path": "intrinsics.yaml",
@@ -2572,6 +2635,10 @@ class IntrinsicCalibrationService:
                         "code": "intrinsic_candidate_not_save_ready",
                         "candidate_id": current_id,
                         "quality_contract": "xgc2.camera.intrinsic-quality.v2",
+                        "board_profile": self.board_profile_id,
+                        "algorithm": intrinsic_algorithm_provenance(
+                            intrinsic_feature_model(self.board_type)
+                        ),
                         "reasons": reasons,
                         "assessment": assessment,
                     },
@@ -2598,6 +2665,10 @@ class IntrinsicCalibrationService:
                         ),
                         "candidate_id": current_id,
                         "quality_contract": "xgc2.camera.intrinsic-quality.v2",
+                        "board_profile": self.board_profile_id,
+                        "algorithm": intrinsic_algorithm_provenance(
+                            intrinsic_feature_model(self.board_type)
+                        ),
                         "session_revision": self.session_revision,
                         "collection_revision": self.collection_revision,
                         "coverage": intrinsic_solver.coverage(self.samples)[0],
@@ -2638,6 +2709,20 @@ class IntrinsicCalibrationService:
                 "session_revision": self.session_revision,
                 "collection_revision": self.collection_revision,
                 "saved": True,
+                "quality_contract": "xgc2.camera.intrinsic-quality.v2",
+                "board_profile": self.board_profile_id,
+                "feature_model": (
+                    intrinsic_solver.APRILGRID_FEATURE_MODEL
+                    if self.board_type == "aprilgrid" else "checkerboard_corners_v1"
+                ),
+                "algorithm": intrinsic_algorithm_provenance(
+                    intrinsic_feature_model(self.board_type)
+                ),
+                "quality": {
+                    "status": "save_ready",
+                    "reasons": [],
+                    "assessment": assessment,
+                },
             }
             self._evidence_bundle_path = None
             self._remove_checkpoint_locked()

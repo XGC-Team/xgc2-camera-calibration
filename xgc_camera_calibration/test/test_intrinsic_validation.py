@@ -75,11 +75,15 @@ class IntrinsicValidationTest(unittest.TestCase):
             "kind": "calibration",
             "calibration_id": "intrinsics-reference.yaml",
             "calibration_created_at": "2026-08-30T12:00:00Z",
+            "calibration_sha256": "", "board_profile": "", "feature_model": "",
+            "quality_contract": "", "quality_passed": False, "algorithm_sha256": "",
         })
         self.assertEqual(validation.report["configurations"]["comparison"], {
             "kind": "calibration",
             "calibration_id": "intrinsics-comparison.yaml",
             "calibration_created_at": "2026-08-30T13:00:00Z",
+            "calibration_sha256": "", "board_profile": "", "feature_model": "",
+            "quality_contract": "", "quality_passed": False, "algorithm_sha256": "",
         })
         self.assertGreater(validation.report["remap_delta_px"]["maximum"], 0.0)
         self.assertEqual(

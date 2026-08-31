@@ -22,9 +22,11 @@ from xgc_camera_calibration.solver import (
     CalibrationError,
     ExtrinsicResult,
     extrinsic_calibration_directory,
+    load_extrinsic_selection,
     save_extrinsic,
     solve_extrinsic,
     versioned_extrinsic_path,
+    write_extrinsic_selection,
 )
 
 
@@ -202,6 +204,69 @@ class CalibrationService:
         self.candidate_id: Optional[str] = None
         self.saved_candidate_id: Optional[str] = None
         self.candidate_points: Optional[Sequence[Dict[str, Any]]] = None
+        self.result_restored = False
+        self._pending_output_file: Optional[Tuple[str, Path]] = None
+        self.recovery_error: Optional[str] = None
+        try:
+            self._restore_selected_result()
+        except Exception as error:
+            self.recovery_error = str(error)
+
+    def _restore_selected_result(self) -> None:
+        restored = load_extrinsic_selection(
+            str(self.output_directory.parents[1]), self.calibration_mode, self.camera_name
+        )
+        if restored is None:
+            return
+        output_file, document, selection = restored
+        if (
+            document.get("parent_frame") != self.parent_frame
+            or document.get("child_frame") != self.child_frame
+        ):
+            raise CalibrationError("selected extrinsic frame identity does not match")
+        metadata = document.get("metadata", {})
+        if not isinstance(metadata, Mapping):
+            raise CalibrationError("selected extrinsic metadata must be an object")
+        points = document.get("points", [])
+        if not isinstance(points, list):
+            raise CalibrationError("selected extrinsic points must be an array")
+        inliers = document.get("inlier_indices", [])
+        warnings = document.get("warnings", [])
+        if not isinstance(inliers, list) or not isinstance(warnings, list):
+            raise CalibrationError("selected extrinsic diagnostics are invalid")
+        candidate_id = str(selection["candidate_id"])
+        self.output_file = str(output_file)
+        self.candidate_id = candidate_id
+        self.saved_candidate_id = candidate_id
+        self.candidate_points = list(points)
+        self.result_payload = {
+            "candidate_id": candidate_id,
+            "saved": True,
+            "translation": [float(value) for value in document["translation_array"]],
+            "quaternion_xyzw": [
+                float(value) for value in document["quaternion_xyzw_array"]
+            ],
+            "mean_reprojection_error_px": float(
+                document.get("mean_reprojection_error_px", 0.0)
+            ),
+            "max_reprojection_error_px": float(
+                document.get("max_reprojection_error_px", 0.0)
+            ),
+            "inlier_indices": [int(value) for value in inliers],
+            "warnings": [str(value) for value in warnings],
+            "projections": [],
+            "points": list(points),
+            "output_file": str(output_file),
+            "save_blocked": None,
+            "selection_file": str(
+                self.output_directory.parents[1]
+                / "selections" / self.camera_name
+                / "{}-extrinsic.json".format(self.calibration_mode)
+            ),
+        }
+        if metadata.get("candidate_id") != candidate_id:
+            raise CalibrationError("selected extrinsic candidate identity is invalid")
+        self.result_restored = True
 
     def _encode_jpeg(self, image: np.ndarray) -> bytes:
         ok, encoded = cv2.imencode(
@@ -220,10 +285,13 @@ class CalibrationService:
                 "mode": "frozen" if frozen is not None else "live",
                 "generation": self.generation,
                 "output_file": self.output_file,
+                "saved_candidate_id": self.saved_candidate_id,
                 "calibration_mode": self.calibration_mode,
                 "camera_name": self.camera_name,
                 "parent_frame": self.parent_frame,
                 "child_frame": self.child_frame,
+                "result_restored": self.result_restored,
+                "recovery_error": self.recovery_error,
                 "source": source_state,
                 "result": result,
             }
@@ -276,6 +344,9 @@ class CalibrationService:
             self.candidate_id = None
             self.saved_candidate_id = None
             self.candidate_points = None
+            self.result_restored = False
+            self._pending_output_file = None
+            self.recovery_error = None
             self.output_file = None
         return self.state()
 
@@ -412,6 +483,11 @@ class CalibrationService:
             self.candidate_id = candidate_id
             self.saved_candidate_id = None
             self.candidate_points = persisted_points
+            if (
+                self._pending_output_file is not None
+                and self._pending_output_file[0] != candidate_id
+            ):
+                self._pending_output_file = None
             return payload
 
     def save(self, candidate_id: str) -> Dict[str, Any]:
@@ -421,6 +497,31 @@ class CalibrationService:
         with self.lock:
             if self.saved_candidate_id is not None:
                 if identity == self.saved_candidate_id and self.result_payload is not None:
+                    try:
+                        selected = load_extrinsic_selection(
+                            str(self.output_directory.parents[1]),
+                            self.calibration_mode,
+                            self.camera_name,
+                        )
+                    except Exception as error:
+                        raise ApiError(
+                            HTTPStatus.CONFLICT,
+                            "Shared extrinsic selection is no longer valid: {}".format(error),
+                        ) from error
+                    if selected is None:
+                        raise ApiError(
+                            HTTPStatus.CONFLICT,
+                            "Shared extrinsic selection is no longer available",
+                        )
+                    if (
+                        str(selected[2]["candidate_id"]) != identity
+                        or self.output_file is None
+                        or selected[0] != Path(self.output_file).resolve()
+                    ):
+                        raise ApiError(
+                            HTTPStatus.CONFLICT,
+                            "A newer shared extrinsic selection superseded this candidate",
+                        )
                     return dict(self.result_payload)
                 raise ApiError(HTTPStatus.CONFLICT, "A different extrinsic candidate is already saved")
             if self.result is None or self.result_payload is None or self.candidate_points is None:
@@ -435,29 +536,40 @@ class CalibrationService:
             if snapshot is None:
                 raise ApiError(HTTPStatus.CONFLICT, "Frozen frame is unavailable")
             try:
-                output_file = versioned_extrinsic_path(self.output_directory)
-                save_extrinsic(
+                pending = self._pending_output_file
+                output_file = pending[1] if pending is not None and pending[0] == identity else None
+                if output_file is None:
+                    output_file = versioned_extrinsic_path(self.output_directory)
+                    save_extrinsic(
+                        output_file,
+                        self.result,
+                        calibration_mode=self.calibration_mode,
+                        camera_name=self.camera_name,
+                        parent_frame=self.parent_frame,
+                        child_frame=self.child_frame,
+                        points=self.candidate_points,
+                        metadata={
+                            "candidate_id": identity,
+                            "image_topic": self.source.image_topic,
+                            "intrinsic_file": str(self.source.intrinsic_file),
+                            "pose_prefix": self.source.pose_prefix,
+                            "image_width": snapshot.width,
+                            "image_height": snapshot.height,
+                            "web_calibrator": True,
+                        },
+                    )
+                    self._pending_output_file = (identity, output_file)
+                selection_file = write_extrinsic_selection(
+                    str(self.output_directory.parents[1]),
+                    self.calibration_mode,
+                    self.camera_name,
                     output_file,
-                    self.result,
-                    calibration_mode=self.calibration_mode,
-                    camera_name=self.camera_name,
-                    parent_frame=self.parent_frame,
-                    child_frame=self.child_frame,
-                    points=self.candidate_points,
-                    metadata={
-                        "candidate_id": identity,
-                        "image_topic": self.source.image_topic,
-                        "intrinsic_file": str(self.source.intrinsic_file),
-                        "pose_prefix": self.source.pose_prefix,
-                        "image_width": snapshot.width,
-                        "image_height": snapshot.height,
-                        "web_calibrator": True,
-                    },
+                    identity,
                 )
-            except OSError as error:
+            except (OSError, ValueError, CalibrationError) as error:
                 raise ApiError(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
-                    "Could not save calibration result: {}".format(error),
+                    "Could not save or select calibration result: {}".format(error),
                 ) from error
             self.output_file = str(output_file)
             self.saved_candidate_id = identity
@@ -465,8 +577,12 @@ class CalibrationService:
                 **self.result_payload,
                 "saved": True,
                 "output_file": self.output_file,
+                "selection_file": str(selection_file),
                 "save_blocked": None,
             }
+            self.result_restored = False
+            self._pending_output_file = None
+            self.recovery_error = None
             return dict(self.result_payload)
 
 

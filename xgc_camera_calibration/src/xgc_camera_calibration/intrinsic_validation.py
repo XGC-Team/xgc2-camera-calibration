@@ -248,10 +248,25 @@ def _configuration_report(
 ) -> Dict[str, Any]:
     if document is None:
         return {"kind": "raw"}
+    metadata = document.get("metadata", {})
+    if not isinstance(metadata, Mapping):
+        metadata = {}
+    stability = metadata.get("stability_assessment", {})
+    if not isinstance(stability, Mapping):
+        stability = {}
+    algorithm = metadata.get("algorithm", {})
+    if not isinstance(algorithm, Mapping):
+        algorithm = {}
     return {
         "kind": "calibration",
         "calibration_id": calibration_id,
         "calibration_created_at": str(document.get("created_at", "")),
+        "calibration_sha256": str(document.get("xgc_file_sha256", "")),
+        "board_profile": str(metadata.get("board_profile", "")),
+        "feature_model": str(metadata.get("feature_model", "")),
+        "quality_contract": str(metadata.get("quality_contract", "")),
+        "quality_passed": stability.get("passed") is True,
+        "algorithm_sha256": str(algorithm.get("sha256", "")),
     }
 
 

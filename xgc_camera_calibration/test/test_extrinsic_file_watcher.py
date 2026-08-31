@@ -4,43 +4,72 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from xgc_camera_calibration.extrinsic_file_watcher import ExtrinsicDirectoryWatcher
+import numpy as np
+
+from xgc_camera_calibration.extrinsic_file_watcher import (
+    ExtrinsicSelectionWatcher,
+)
+from xgc_camera_calibration.solver import (
+    ExtrinsicResult,
+    save_extrinsic,
+    write_extrinsic_selection,
+)
 
 
-class ExtrinsicDirectoryWatcherTest(unittest.TestCase):
-    def test_reports_latest_existing_timestamped_file_once(self):
+class ExtrinsicSelectionWatcherTest(unittest.TestCase):
+    def test_selection_watcher_follows_pointer_not_directory_mtime(self):
         with tempfile.TemporaryDirectory() as directory:
-            older = Path(directory) / "extrinsics-20260830T010000.000000Z.yaml"
-            newer = Path(directory) / "extrinsics-20260830T020000.000000Z.yaml"
-            older.write_text("first")
-            newer.write_text("second")
-            watcher = ExtrinsicDirectoryWatcher(directory)
-
+            root = Path(directory) / "camera"
+            selected = root / "phy" / "usb_cam" / "extrinsics-20260830T010000.000000Z.yaml"
+            newer = root / "phy" / "usb_cam" / "extrinsics-20260830T020000.000000Z.yaml"
+            for path, candidate in ((selected, "candidate-selected"), (newer, "candidate-newer")):
+                save_extrinsic(
+                    path,
+                    ExtrinsicResult(
+                        translation=np.asarray((1.0, 2.0, 3.0)),
+                        quaternion_xyzw=np.asarray((0.0, 0.0, 0.0, 1.0)),
+                        rotation_world_to_camera=np.eye(3),
+                        translation_world_to_camera=np.asarray((-1.0, -2.0, -3.0)),
+                        reprojection_errors_px=np.asarray((0.1, 0.2, 0.3, 0.4)),
+                        inlier_indices=np.asarray((0, 1, 2, 3)),
+                        warnings=(),
+                    ),
+                    calibration_mode="phy", camera_name="usb_cam",
+                    parent_frame="world", child_frame="usb_cam_optical_frame",
+                    metadata={"candidate_id": candidate},
+                )
+            write_extrinsic_selection(
+                str(root), "phy", "usb_cam", selected, "candidate-selected"
+            )
+            watcher = ExtrinsicSelectionWatcher(str(root), "phy", "usb_cam")
+            self.assertEqual(watcher.next_revision().path, selected.resolve())
+            self.assertIsNone(watcher.next_revision())
+            write_extrinsic_selection(
+                str(root), "phy", "usb_cam", newer, "candidate-newer"
+            )
             self.assertEqual(watcher.next_revision().path, newer.resolve())
-            self.assertIsNone(watcher.next_revision())
 
-    def test_ignores_prestart_results_until_a_new_timestamped_file_arrives(self):
+    def test_selection_watcher_can_require_pointer_update(self):
         with tempfile.TemporaryDirectory() as directory:
-            stale = Path(directory) / "extrinsics-20260830T010000.000000Z.yaml"
-            solved = Path(directory) / "extrinsics-20260830T020000.000000Z.yaml"
-            stale.write_text("stale")
-            watcher = ExtrinsicDirectoryWatcher(directory, require_update=True)
-
+            root = Path(directory) / "camera"
+            result = root / "phy" / "usb_cam" / "extrinsics-20260830T010000.000000Z.yaml"
+            save_extrinsic(
+                result,
+                ExtrinsicResult(
+                    translation=np.zeros(3), quaternion_xyzw=np.asarray((0.0, 0.0, 0.0, 1.0)),
+                    rotation_world_to_camera=np.eye(3), translation_world_to_camera=np.zeros(3),
+                    reprojection_errors_px=np.asarray((0.1, 0.1, 0.1, 0.1)),
+                    inlier_indices=np.asarray((0, 1, 2, 3)), warnings=(),
+                ),
+                calibration_mode="phy", camera_name="usb_cam",
+                parent_frame="world", child_frame="usb_cam_optical_frame",
+                metadata={"candidate_id": "candidate"},
+            )
+            write_extrinsic_selection(str(root), "phy", "usb_cam", result, "candidate")
+            watcher = ExtrinsicSelectionWatcher(
+                str(root), "phy", "usb_cam", require_update=True
+            )
             self.assertIsNone(watcher.next_revision())
-            solved.write_text("solved")
-            self.assertEqual(watcher.next_revision().path, solved.resolve())
-            self.assertIsNone(watcher.next_revision())
-
-    def test_accepts_first_result_created_after_start_and_ignores_alias(self):
-        with tempfile.TemporaryDirectory() as directory:
-            alias = Path(directory) / "extrinsics.yaml"
-            result = Path(directory) / "extrinsics-20260830T010000.000000Z.yaml"
-            alias.write_text("not part of the result contract")
-            watcher = ExtrinsicDirectoryWatcher(directory, require_update=True)
-
-            self.assertIsNone(watcher.next_revision())
-            result.write_text("solved")
-            self.assertEqual(watcher.next_revision().path, result.resolve())
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ catkin_install_python(PROGRAMS
   scripts/extrinsic_calibrator_web.py
   scripts/intrinsic_calibrator_web.py
   scripts/extrinsic_tf_publisher.py
+  scripts/gazebo_camera_from_extrinsic.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 install(DIRECTORY launch
@@ -23,6 +24,7 @@ if(CATKIN_ENABLE_TESTING)
   catkin_add_nosetests(test/test_intrinsic_solver.py)
   catkin_add_nosetests(test/test_intrinsic_aprilgrid_truth.py)
   catkin_add_nosetests(test/test_camera_control.py)
+  catkin_add_nosetests(test/test_camera_initial_pose.py)
   catkin_add_nosetests(test/test_intrinsic_service.py)
   catkin_add_nosetests(test/test_media_snapshot.py)
   catkin_add_nosetests(test/test_web_service.py)

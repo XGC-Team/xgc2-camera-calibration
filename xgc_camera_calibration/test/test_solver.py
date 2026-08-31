@@ -9,10 +9,14 @@ import numpy as np
 
 from xgc_camera_calibration.solver import (
     CalibrationError,
+    extrinsic_selection_path,
+    load_extrinsic_selection,
     load_extrinsic,
     save_extrinsic,
+    selected_extrinsic_path,
     selected_intrinsic_path,
     solve_extrinsic,
+    write_extrinsic_selection,
 )
 from xgc_camera_calibration.transforms import (
     link_to_optical_rotation,
@@ -172,11 +176,80 @@ class ExtrinsicSolverTest(unittest.TestCase):
             result.translation,
             atol=1e-12,
         )
+        np.testing.assert_allclose(chain["link_t_optical"], [0.0, 0.0, 0.0])
+
+        gazebo_chain = split_parent_to_optical_pose(
+            result.translation, result.quaternion_xyzw, [0.067, 0.0, 0.0]
+        )
+        gazebo_parent_r_link = quaternion_to_rotation_matrix(
+            gazebo_chain["parent_q_link_xyzw"]
+        )
+        np.testing.assert_allclose(
+            gazebo_chain["parent_t_link"]
+            + gazebo_parent_r_link.dot(gazebo_chain["link_t_optical"]),
+            result.translation,
+            atol=1e-12,
+        )
         np.testing.assert_allclose(
             link_to_optical_rotation().dot(np.array([1.0, 0.0, 0.0])),
             np.array([0.0, -1.0, 0.0]),
             atol=1e-12,
         )
+
+    def test_shared_selection_resolves_one_exact_immutable_extrinsic(self):
+        result = solve_extrinsic(self.world, self.pixels, self.intrinsic)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "camera"
+            output = root / "phy" / "usb_cam" / "extrinsics-20260830T010000.000000Z.yaml"
+            candidate_id = "extrinsic-candidate-selection"
+            save_extrinsic(
+                output, result, calibration_mode="phy", camera_name="usb_cam",
+                parent_frame="world", child_frame="usb_cam_optical_frame",
+                metadata={"candidate_id": candidate_id},
+            )
+            pointer = write_extrinsic_selection(
+                str(root), "phy", "usb_cam", output, candidate_id
+            )
+            self.assertEqual(
+                pointer,
+                extrinsic_selection_path(str(root), "phy", "usb_cam"),
+            )
+            selected, document, selection = load_extrinsic_selection(
+                str(root), "phy", "usb_cam"
+            )
+            self.assertEqual(selected, output.resolve())
+            self.assertEqual(document["metadata"]["candidate_id"], candidate_id)
+            self.assertEqual(selection["relative_path"], "phy/usb_cam/" + output.name)
+            self.assertEqual(
+                selected_extrinsic_path(str(root), "phy", "usb_cam", str(output)),
+                output.resolve(),
+            )
+
+            output.write_text(output.read_text(encoding="utf-8") + "# drift\n", encoding="utf-8")
+            with self.assertRaisesRegex(CalibrationError, "digest does not match"):
+                load_extrinsic_selection(str(root), "phy", "usb_cam")
+
+    def test_shared_selection_rejects_alias_or_cross_partition_result(self):
+        result = solve_extrinsic(self.world, self.pixels, self.intrinsic)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "camera"
+            physical = root / "phy" / "usb_cam" / "extrinsics-20260830T010000.000000Z.yaml"
+            simulation = root / "sim" / "usb_cam" / physical.name
+            for output, mode in ((physical, "phy"), (simulation, "sim")):
+                save_extrinsic(
+                    output, result, calibration_mode=mode, camera_name="usb_cam",
+                    parent_frame="world", child_frame="usb_cam_optical_frame",
+                    metadata={"candidate_id": "candidate-" + mode},
+                )
+            alias = physical.parent / "extrinsics.yaml"
+            alias.symlink_to(physical)
+            timestamp_alias = (
+                physical.parent / "extrinsics-20260830T030000.000000Z.yaml"
+            )
+            timestamp_alias.symlink_to(physical)
+            for invalid in (alias, timestamp_alias, simulation):
+                with self.assertRaises(ValueError):
+                    selected_extrinsic_path(str(root), "phy", "usb_cam", str(invalid))
 
 
 if __name__ == "__main__":

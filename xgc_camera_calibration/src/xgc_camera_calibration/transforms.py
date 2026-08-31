@@ -7,6 +7,9 @@ import numpy as np
 from .solver import CalibrationError, rotation_matrix_to_quaternion
 
 
+CAMERA_LINK_TO_OPTICAL_TRANSLATION = np.zeros(3, dtype=np.float64)
+
+
 def quaternion_to_rotation_matrix(quaternion_xyzw):
     quaternion = np.asarray(quaternion_xyzw, dtype=np.float64).reshape(4)
     norm = float(np.linalg.norm(quaternion))
@@ -39,19 +42,41 @@ def link_to_optical_rotation():
     return _rpy_matrix(-math.pi / 2.0, 0.0, -math.pi / 2.0)
 
 
-def split_parent_to_optical_pose(translation, quaternion_xyzw):
+def rotation_matrix_to_rpy(rotation):
+    """Return fixed-axis roll, pitch, yaw for a finite rotation matrix."""
+
+    matrix = np.asarray(rotation, dtype=np.float64).reshape(3, 3)
+    if not np.all(np.isfinite(matrix)):
+        raise CalibrationError("rotation matrix contains a non-finite value")
+    pitch = math.asin(max(-1.0, min(1.0, -float(matrix[2, 0]))))
+    if abs(math.cos(pitch)) > 1.0e-9:
+        roll = math.atan2(float(matrix[2, 1]), float(matrix[2, 2]))
+        yaw = math.atan2(float(matrix[1, 0]), float(matrix[0, 0]))
+    else:
+        roll = 0.0
+        yaw = math.atan2(-float(matrix[0, 1]), float(matrix[1, 1]))
+    return roll, pitch, yaw
+
+
+def split_parent_to_optical_pose(
+    translation, quaternion_xyzw,
+    link_to_optical_translation=CAMERA_LINK_TO_OPTICAL_TRANSLATION,
+):
     """Convert parent_T_optical into parent_T_link and link_T_optical.
 
-    The link and optical origins are coincident. camera_link uses x-forward,
-    y-left, z-up; camera_optical uses x-right, y-down, z-forward.
+    camera_link uses x-forward, y-left, z-up; camera_optical uses x-right,
+    y-down, z-forward. Callers must supply their measured/model-owned optical
+    offset; the generic physical-camera default remains coincident origins.
     """
 
     parent_r_optical = quaternion_to_rotation_matrix(quaternion_xyzw)
     link_r_optical = link_to_optical_rotation()
     parent_r_link = parent_r_optical.dot(link_r_optical.T)
+    link_t_optical = np.asarray(link_to_optical_translation, dtype=np.float64).reshape(3)
+    parent_t_optical = np.asarray(translation, dtype=np.float64).reshape(3)
     return {
-        "parent_t_link": np.asarray(translation, dtype=np.float64).reshape(3),
+        "parent_t_link": parent_t_optical - parent_r_link.dot(link_t_optical),
         "parent_q_link_xyzw": rotation_matrix_to_quaternion(parent_r_link),
-        "link_t_optical": np.zeros(3, dtype=np.float64),
+        "link_t_optical": link_t_optical,
         "link_q_optical_xyzw": rotation_matrix_to_quaternion(link_r_optical),
     }

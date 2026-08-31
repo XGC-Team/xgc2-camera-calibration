@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import json
+import shutil
 import tempfile
 import threading
 import unittest
@@ -175,6 +176,8 @@ class WebCalibrationServiceTest(unittest.TestCase):
         self.assertTrue(output.is_file())
         self.assertFalse((self.output_directory / "extrinsics.yaml").exists())
         self.assertEqual(self.service.state()["output_file"], str(output))
+        self.assertFalse(self.service.state()["result_restored"])
+        self.assertTrue(Path(saved["selection_file"]).is_file())
         document = load_extrinsic(output)
         self.assertEqual(document["calibration_mode"], "sim")
         self.assertEqual(document["camera_name"], "usb_cam")
@@ -182,6 +185,66 @@ class WebCalibrationServiceTest(unittest.TestCase):
         self.assertEqual(document["metadata"]["candidate_id"], result["candidate_id"])
         self.assertEqual(document["metadata"]["image_topic"], FakeSource.image_topic)
         self.assertEqual(self.service.save(result["candidate_id"]), saved)
+
+    def test_restart_restores_only_the_exact_shared_selection(self):
+        self.service.freeze()
+        candidate = self.service.solve(self.point_request())
+        saved = self.service.save(candidate["candidate_id"])
+
+        restored = CalibrationService(
+            FakeSource(self.snapshot),
+            calibration_root=str(self.calibration_root),
+            calibration_mode="sim",
+            camera_name="usb_cam",
+            parent_frame="map",
+            child_frame="camera_optical_frame",
+            maximum_inlier_error_px=1.0,
+        )
+        state = restored.state()
+        self.assertEqual(state["mode"], "live")
+        self.assertTrue(state["result_restored"])
+        self.assertEqual(state["output_file"], saved["output_file"])
+        self.assertTrue(state["result"]["saved"])
+        self.assertEqual(state["result"]["candidate_id"], candidate["candidate_id"])
+        self.assertEqual(state["result"]["selection_file"], saved["selection_file"])
+
+        restored.freeze()
+        self.assertFalse(restored.state()["result_restored"])
+        self.assertIsNone(restored.state()["result"])
+
+    def test_corrupt_selection_is_visible_but_does_not_block_fresh_save(self):
+        pointer = self.calibration_root / "selections" / "usb_cam" / "sim-extrinsic.json"
+        pointer.parent.mkdir(parents=True)
+        pointer.write_text('{"schema":"broken"}\n', encoding="utf-8")
+        service = CalibrationService(
+            FakeSource(self.snapshot), calibration_root=str(self.calibration_root),
+            calibration_mode="sim", camera_name="usb_cam", parent_frame="map",
+            child_frame="camera_optical_frame", maximum_inlier_error_px=1.0,
+        )
+        self.assertFalse(service.state()["result_restored"])
+        self.assertIn("invalid shape", service.state()["recovery_error"])
+        service.freeze()
+        request = self.point_request()
+        request["generation"] = service.generation
+        candidate = service.solve(request)
+        saved = service.save(candidate["candidate_id"])
+        self.assertTrue(saved["saved"])
+        self.assertIsNone(service.state()["recovery_error"])
+
+    def test_saved_retry_rejects_a_superseding_shared_selection(self):
+        self.service.freeze()
+        candidate = self.service.solve(self.point_request())
+        self.service.save(candidate["candidate_id"])
+        original = Path(self.service.output_file)
+        replacement = original.with_name("extrinsics-20990101T000000.000000Z.yaml")
+        shutil.copyfile(original, replacement)
+        from xgc_camera_calibration.solver import write_extrinsic_selection
+        write_extrinsic_selection(
+            str(self.calibration_root), "sim", "usb_cam", replacement,
+            candidate["candidate_id"],
+        )
+        with self.assertRaisesRegex(ApiError, "superseded"):
+            self.service.save(candidate["candidate_id"])
 
     def test_state_has_no_fabricated_output_alias_before_solve(self):
         state = self.service.state()
@@ -200,6 +263,30 @@ class WebCalibrationServiceTest(unittest.TestCase):
         self.assertEqual(context.exception.status, 409)
         saved = self.service.save(first["candidate_id"])
         self.assertTrue(saved["saved"])
+        self.assertEqual(len(list(self.output_directory.glob("extrinsics-*.yaml"))), 1)
+
+    def test_pointer_failure_retries_the_same_immutable_output(self):
+        self.service.freeze()
+        candidate = self.service.solve(self.point_request())
+        from xgc_camera_calibration import web_service as module
+
+        real_write = module.write_extrinsic_selection
+        attempts = 0
+
+        def flaky_write(*args, **kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise OSError("pointer unavailable")
+            return real_write(*args, **kwargs)
+
+        with patch.object(module, "write_extrinsic_selection", side_effect=flaky_write):
+            with self.assertRaisesRegex(ApiError, "Could not save or select"):
+                self.service.save(candidate["candidate_id"])
+            outputs = list(self.output_directory.glob("extrinsics-*.yaml"))
+            self.assertEqual(len(outputs), 1)
+            saved = self.service.save(candidate["candidate_id"])
+        self.assertEqual(Path(saved["output_file"]), outputs[0])
         self.assertEqual(len(list(self.output_directory.glob("extrinsics-*.yaml"))), 1)
 
     def test_live_preview_reuses_compressed_jpeg_without_reencoding(self):

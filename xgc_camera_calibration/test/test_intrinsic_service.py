@@ -21,6 +21,7 @@ import numpy as np
 from xgc_camera_calibration import intrinsic_solver, intrinsic_validation
 from xgc_camera_calibration.intrinsic_service import (
     IntrinsicCalibrationService,
+    intrinsic_algorithm_provenance,
     intrinsic_calibration_directory,
     recommended_views,
 )
@@ -284,6 +285,13 @@ class FakeCameraControl:
 
 
 class IntrinsicServiceTest(unittest.TestCase):
+    def test_algorithm_provenance_preserves_the_selected_feature_model(self):
+        feature_model = "checkerboard_corners_v1"
+        self.assertEqual(
+            intrinsic_algorithm_provenance(feature_model)["feature_model"],
+            feature_model,
+        )
+
     def test_storage_contract_is_explicitly_partitioned_by_mode_and_camera(self):
         root = "/home/operator/Documents/XGC/Calibration/camera"
         self.assertEqual(
@@ -1463,6 +1471,8 @@ class IntrinsicServiceTest(unittest.TestCase):
             self.assertEqual(manifest["mode"], "phy")
             self.assertEqual(manifest["camera_name"], "usb_cam")
             self.assertEqual(manifest["board_profile"], "field_6x6_88mm_30pct")
+            self.assertEqual(manifest["algorithm"]["contract"], "xgc2.camera.intrinsic-algorithm.v1")
+            self.assertRegex(manifest["algorithm"]["sha256"], r"^[0-9a-f]{64}$")
             self.assertEqual(manifest["samples"][0]["snapshot_id"], "snapshot-1")
             self.assertEqual(manifest["samples"][0]["timestamp_nanoseconds"], 123456789)
             self.assertEqual(
@@ -1486,6 +1496,14 @@ class IntrinsicServiceTest(unittest.TestCase):
             self.assertEqual(
                 saved_document["metadata"]["quality_contract"],
                 "xgc2.camera.intrinsic-quality.v2",
+            )
+            self.assertEqual(
+                saved_document["metadata"]["board_profile"],
+                "field_6x6_88mm_30pct",
+            )
+            self.assertEqual(
+                saved_document["metadata"]["algorithm"]["sha256"],
+                manifest["algorithm"]["sha256"],
             )
             self.assertEqual(
                 saved_document["metadata"]["candidate_id"],

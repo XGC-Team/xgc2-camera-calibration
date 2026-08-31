@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import math
+import hashlib
+import json
 import os
 import re
+import stat
 import tempfile
 from itertools import chain, combinations, islice
 from dataclasses import dataclass
@@ -21,6 +24,10 @@ CAMERA_NAME_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9._-]{0,63}$")
 INTRINSIC_FILENAME_PATTERN = re.compile(
     r"^intrinsics-\d{8}T\d{6}\.\d{6}Z\.yaml$"
 )
+EXTRINSIC_FILENAME_PATTERN = re.compile(
+    r"^extrinsics-\d{8}T\d{6}\.\d{6}Z(?:-\d{2})?\.yaml$"
+)
+EXTRINSIC_SELECTION_SCHEMA = "xgc2.camera.extrinsic-selection.v1"
 
 
 class CalibrationError(RuntimeError):
@@ -81,6 +88,184 @@ def versioned_extrinsic_path(directory: os.PathLike) -> Path:
         candidate = destination / "extrinsics-{}-{:02d}.yaml".format(timestamp, sequence)
         sequence += 1
     return candidate
+
+
+def selected_extrinsic_path(
+    root: str, mode: str, camera_name: str, extrinsic_file: str
+) -> Path:
+    """Validate one immutable extrinsic result in the selected partition."""
+
+    expected_directory = extrinsic_calibration_directory(root, mode, camera_name)
+    authored = Path(str(extrinsic_file).strip()).expanduser()
+    if not authored.is_absolute():
+        raise ValueError("extrinsic file must be absolute")
+    if authored.is_symlink():
+        raise ValueError("extrinsic file must not be a symbolic link")
+    try:
+        canonical_root = Path(str(root)).expanduser().resolve(strict=True)
+        selected = authored.resolve(strict=True)
+    except OSError as error:
+        raise ValueError("extrinsic file must resolve to an existing file") from error
+    expected_directory = canonical_root / str(mode).strip() / str(camera_name).strip()
+    if (
+        selected.parent != expected_directory
+        or not selected.is_file()
+        or not EXTRINSIC_FILENAME_PATTERN.fullmatch(selected.name)
+    ):
+        raise ValueError(
+            "extrinsic file must be a concrete extrinsics-UTC.yaml under {}/".format(
+                expected_directory
+            )
+        )
+    return selected
+
+
+def extrinsic_selection_path(root: str, mode: str, camera_name: str) -> Path:
+    """Return the shared pointer path without creating a YAML alias."""
+
+    calibration_root = Path(str(root)).expanduser()
+    calibration_mode = str(mode).strip()
+    identity = str(camera_name).strip()
+    if not calibration_root.is_absolute():
+        raise ValueError("calibration root must be absolute")
+    if calibration_mode not in ("sim", "phy"):
+        raise ValueError("calibration mode must be sim or phy")
+    if not CAMERA_NAME_PATTERN.fullmatch(identity):
+        raise ValueError("camera name must be a stable identifier")
+    return calibration_root / "selections" / identity / "{}-extrinsic.json".format(
+        calibration_mode
+    )
+
+
+def _read_regular_file_no_follow(path: Path) -> bytes:
+    try:
+        descriptor = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError as error:
+        raise CalibrationError("selected calibration file is unavailable") from error
+    try:
+        status = os.fstat(descriptor)
+        if not stat.S_ISREG(status.st_mode):
+            raise CalibrationError("selected calibration file must be regular")
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            return stream.read()
+    finally:
+        os.close(descriptor)
+
+
+def write_extrinsic_selection(
+    root: str,
+    mode: str,
+    camera_name: str,
+    extrinsic_file: os.PathLike,
+    candidate_id: str,
+) -> Path:
+    """Atomically point every Experiment at one exact immutable result."""
+
+    selected = selected_extrinsic_path(root, mode, camera_name, str(extrinsic_file))
+    payload = _read_regular_file_no_follow(selected)
+    try:
+        document = _validate_extrinsic_document(yaml.safe_load(payload.decode("utf-8")) or {})
+    except (UnicodeDecodeError, yaml.YAMLError) as error:
+        raise CalibrationError("selected extrinsic result is unreadable") from error
+    metadata = document.get("metadata")
+    if not isinstance(metadata, dict):
+        raise CalibrationError("extrinsic selection metadata must be an object")
+    if document["calibration_mode"] != mode or document["camera_name"] != camera_name:
+        raise CalibrationError("extrinsic selection identity does not match its result")
+    identity = str(candidate_id).strip()
+    if not identity or metadata.get("candidate_id") != identity:
+        raise CalibrationError("extrinsic selection candidate identity is invalid")
+    calibration_root = Path(str(root)).expanduser().resolve(strict=True)
+    pointer = extrinsic_selection_path(root, mode, camera_name)
+    pointer.parent.mkdir(parents=True, exist_ok=True)
+    selection = {
+        "schema": EXTRINSIC_SELECTION_SCHEMA,
+        "calibration_mode": mode,
+        "camera_name": camera_name,
+        "relative_path": selected.relative_to(calibration_root).as_posix(),
+        "sha256": hashlib.sha256(payload).hexdigest(),
+        "candidate_id": identity,
+        "selected_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=str(pointer.parent),
+            prefix=".{}-".format(pointer.name), suffix=".tmp", delete=False,
+        ) as stream:
+            temporary = Path(stream.name)
+            json.dump(selection, stream, indent=2, sort_keys=True, allow_nan=False)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(str(temporary), 0o600)
+        os.replace(str(temporary), str(pointer))
+        directory_fd = os.open(str(pointer.parent), getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if temporary is not None and temporary.exists():
+            temporary.unlink()
+    return pointer
+
+
+def load_extrinsic_selection(
+    root: str, mode: str, camera_name: str
+) -> Optional[Tuple[Path, Dict[str, Any], Dict[str, Any]]]:
+    """Resolve and verify the exact result named by the shared pointer."""
+
+    pointer = extrinsic_selection_path(root, mode, camera_name)
+    if not pointer.exists():
+        return None
+    if pointer.is_symlink() or not pointer.is_file():
+        raise CalibrationError("extrinsic selection pointer must be a regular file")
+    try:
+        selection = json.loads(_read_regular_file_no_follow(pointer).decode("utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError) as error:
+        raise CalibrationError("extrinsic selection pointer is unreadable") from error
+    required = {
+        "schema", "calibration_mode", "camera_name", "relative_path", "sha256",
+        "candidate_id", "selected_at",
+    }
+    if not isinstance(selection, dict) or set(selection) != required:
+        raise CalibrationError("extrinsic selection pointer has an invalid shape")
+    if (
+        selection["schema"] != EXTRINSIC_SELECTION_SCHEMA
+        or selection["calibration_mode"] != mode
+        or selection["camera_name"] != camera_name
+        or not isinstance(selection["relative_path"], str)
+        or not re.fullmatch(r"[0-9a-f]{64}", str(selection["sha256"]))
+        or not isinstance(selection["candidate_id"], str)
+        or not selection["candidate_id"]
+        or not isinstance(selection["selected_at"], str)
+        or not selection["selected_at"]
+    ):
+        raise CalibrationError("extrinsic selection pointer identity is invalid")
+    root_path = Path(str(root)).expanduser().resolve(strict=True)
+    candidate = root_path / selection["relative_path"]
+    try:
+        selected = selected_extrinsic_path(root, mode, camera_name, str(candidate))
+        payload = _read_regular_file_no_follow(selected)
+    except (OSError, ValueError) as error:
+        raise CalibrationError("extrinsic selection result is unavailable") from error
+    if hashlib.sha256(payload).hexdigest() != selection["sha256"]:
+        raise CalibrationError("extrinsic selection result digest does not match")
+    try:
+        raw_document = yaml.safe_load(payload.decode("utf-8")) or {}
+    except (UnicodeDecodeError, yaml.YAMLError) as error:
+        raise CalibrationError("extrinsic selection result is unreadable") from error
+    document = _validate_extrinsic_document(raw_document)
+    metadata = document.get("metadata")
+    if (
+        document["calibration_mode"] != mode
+        or document["camera_name"] != camera_name
+        or not isinstance(metadata, dict)
+        or metadata.get("candidate_id") != selection["candidate_id"]
+    ):
+        raise CalibrationError("extrinsic selection result identity does not match")
+    return selected, document, selection
 
 
 @dataclass(frozen=True)
@@ -460,10 +645,7 @@ def _ordered_values(value: Any, names: Sequence[str], field: str) -> np.ndarray:
     return result
 
 
-def load_extrinsic(path: os.PathLike) -> Dict[str, Any]:
-    source = Path(path).expanduser()
-    with source.open("r", encoding="utf-8") as stream:
-        document = yaml.safe_load(stream) or {}
+def _validate_extrinsic_document(document: Any) -> Dict[str, Any]:
     if not isinstance(document, dict):
         raise CalibrationError("extrinsic document must be a mapping")
     if document.get("schema") != "xgc2.camera.extrinsic.v1":
@@ -487,3 +669,10 @@ def load_extrinsic(path: os.PathLike) -> Dict[str, Any]:
     document["translation_array"] = translation
     document["quaternion_xyzw_array"] = quaternion / norm
     return document
+
+
+def load_extrinsic(path: os.PathLike) -> Dict[str, Any]:
+    source = Path(path).expanduser()
+    with source.open("r", encoding="utf-8") as stream:
+        document = yaml.safe_load(stream) or {}
+    return _validate_extrinsic_document(document)
