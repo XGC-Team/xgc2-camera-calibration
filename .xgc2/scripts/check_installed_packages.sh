@@ -17,7 +17,7 @@ for page in extrinsic intrinsic; do
   test -f "${PREFIX}/share/xgc_camera_calibration/web/${page}/app.js"
   test -f "${PREFIX}/share/xgc_camera_calibration/web/${page}/styles.css"
 done
-python3 -c 'from xgc_camera_calibration.camera_initial_pose import resolve_gazebo_camera_initial_pose; from xgc_camera_calibration.extrinsic_file_watcher import ExtrinsicSelectionWatcher; from xgc_camera_calibration.intrinsic_solver import calibrate_intrinsic; from xgc_camera_calibration.media_snapshot import MediaSnapshotClient; from xgc_camera_calibration.solver import load_extrinsic_selection, solve_extrinsic, write_extrinsic_selection; from xgc_camera_calibration.transforms import split_parent_to_optical_pose'
+python3 -c 'from xgc_camera_calibration.camera_initial_pose import resolve_gazebo_camera_pose_from_file; from xgc_camera_calibration.extrinsic_file_watcher import ExtrinsicSelectionWatcher; from xgc_camera_calibration.intrinsic_solver import calibrate_intrinsic; from xgc_camera_calibration.media_snapshot import MediaSnapshotClient; from xgc_camera_calibration.solver import load_extrinsic_selection, solve_extrinsic, write_extrinsic_selection; from xgc_camera_calibration.transforms import split_parent_to_optical_pose'
 RUNTIME="$(mktemp -d)"
 CALIBRATION_ROOT="${RUNTIME}/calibrations"
 CAMERA_NAME="package_smoke"
