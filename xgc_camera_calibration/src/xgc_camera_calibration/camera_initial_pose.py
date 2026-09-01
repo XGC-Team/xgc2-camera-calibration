@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Dict, Iterable, List, Sequence, Tuple
 
@@ -116,8 +117,18 @@ def replace_roslaunch_pose_arguments(
             raise CalibrationError(
                 "camera roslaunch arguments require exactly one {} assignment".format(name)
             )
-        result[matches[0]] = "{}:={:.17g}".format(name, float(pose[name]))
+        result[matches[0]] = "{}:={}".format(name, _roslaunch_decimal(pose[name]))
     return result
+
+
+def _roslaunch_decimal(value: float) -> str:
+    """Serialize a finite float without exponent syntax for ROS argparse."""
+
+    number = float(value)
+    if not math.isfinite(number):
+        raise CalibrationError("camera roslaunch pose values must be finite")
+    text = format(number, ".17f").rstrip("0").rstrip(".")
+    return "0" if text in ("", "-0") else text
 
 
 def _require_world_optical_document(

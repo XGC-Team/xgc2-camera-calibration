@@ -67,6 +67,13 @@ class CameraInitialPoseTest(unittest.TestCase):
                 pose,
             )
             self.assertTrue(any(value.startswith("x:=") and value != "x:=0" for value in launch))
+            tiny = replace_roslaunch_pose_arguments(
+                ["x:=0", "y:=0", "z:=0", "roll:=0", "pitch:=0", "yaw:=0"],
+                {"x": -4.0, "y": 1.2e-12, "z": 1.5, "roll": -7.2e-13,
+                 "pitch": 0.35, "yaw": -5.3e-13},
+            )
+            self.assertFalse(any("e" in value.lower() for value in tiny))
+            self.assertIn("roll:=-0.00000000000072", tiny)
 
     def test_fails_closed_without_complete_launch_args(self):
         with self.assertRaisesRegex(CalibrationError, "exactly one yaw"):

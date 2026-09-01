@@ -84,8 +84,8 @@ assert deb["size"] > 0
 PY
 
 grep -q '^id: xgc2-camera-calibration-ros1$' .xgc2/product.yml
-grep -q '^version: 0.3.0-32$' .xgc2/product.yml
-grep -q '^    focal: 0.3.0-32$' .xgc2/product.yml
+grep -q '^version: 0.3.0-33$' .xgc2/product.yml
+grep -q '^    focal: 0.3.0-33$' .xgc2/product.yml
 grep -Fq 'DOCKER_IMAGE="${DOCKER_IMAGE:-ghcr.io/xgc-team/xgc2-images/xgc2-build-focal-full-noetic:1.0.1}"' \
   .xgc2/scripts/build_debs_in_docker.sh
 if grep -q '^    focal: .*~focal' .xgc2/product.yml; then
