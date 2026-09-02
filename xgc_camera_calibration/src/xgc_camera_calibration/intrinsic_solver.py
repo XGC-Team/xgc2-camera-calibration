@@ -215,6 +215,7 @@ def detect_board(
     tag_family: str = "tag36h11",
     start_id: int = 0,
     min_tags: int = 6,
+    require_refinement: bool = True,
 ) -> Optional[BoardDetection]:
     """Detect one calibration board and return image/object correspondences."""
     if gray.ndim != 2:
@@ -230,6 +231,7 @@ def detect_board(
             start_id=start_id,
             min_tags=min_tags,
             maximum_width=maximum_width,
+            require_refinement=require_refinement,
         )
     if kind not in ("checkerboard", "chessboard"):
         raise ValueError("unsupported calibration board type: {}".format(board_type))
@@ -267,9 +269,14 @@ def _detect_aruco_markers(image: np.ndarray, dictionary: Any):
 def aprilgrid_has_candidate_evidence(
     gray: np.ndarray,
     tag_family: str = "tag36h11",
-    minimum_quads: int = 6,
+    minimum_quads: int = 1,
 ) -> bool:
-    """Return whether a low-resolution frame justifies a source-level retry."""
+    """Return whether a low-resolution frame justifies a higher-resolution retry.
+
+    One decoded marker or rejected quad is enough. A4 24 mm tags at arm's
+    length occupy ~8 px on the VGA search plane and often yield fewer than
+    six recovered quads even though the source JPEG still decodes the board.
+    """
     if gray.ndim != 2 or minimum_quads < 1 or not hasattr(cv2, "aruco"):
         return False
     dictionary_name = _APRILTAG_DICTIONARIES.get(str(tag_family).strip().lower())
@@ -746,8 +753,14 @@ def detect_aprilgrid(
     min_tags: int = 6,
     maximum_width: int = 960,
     corner_datum: str = APRILGRID_CORNER_DATUM,
+    require_refinement: bool = True,
 ) -> Optional[BoardDetection]:
-    """Detect a Kalibr-style AprilGrid and return the visible tag corners."""
+    """Detect a Kalibr-style AprilGrid and return the visible tag corners.
+
+    Search planes may pass ``require_refinement=False`` so a decoded lattice
+    can annotate the live result even when 20 px edge fitting is impossible
+    at VGA. Sample admission still requires source-resolution refinement.
+    """
     if float(square) <= 0.0:
         raise ValueError("AprilGrid tag size must be positive")
     if float(tag_spacing) < 0.0:
@@ -809,41 +822,51 @@ def detect_aprilgrid(
     tag_object_points = np.asarray(object_points, dtype=np.float32).reshape(-1, 4, 3)
     raw_pixels = tag_image_points.reshape(-1, 1, 2)
     objects = tag_object_points.reshape(-1, 3)
+    calibration_pixels = None
+    calibration_objects = None
     try:
         calibration_pixels, calibration_objects = refine_aprilgrid_calibration_corners(
             gray, tag_image_points, tag_object_points, minimum_tags=min_tags
         )
+        calibration_image_tags = np.asarray(
+            calibration_pixels, dtype=np.float32
+        ).reshape(-1, 4, 2)
+        calibration_object_tags = np.asarray(
+            calibration_objects, dtype=np.float32
+        ).reshape(-1, 4, 3)
+        calibration_tag_ids: List[int] = []
+        for refined_object in calibration_object_tags:
+            matching = [
+                index
+                for index, raw_object in enumerate(tag_object_points)
+                if np.array_equal(refined_object, raw_object)
+            ]
+            if len(matching) != 1:
+                raise CalibrationError(
+                    "AprilGrid refined tags lost their lattice identity"
+                )
+            calibration_tag_ids.append(tag_ids[matching[0]])
+        if not _strict_aprilgrid_observation(
+            calibration_image_tags,
+            calibration_object_tags,
+            calibration_tag_ids,
+            board_size,
+            square,
+            tag_spacing,
+            start_id,
+            observation_uncertainty_px("aprilgrid"),
+        ):
+            raise CalibrationError(
+                "AprilGrid observation failed geometric consistency"
+            )
     except CalibrationError:
-        return None
-    calibration_image_tags = np.asarray(
-        calibration_pixels, dtype=np.float32
-    ).reshape(-1, 4, 2)
-    calibration_object_tags = np.asarray(
-        calibration_objects, dtype=np.float32
-    ).reshape(-1, 4, 3)
-    calibration_tag_ids: List[int] = []
-    for refined_object in calibration_object_tags:
-        matching = [
-            index
-            for index, raw_object in enumerate(tag_object_points)
-            if np.array_equal(refined_object, raw_object)
-        ]
-        if len(matching) != 1:
+        if require_refinement:
             return None
-        calibration_tag_ids.append(tag_ids[matching[0]])
-    if not _strict_aprilgrid_observation(
-        calibration_image_tags,
-        calibration_object_tags,
-        calibration_tag_ids,
-        board_size,
-        square,
-        tag_spacing,
-        start_id,
-        observation_uncertainty_px("aprilgrid"),
-    ):
-        return None
+        calibration_pixels = None
+        calibration_objects = None
     # Raw decoded corners remain annotation-only. Calibration and coverage use
-    # the exact same complete-tag refinement mask and correspondence order.
+    # the exact same complete-tag refinement mask when it exists; search planes
+    # may keep decoded corners for live annotation without admitting them.
     pixels = raw_pixels.copy()
     flat = raw_pixels.reshape(-1, 2)
     valid = (
@@ -856,12 +879,18 @@ def detect_aprilgrid(
         pixels[valid] = cv2.cornerSubPix(
             gray, raw_pixels[valid].copy(), (3, 3), (-1, -1), _SUBPIX_CRITERIA
         )
+    coverage_pixels = (
+        calibration_pixels if calibration_pixels is not None else pixels
+    )
+    coverage_objects = (
+        calibration_objects if calibration_objects is not None else objects
+    )
     return BoardDetection(
         image_points=pixels,
         object_points=objects,
         coverage=_aprilgrid_coverage(
-            calibration_pixels,
-            calibration_objects,
+            coverage_pixels,
+            coverage_objects,
             width,
             height,
         ),
@@ -1017,7 +1046,8 @@ def next_view_guidance(
     """Describe the single view that expands the weakest coverage axis most.
 
     X and Y need samples on both sides of the image, while Size and Skew are
-    rewarded by their largest observed value.  Returning a small semantic
+    rewarded by their largest observed value. AprilGrid Skew is out-of-plane
+    tilt (``direction='tilt'``), not in-plane roll. Returning a small semantic
     document keeps presentation/localization in the WebUI and gives a physical
     operator a stable direction based on the whole sample history rather than
     whichever frame happened to arrive last.

@@ -38,6 +38,10 @@ from xgc_camera_calibration.solver import CalibrationError
 from xgc_camera_calibration.web_service import ApiError
 
 APRILGRID_ADAPTIVE_DETECTION_WIDTH = 2200
+# One decoded marker or rejected quad on the VGA plane is enough to retry at
+# a higher JPEG decode. Six-quad evidence dropped A4 24 mm boards at arm's
+# length, where VGA recovers 1–5 quads and 4K still decodes the lattice.
+APRILGRID_ADAPTIVE_EVIDENCE_QUADS = 1
 INTRINSIC_VALIDATION_MIN_JPEG_QUALITY = 95
 CAMERA_NAME_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9._-]{0,63}$")
 _TARGET_CAPTURE_TOKEN_UNSET = object()
@@ -48,6 +52,11 @@ _SIM_TARGET_ANGLE_TOLERANCE_RAD = 0.04
 _SIM_TARGET_SENSOR_OFFSET_LIMIT_METERS = 0.08
 _SIM_CAMERA_OPTICAL_ORIGIN_METERS = 0.067
 _SIM_GUIDE_REFERENCE_BOARD_EXTENT_METERS = 0.66
+# AprilGrid Skew is homography anisotropy, not in-plane roll. A ~55° look-at
+# off the board normal fills PARAM_RANGES[3]=0.5 for both 0.66 m and 0.18 m
+# plates while keeping the grid inside a 4K 110° frame.
+_SKEW_VIEW_TANGENT = math.tan(math.radians(55.0))
+_SKEW_VIEW_MIN_HEIGHT_METERS = 1.5
 
 
 def intrinsic_feature_model(board_type: str) -> str:
@@ -108,8 +117,10 @@ def recommended_views(
     Filling X and Y needs the board off-centre in the image, so those poses carry
     a yaw/pitch aim offset (the camera adapter applies it through
     look_at_orientation) -- a camera that simply aims at the board keeps it
-    centred and never moves the X/Y bars.  Size needs near and far views; Skew
-    needs the oblique corners.  Each pose sits at its own point so it is a
+    centred and never moves the X/Y bars. Size needs near and far views. Skew
+    is out-of-plane perspective (homography anisotropy): move the camera off the
+    board normal and keep looking at the plate. In-plane roll is a similarity
+    and does not fill AprilGrid Skew. Each pose sits at its own point so it is a
     distinct, clickable marker in the 3D guide.
     """
     tx, ty, tz = float(board_center[0]), float(board_center[1]), float(board_center[2])
@@ -143,9 +154,22 @@ def recommended_views(
             ty + dy * view_scale,
             tz + dz * view_scale,
         )
+
+    def look_at_off_axis(dx: float, y_tangent: float, z_tangent: float) -> Tuple[float, float, float]:
+        # Polar displacement is a fraction of the link-to-board X distance so
+        # field 0.66 m and A4 0.18 m plates get the same out-of-plane angle.
+        x, _y, _z = position(dx, 0.0, 0.0)
+        distance = max(0.05, abs(tx - x))
+        return (
+            x,
+            ty + y_tangent * distance,
+            max(_SKEW_VIEW_MIN_HEIGHT_METERS, tz + z_tangent * distance),
+        )
+
     # Tuned for the shared 3840x2160, 110-degree camera profile. Keep the whole
     # plate visible while moving it far enough toward each edge to satisfy the
-    # ROS camera_calibration X/Y coverage ranges.
+    # ROS camera_calibration X/Y coverage ranges. The last four views are
+    # look-at off-axis (roll = 0); they exist to fill AprilGrid Skew.
     specs = [
         ("left edge", position(-2.91, 0.05, 0.00), -0.58, 0.00, 0.08),
         ("right edge", position(-2.91, -0.05, 0.00), 0.58, 0.00, -0.08),
@@ -158,10 +182,10 @@ def recommended_views(
         ("center face", position(-2.30, 0.00, 0.00), 0.00, 0.00, 0.00),
         ("near large", position(-2.10, 0.00, 0.00), 0.00, 0.00, 0.00),
         ("near maximum", position(-1.30, 0.00, 0.00), 0.00, 0.00, 0.00),
-        ("clockwise skew", position(-2.20, 0.04, 0.04), 0.00, 0.00, 0.46),
-        ("counter-clockwise skew", position(-2.20, -0.04, -0.04), 0.00, 0.00, -0.46),
-        ("oblique high", position(-2.20, 0.35, 0.35), 0.00, 0.00, 0.28),
-        ("oblique low", position(-2.20, -0.35, -0.35), 0.00, 0.00, -0.28),
+        ("left oblique", look_at_off_axis(-1.70, _SKEW_VIEW_TANGENT, 0.00), 0.00, 0.00, 0.00),
+        ("right oblique", look_at_off_axis(-1.70, -_SKEW_VIEW_TANGENT, 0.00), 0.00, 0.00, 0.00),
+        ("oblique high", look_at_off_axis(-1.70, 0.00, _SKEW_VIEW_TANGENT), 0.00, 0.00, 0.00),
+        ("oblique low", look_at_off_axis(-1.70, 0.00, -_SKEW_VIEW_TANGENT), 0.00, 0.00, 0.00),
     ]
     return [{
         "name": name,
@@ -1732,46 +1756,87 @@ class IntrinsicCalibrationService:
             dtype=np.float32,
         )
         gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-        detection = intrinsic_solver.detect_board(
+
+        def detect_on(image_gray: np.ndarray, maximum_width: int, require_refinement: bool):
+            return intrinsic_solver.detect_board(
+                image_gray,
+                self.board_size,
+                maximum_width,
+                board_type=self.board_type,
+                square=self.square,
+                tag_spacing=self.tag_spacing,
+                tag_family=self.tag_family,
+                start_id=self.tag_start_id,
+                min_tags=self.min_tags,
+                require_refinement=require_refinement,
+            )
+
+        def adopt_working_image(image: np.ndarray, image_gray: Optional[np.ndarray] = None) -> np.ndarray:
+            nonlocal bgr, height, width, gray, source_scale
+            bgr = image
+            height, width = bgr.shape[:2]
+            gray = (
+                image_gray
+                if image_gray is not None
+                else cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+            )
+            source_scale = np.asarray(
+                [
+                    float(source_width) / float(width),
+                    float(source_height) / float(height),
+                ],
+                dtype=np.float32,
+            )
+            return gray
+
+        aprilgrid_search = self.board_type == "aprilgrid"
+        detection = detect_on(
             gray,
-            self.board_size,
-            width if self.board_type == "aprilgrid" else self.maximum_detect_width,
-            board_type=self.board_type,
-            square=self.square,
-            tag_spacing=self.tag_spacing,
-            tag_family=self.tag_family,
-            start_id=self.tag_start_id,
-            min_tags=self.min_tags,
+            width if aprilgrid_search else self.maximum_detect_width,
+            require_refinement=not aprilgrid_search,
         )
         if (
             detection is None
-            and self.board_type == "aprilgrid"
+            and aprilgrid_search
             and source_jpeg
             and source_width > width
             and intrinsic_solver.aprilgrid_has_candidate_evidence(
-                gray, self.tag_family, self.min_tags
+                gray, self.tag_family, APRILGRID_ADAPTIVE_EVIDENCE_QUADS
             )
         ):
             adaptive = self._decode_adaptive_aprilgrid_frame(source_jpeg, source_width)
             if adaptive is not None and adaptive.shape[1] > width:
-                bgr = adaptive
-                height, width = bgr.shape[:2]
-                source_scale = np.asarray(
-                    [float(source_width) / float(width), float(source_height) / float(height)],
-                    dtype=np.float32,
+                adaptive_gray = cv2.cvtColor(adaptive, cv2.COLOR_BGR2GRAY)
+                detection = detect_on(
+                    adaptive_gray, adaptive_gray.shape[1], require_refinement=False
                 )
-                gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-                detection = intrinsic_solver.detect_board(
-                    gray,
-                    self.board_size,
-                    width,
-                    board_type=self.board_type,
-                    square=self.square,
-                    tag_spacing=self.tag_spacing,
-                    tag_family=self.tag_family,
-                    start_id=self.tag_start_id,
-                    min_tags=self.min_tags,
-                )
+                if detection is not None:
+                    adopt_working_image(adaptive, adaptive_gray)
+                elif (
+                    source_width > adaptive.shape[1]
+                    and intrinsic_solver.aprilgrid_has_candidate_evidence(
+                        adaptive_gray,
+                        self.tag_family,
+                        APRILGRID_ADAPTIVE_EVIDENCE_QUADS,
+                    )
+                ):
+                    source_gray = cv2.imdecode(
+                        np.frombuffer(source_jpeg, dtype=np.uint8),
+                        cv2.IMREAD_GRAYSCALE,
+                    )
+                    if (
+                        isinstance(source_gray, np.ndarray)
+                        and source_gray.ndim == 2
+                        and source_gray.shape[:2] == (source_height, source_width)
+                    ):
+                        detection = detect_on(
+                            source_gray, source_width, require_refinement=True
+                        )
+                        if detection is not None:
+                            adopt_working_image(
+                                cv2.cvtColor(source_gray, cv2.COLOR_GRAY2BGR),
+                                source_gray,
+                            )
 
         scale = 1.0
         if width > self.display_width:
@@ -1791,19 +1856,22 @@ class IntrinsicCalibrationService:
             if detection is not None:
                 corners = detection.image_points
                 params = detection.coverage
-                calibration_corners = (
-                    detection.calibration_image_points
-                    if detection.calibration_image_points is not None
-                    else corners
-                )
-                calibration_corners = (
-                    np.asarray(calibration_corners, dtype=np.float32) * source_scale
-                ).astype(np.float32)
-                calibration_objects = (
-                    detection.calibration_object_points
-                    if detection.calibration_object_points is not None
-                    else detection.object_points
-                )
+                if detection.calibration_image_points is not None:
+                    calibration_corners = (
+                        np.asarray(detection.calibration_image_points, dtype=np.float32)
+                        * source_scale
+                    ).astype(np.float32)
+                    calibration_objects = detection.calibration_object_points
+                elif self.board_type == "aprilgrid":
+                    # Decoded search-plane corners are annotation-only. Admission
+                    # waits for source-resolution edge refinement.
+                    calibration_corners = None
+                    calibration_objects = None
+                else:
+                    calibration_corners = (
+                        np.asarray(corners, dtype=np.float32) * source_scale
+                    ).astype(np.float32)
+                    calibration_objects = detection.object_points
                 scaled = (corners * scale).astype(np.float32)
                 if self.board_type == "aprilgrid":
                     for point in scaled.reshape(-1, 2):
@@ -1840,7 +1908,14 @@ class IntrinsicCalibrationService:
                         accepted = False
                         duplicate = True
                     if accepted:
-                        if self.board_type == "aprilgrid" and source_jpeg:
+                        already_source_refined = (
+                            self.board_type == "aprilgrid"
+                            and width == source_width
+                            and height == source_height
+                            and detection.calibration_image_points is not None
+                            and detection.calibration_object_points is not None
+                        )
+                        if self.board_type == "aprilgrid" and source_jpeg and not already_source_refined:
                             try:
                                 source_gray = cv2.imdecode(
                                     np.frombuffer(source_jpeg, dtype=np.uint8),
@@ -1863,6 +1938,7 @@ class IntrinsicCalibrationService:
                                     tag_family=self.tag_family,
                                     start_id=self.tag_start_id,
                                     min_tags=self.min_tags,
+                                    require_refinement=True,
                                 )
                                 if source_detection is None:
                                     raise CalibrationError(
@@ -1882,6 +1958,14 @@ class IntrinsicCalibrationService:
                                 # AprilGrid corners.
                                 self._recovery_error = str(error) or error.__class__.__name__
                                 accepted = False
+                        if accepted and (
+                            calibration_corners is None or calibration_objects is None
+                        ):
+                            self._recovery_error = (
+                                "AprilGrid source-resolution refinement "
+                                "did not retain enough complete tags"
+                            )
+                            accepted = False
                         if accepted:
                             candidate_image_size = (source_width, source_height)
                             if (
@@ -1987,12 +2071,15 @@ class IntrinsicCalibrationService:
         image = cv2.imdecode(encoded, decode_flag)
         if not isinstance(image, np.ndarray) or image.ndim != 3 or image.shape[2] != 3:
             return None
-        if image.shape[1] != target_width:
+        # Never invent AprilTag payload bits by upscaling a reduced JPEG
+        # decode. 4K IMREAD_REDUCED_COLOR_2 is 1920 px; keep that plane
+        # instead of cubically stretching it to 2200 px.
+        if image.shape[1] > target_width:
             scale = float(target_width) / float(image.shape[1])
             image = cv2.resize(
                 image,
                 (max(1, int(image.shape[1] * scale)), max(1, int(image.shape[0] * scale))),
-                interpolation=cv2.INTER_CUBIC if scale > 1.0 else cv2.INTER_AREA,
+                interpolation=cv2.INTER_AREA,
             )
         return image
 

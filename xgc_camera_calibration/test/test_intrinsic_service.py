@@ -3,6 +3,7 @@
 import hashlib
 import io
 import json
+import math
 import tempfile
 import threading
 import unittest
@@ -20,11 +21,13 @@ import numpy as np
 
 from xgc_camera_calibration import intrinsic_solver, intrinsic_validation
 from xgc_camera_calibration.intrinsic_service import (
+    APRILGRID_ADAPTIVE_EVIDENCE_QUADS,
     IntrinsicCalibrationService,
     intrinsic_algorithm_provenance,
     intrinsic_calibration_directory,
     recommended_views,
 )
+from xgc_camera_calibration.media_snapshot import MediaSnapshotClient
 from xgc_camera_calibration.web_service import ApiError, CalibrationHttpServer
 
 
@@ -164,6 +167,142 @@ def render_aprilgrid_view(center_pixel, depth_m, rotation_vector):
         raise AssertionError("could not encode synthetic AprilGrid frame")
     decoded = cv2.imdecode(jpeg, cv2.IMREAD_GRAYSCALE)
     return cv2.cvtColor(decoded, cv2.COLOR_GRAY2BGR)
+
+
+PRODUCTION_IMAGE_SIZE = (3840, 2160)
+PRODUCTION_K = np.asarray(
+    (
+        (1344.398473, 0.0, 1919.5),
+        (0.0, 1344.398473, 1079.5),
+        (0.0, 0.0, 1.0),
+    ),
+    dtype=np.float64,
+)
+
+
+def render_production_aprilgrid(tag_size, tag_gap, depth_m, rotation=(0.0, 0.0, 0.0)):
+    """Warp a 6x6 tag36h11 board onto the local-fleet 4K 110° camera."""
+    dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
+    cols, rows = 6, 6
+    tag_pixels = 80
+    gap_pixels = 24
+    margin = 48
+    pitch = tag_pixels + gap_pixels
+    content_width = cols * tag_pixels + (cols - 1) * gap_pixels
+    content_height = rows * tag_pixels + (rows - 1) * gap_pixels
+    board = np.full(
+        (content_height + 2 * gap_pixels + 2 * margin,
+         content_width + 2 * gap_pixels + 2 * margin),
+        255,
+        dtype=np.uint8,
+    )
+    for row in range(rows + 1):
+        for col in range(cols + 1):
+            y0 = margin + row * pitch
+            x0 = margin + col * pitch
+            board[y0:y0 + gap_pixels, x0:x0 + gap_pixels] = 0
+    for visual_row in range(rows):
+        for col in range(cols):
+            marker_id = (rows - 1 - visual_row) * cols + col
+            marker = cv2.aruco.generateImageMarker(
+                dictionary, marker_id, tag_pixels, None, 2
+            )
+            marker = np.rot90(marker, 2)
+            y0 = margin + gap_pixels + visual_row * pitch
+            x0 = margin + gap_pixels + col * pitch
+            board[y0:y0 + tag_pixels, x0:x0 + tag_pixels] = marker
+    board_width = tag_size + (cols - 1) * (tag_size + tag_gap)
+    board_height = tag_size + (rows - 1) * (tag_size + tag_gap)
+    lo = float(margin + gap_pixels) - 0.5
+    source = np.asarray(
+        (
+            (lo, lo + content_height),
+            (lo + content_width, lo + content_height),
+            (lo + content_width, lo),
+            (lo, lo),
+        ),
+        dtype=np.float32,
+    )
+    boundary = np.asarray(
+        (
+            (0.0, 0.0, 0.0),
+            (board_width, 0.0, 0.0),
+            (board_width, board_height, 0.0),
+            (0.0, board_height, 0.0),
+        ),
+        dtype=np.float32,
+    )
+    delta_rotation = cv2.Rodrigues(np.asarray(rotation, dtype=np.float64))[0]
+    rotation_matrix = delta_rotation.dot(np.diag((1.0, -1.0, -1.0)))
+    rvec = cv2.Rodrigues(rotation_matrix)[0].reshape(3)
+    board_center = np.asarray((board_width / 2.0, board_height / 2.0, 0.0))
+    camera_center = np.asarray((0.0, 0.0, float(depth_m)))
+    translation = camera_center - rotation_matrix.dot(board_center)
+    projected, _jacobian = cv2.projectPoints(
+        boundary,
+        rvec,
+        translation,
+        PRODUCTION_K,
+        np.zeros(5, dtype=np.float64),
+    )
+    transform = cv2.getPerspectiveTransform(
+        source, projected.reshape(4, 2).astype(np.float32)
+    )
+    gray = cv2.warpPerspective(
+        board,
+        transform,
+        PRODUCTION_IMAGE_SIZE,
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=255,
+    )
+    encoded, jpeg = cv2.imencode(".jpg", gray, (cv2.IMWRITE_JPEG_QUALITY, 94))
+    if not encoded:
+        raise AssertionError("could not encode production AprilGrid frame")
+    decoded = cv2.imdecode(jpeg, cv2.IMREAD_GRAYSCALE)
+    return cv2.cvtColor(decoded, cv2.COLOR_GRAY2BGR), jpeg.tobytes()
+
+
+def _project_aprilgrid_view_coverage(view, objects, extent):
+    width, height = 3840, 2160
+    camera_matrix = np.array(
+        ((1344.398473, 0.0, 1919.5), (0.0, 1344.398473, 1079.5), (0.0, 0.0, 1.0)),
+        dtype=np.float64,
+    )
+    board_center = np.array((2.0, 0.0, 2.2), dtype=np.float64)
+    link_from_optical = np.array(((0.0, 0.0, 1.0), (-1.0, 0.0, 0.0), (0.0, -1.0, 0.0)))
+    world_from_board = np.array(((0.0, 0.0, -1.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)))
+    position = np.asarray(view["position"], dtype=np.float64)
+    delta = board_center - position
+    yaw = math.atan2(delta[1], delta[0]) + float(view["yaw_offset"])
+    pitch = -math.atan2(delta[2], math.hypot(delta[0], delta[1])) + float(view["pitch_offset"])
+    roll = float(view["roll"])
+    cr, sr = math.cos(roll), math.sin(roll)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    world_from_link = np.array(
+        ((cy, -sy, 0.0), (sy, cy, 0.0), (0.0, 0.0, 1.0))
+    ).dot(np.array(((cp, 0.0, sp), (0.0, 1.0, 0.0), (-sp, 0.0, cp)))).dot(
+        np.array(((1.0, 0.0, 0.0), (0.0, cr, -sr), (0.0, sr, cr)))
+    )
+    optical_pos = position + 0.067 * world_from_link[:, 0]
+    optical_from_world = (world_from_link.dot(link_from_optical)).T
+    centered = objects - np.array((extent / 2.0, extent / 2.0, 0.0))
+    world = world_from_board.dot(centered.T).T + board_center
+    rotation, _ = cv2.Rodrigues(optical_from_world)
+    translation = -optical_from_world.dot(optical_pos)
+    pixels = cv2.projectPoints(
+        world.astype(np.float64), rotation, translation, camera_matrix, np.zeros(5),
+    )[0].reshape(-1, 2)
+    camera_z = optical_from_world.dot((world - optical_pos).T).T[:, 2]
+    visible = (
+        (camera_z > 1.0e-6)
+        & (pixels[:, 0] >= 0.0) & (pixels[:, 0] < width)
+        & (pixels[:, 1] >= 0.0) & (pixels[:, 1] < height)
+    )
+    if int(np.count_nonzero(visible)) < 16:
+        return (0.5, 0.5, 0.0, 0.0)
+    return intrinsic_solver._aprilgrid_coverage(pixels[visible], objects[visible], width, height)
 
 
 def make_service(output_file, **kwargs):
@@ -306,16 +445,21 @@ class IntrinsicServiceTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 intrinsic_calibration_directory(root, mode, camera)
 
-    def test_90_degree_simulation_sweep_stays_high_and_near(self):
+    def test_90_degree_simulation_sweep_stays_on_the_viewing_side(self):
         views = recommended_views((2.0, 0.0, 2.2))
         near = next(view for view in views if view["name"] == "near maximum")
         oblique_high = next(view for view in views if view["name"] == "oblique high")
         self.assertEqual(near["position"], [0.7, 0.0, 2.2])
-        self.assertEqual(oblique_high["position"], [-0.2, 0.35, 2.55])
+        self.assertGreater(oblique_high["position"][2], 2.2)
+        self.assertEqual(oblique_high["roll"], 0.0)
         self.assertEqual(len({tuple(view["position"]) for view in views}), len(views))
-        self.assertGreaterEqual(min(view["position"][2] for view in views), 1.75)
-        self.assertLessEqual(max(view["position"][2] for view in views), 2.65)
-        self.assertGreaterEqual(max(abs(view["roll"]) for view in views), 0.46)
+        self.assertGreaterEqual(min(view["position"][2] for view in views), 1.5)
+        self.assertTrue(all(view["position"][0] < 2.0 for view in views))
+        for name in ("left oblique", "right oblique", "oblique high", "oblique low"):
+            view = next(item for item in views if item["name"] == name)
+            self.assertEqual(view["yaw_offset"], 0.0)
+            self.assertEqual(view["pitch_offset"], 0.0)
+            self.assertEqual(view["roll"], 0.0)
 
     def test_field_aprilgrid_scales_simulation_views_to_target_extent(self):
         views = recommended_views((2.0, 0.0, 2.2), 0.66, camera_optical_origin=0.067)
@@ -324,7 +468,7 @@ class IntrinsicServiceTest(unittest.TestCase):
         self.assertEqual(left["position"], [0.8, 0.02, 2.2])
         self.assertEqual(left["yaw_offset"], -0.58)
         self.assertEqual(near["position"], [1.46, 0.0, 2.2])
-        self.assertGreaterEqual(min(view["position"][2] for view in views), 2.01)
+        self.assertGreaterEqual(min(view["position"][2] for view in views), 1.5)
         self.assertEqual(len({tuple(view["position"]) for view in views}), len(views))
 
     def test_a4_aprilgrid_scales_optical_distance_instead_of_camera_link_distance(self):
@@ -344,6 +488,36 @@ class IntrinsicServiceTest(unittest.TestCase):
             delta=0.015,
         )
         self.assertEqual(a4_near["position"], [1.81, 0.0, 2.2])
+
+    def test_aprilgrid_auto_sweep_fills_homography_skew_for_both_boards(self):
+        # In-plane roll used to stall Skew at ~75% / ~83%. Off-axis look-at
+        # must fill the AprilGrid anisotropy bar for both production plates.
+        for extent, tag, gap in (
+            (0.66, 0.088, 0.0264),
+            (0.18, 0.024, 0.0072),
+        ):
+            views = recommended_views(
+                (2.0, 0.0, 2.2), extent, camera_optical_origin=0.067
+            )
+            objects = np.concatenate(
+                [
+                    intrinsic_solver.aprilgrid_tag_object_points((6, 6), tag, gap, 0, tag_id)
+                    for tag_id in range(36)
+                ],
+                axis=0,
+            )
+            samples = [
+                _project_aprilgrid_view_coverage(view, objects, extent)
+                for view in views
+            ]
+            bars, goodenough = intrinsic_solver.coverage(samples)
+            skew = next(bar["progress"] for bar in bars if bar["label"] == "Skew")
+            self.assertGreaterEqual(
+                skew,
+                1.0,
+                msg="extent {} Skew stalled at {:.3f}".format(extent, skew),
+            )
+            self.assertTrue(goodenough, msg="extent {} coverage incomplete: {}".format(extent, bars))
 
     def test_web_assets_use_proxy_safe_relative_urls(self):
         index = (WEB_ROOT / "index.html").read_text(encoding="utf-8")
@@ -729,7 +903,7 @@ class IntrinsicServiceTest(unittest.TestCase):
             with patch.object(
                 intrinsic_solver,
                 "detect_board",
-                side_effect=[None, detection, detection],
+                side_effect=[None, detection],
             ) as detect, patch.object(
                 intrinsic_solver, "aprilgrid_has_candidate_evidence", return_value=True
             ):
@@ -738,10 +912,143 @@ class IntrinsicServiceTest(unittest.TestCase):
                     source_image_size=(1920, 1080),
                     source_jpeg=encoded.tobytes(),
                 )
+            # Adaptive decode already sits on the source plane, so admission
+            # must not run the same detector a third time.
             self.assertEqual(
-                [call.args[2] for call in detect.call_args_list], [480, 1920, 1920]
+                [call.args[2] for call in detect.call_args_list], [480, 1920]
             )
             self.assertEqual(service.state()["detection"]["corner_count"], 4)
+            self.assertTrue(service.state()["detection"]["accepted"])
+            self.assertEqual(service.state()["samples"], 1)
+
+    def test_adaptive_aprilgrid_decode_does_not_upscale_a_reduced_jpeg(self):
+        source = np.full((2160, 3840, 3), 127, np.uint8)
+        ok, encoded = cv2.imencode(".jpg", source)
+        self.assertTrue(ok)
+        image = IntrinsicCalibrationService._decode_adaptive_aprilgrid_frame(
+            encoded.tobytes(), 3840
+        )
+        self.assertIsNotNone(image)
+        self.assertEqual(image.shape[1], 1920)
+        self.assertEqual(image.shape[0], 1080)
+
+    def test_unrefined_search_corners_never_enter_the_pool_without_source_jpeg(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = IntrinsicCalibrationService(
+                board_size=(2, 2),
+                square=0.088,
+                output_file=str(Path(directory) / "intrinsics.yaml"),
+                camera_name="usb_cam",
+                board_type="aprilgrid",
+                tag_spacing=0.0264,
+                min_tags=4,
+            )
+            corners = np.asarray(
+                [[20, 20], [40, 20], [40, 40], [20, 40]],
+                dtype=np.float32,
+            ).reshape(-1, 1, 2)
+            detection = intrinsic_solver.BoardDetection(
+                image_points=corners,
+                object_points=np.zeros((4, 3), np.float32),
+                coverage=(0.2, 0.3, 0.4, 0.5),
+                calibration_image_points=None,
+                calibration_object_points=None,
+            )
+            with patch.object(intrinsic_solver, "detect_board", return_value=detection):
+                service.process_frame(np.zeros((120, 160, 3), np.uint8))
+            state = service.state()
+            self.assertEqual(state["samples"], 0)
+            self.assertEqual(state["detection"]["status"], "detected")
+            self.assertFalse(state["detection"]["accepted"])
+            self.assertEqual(service._evidence_samples, [])
+
+    def test_physical_vga_search_collects_both_aprilgrid_profiles_from_source_jpeg(self):
+        if not hasattr(cv2, "aruco") or not hasattr(cv2.aruco, "DICT_APRILTAG_36h11"):
+            self.skipTest("OpenCV AprilTag 36h11 dictionary is unavailable")
+        self.assertEqual(APRILGRID_ADAPTIVE_EVIDENCE_QUADS, 1)
+        cases = (
+            ("a4", 0.024, 0.0072, 0.80),
+            ("field", 0.088, 0.0264, 2.50),
+        )
+        for name, tag_size, tag_gap, depth in cases:
+            with self.subTest(profile=name, depth=depth):
+                source_bgr, source_jpeg = render_production_aprilgrid(
+                    tag_size, tag_gap, depth
+                )
+                working = MediaSnapshotClient._decode_detection_jpeg(
+                    source_jpeg,
+                    PRODUCTION_IMAGE_SIZE[0],
+                    PRODUCTION_IMAGE_SIZE[1],
+                    640 * 480,
+                )
+                self.assertLess(working.shape[1], 960)
+                with tempfile.TemporaryDirectory() as directory:
+                    service = IntrinsicCalibrationService(
+                        board_size=(6, 6),
+                        square=tag_size,
+                        output_file=str(Path(directory) / "intrinsics.yaml"),
+                        camera_name="usb_cam",
+                        calibration_mode="phy",
+                        board_type="aprilgrid",
+                        tag_spacing=tag_gap,
+                        min_tags=6,
+                        display_width=640,
+                    )
+                    self.assertIsNone(service.camera)
+                    service.process_frame(
+                        working,
+                        source_image_size=PRODUCTION_IMAGE_SIZE,
+                        source_jpeg=source_jpeg,
+                        source_snapshot_id="physical-{}".format(name),
+                    )
+                    state = service.state()
+                    self.assertEqual(state["detection"]["status"], "detected")
+                    self.assertTrue(state["detection"]["accepted"])
+                    self.assertEqual(state["samples"], 1)
+                    self.assertFalse(state["camera_control"])
+                    self.assertEqual(len(service._evidence_samples), 1)
+                    self.assertEqual(
+                        service.image_size, PRODUCTION_IMAGE_SIZE
+                    )
+                    evidence = Path(service._evidence_root) / "source/000.jpg"
+                    self.assertEqual(evidence.read_bytes(), source_jpeg)
+
+    def test_simulation_pose_gate_still_blocks_untargeted_physical_style_frames(self):
+        if not hasattr(cv2, "aruco") or not hasattr(cv2.aruco, "DICT_APRILTAG_36h11"):
+            self.skipTest("OpenCV AprilTag 36h11 dictionary is unavailable")
+        source_bgr, source_jpeg = render_production_aprilgrid(0.024, 0.0072, 0.80)
+        del source_bgr
+        working = MediaSnapshotClient._decode_detection_jpeg(
+            source_jpeg,
+            PRODUCTION_IMAGE_SIZE[0],
+            PRODUCTION_IMAGE_SIZE[1],
+            640 * 480,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            service = IntrinsicCalibrationService(
+                board_size=(6, 6),
+                square=0.024,
+                output_file=str(Path(directory) / "intrinsics.yaml"),
+                camera_name="usb_cam",
+                calibration_mode="sim",
+                board_type="aprilgrid",
+                tag_spacing=0.0072,
+                min_tags=6,
+                display_width=640,
+            )
+            service.attach_camera_control(FakeCameraControl())
+            service.process_frame(
+                working,
+                source_image_size=PRODUCTION_IMAGE_SIZE,
+                source_jpeg=source_jpeg,
+                source_snapshot_id="sim-untargeted",
+            )
+            state = service.state()
+            self.assertEqual(state["detection"]["status"], "detected")
+            self.assertFalse(state["detection"]["accepted"])
+            self.assertEqual(state["samples"], 0)
+            self.assertTrue(state["camera_control"])
+            self.assertEqual(service._evidence_samples, [])
 
     def test_source_jpeg_refinement_is_the_candidate_pool_authority(self):
         if not hasattr(cv2, "aruco") or not hasattr(cv2.aruco, "DICT_APRILTAG_36h11"):

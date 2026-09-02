@@ -739,6 +739,60 @@ class IntrinsicSolverTest(unittest.TestCase):
         )
         self.assertIsNone(detection)
 
+    def test_optional_refinement_keeps_decoded_search_when_edges_are_short(self):
+        objects, images = _project_standard_aprilgrid_tags((0, 1, 2, 6, 7, 8))
+        del objects
+        opencv_order = np.asarray(solver._APRILGRID_OPENCV_TO_KALIBR_CORNER_ORDER)
+        corners = [image[opencv_order].reshape(1, 4, 2) for image in images]
+        ids = np.asarray((0, 1, 2, 6, 7, 8), dtype=np.int32).reshape(-1, 1)
+        gray = np.full((800, 1200), 127, dtype=np.uint8)
+        with mock.patch.object(
+            solver, "_detect_aruco_markers", return_value=(corners, ids, [])
+        ), mock.patch.object(
+            solver,
+            "refine_aprilgrid_calibration_corners",
+            side_effect=CalibrationError("AprilGrid edge is too short"),
+        ):
+            required = solver.detect_aprilgrid(
+                gray,
+                (6, 6),
+                square=0.088,
+                tag_spacing=0.0264,
+                min_tags=6,
+                maximum_width=1200,
+                require_refinement=True,
+            )
+            optional = solver.detect_aprilgrid(
+                gray,
+                (6, 6),
+                square=0.088,
+                tag_spacing=0.0264,
+                min_tags=6,
+                maximum_width=1200,
+                require_refinement=False,
+            )
+        self.assertIsNone(required)
+        self.assertIsNotNone(optional)
+        self.assertEqual(len(optional.image_points), 24)
+        self.assertIsNone(optional.calibration_image_points)
+        self.assertIsNone(optional.calibration_object_points)
+
+    def test_one_rejected_quad_justifies_a_higher_resolution_retry(self):
+        gray = np.full((540, 960), 127, np.uint8)
+        rejected = [
+            np.asarray(
+                (((10.0, 10.0), (20.0, 10.0), (20.0, 20.0), (10.0, 20.0)),),
+                dtype=np.float32,
+            )
+        ]
+        with mock.patch.object(
+            solver, "_detect_aruco_markers", return_value=([], None, rejected)
+        ):
+            self.assertTrue(solver.aprilgrid_has_candidate_evidence(gray))
+            self.assertFalse(
+                solver.aprilgrid_has_candidate_evidence(gray, minimum_quads=6)
+            )
+
     def test_edge_line_refinement_rejects_a_nonstraight_tag_boundary(self):
         gray = np.full((160, 240), 255, dtype=np.uint8)
         for x in range(gray.shape[1]):
