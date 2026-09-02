@@ -425,8 +425,8 @@ def _planar_pose_ransac(
                 best = (score, rotation_vector, translation_vector, inliers)
     if best is None:
         raise CalibrationError(
-            "planar robot layout is degenerate; select at least two well-separated "
-            "markers from both the UAV and UGV rows"
+            "could not estimate a planar camera pose from the selected markers; "
+            "choose well-separated, non-collinear markers"
         )
     return best[1], best[2], np.asarray(best[3], dtype=np.int32)
 

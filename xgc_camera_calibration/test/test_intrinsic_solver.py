@@ -739,6 +739,43 @@ class IntrinsicSolverTest(unittest.TestCase):
         )
         self.assertIsNone(detection)
 
+    def test_source_edge_refine_falls_back_to_cornersubpix(self):
+        if not hasattr(cv2, "aruco") or not hasattr(cv2.aruco, "DICT_APRILTAG_36h11"):
+            self.skipTest("OpenCV AprilTag 36h11 dictionary is unavailable")
+        gray = _render_aprilgrid((6, 6), tag_pixels=80, gap_pixels=24, border=60)
+        corners = []
+        objects = []
+        dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
+        detected, ids, _rejected = solver._detect_aruco_markers(gray, dictionary)
+        self.assertIsNotNone(ids)
+        for marker_corners, marker_id in zip(detected, ids.reshape(-1)):
+            obj = solver.aprilgrid_tag_object_points(
+                (6, 6), 0.088, 0.0264, 0, int(marker_id)
+            )
+            if obj is None:
+                continue
+            image = solver._opencv_corners_to_aprilgrid_datum(
+                np.asarray(marker_corners, dtype=np.float32).reshape(4, 2),
+                solver.APRILGRID_CORNER_DATUM,
+            )
+            corners.append(image)
+            objects.append(obj)
+        with mock.patch.object(
+            solver, "_refine_aprilgrid_quad_edges", side_effect=ValueError("too short")
+        ):
+            pixels, localized, _coverage = solver.localize_aprilgrid_source_corners(
+                gray,
+                np.asarray(corners, dtype=np.float32),
+                np.asarray(objects, dtype=np.float32),
+                (6, 6),
+                0.088,
+                0.0264,
+                0,
+                6,
+            )
+        self.assertGreaterEqual(len(pixels), 24)
+        self.assertEqual(len(pixels), len(localized))
+
     def test_optional_refinement_keeps_decoded_search_when_edges_are_short(self):
         objects, images = _project_standard_aprilgrid_tags((0, 1, 2, 6, 7, 8))
         del objects

@@ -22,6 +22,7 @@ import numpy as np
 from xgc_camera_calibration import intrinsic_solver, intrinsic_validation
 from xgc_camera_calibration.intrinsic_service import (
     APRILGRID_ADAPTIVE_EVIDENCE_QUADS,
+    APRILGRID_SEARCH_HOLD_FRAMES,
     IntrinsicCalibrationService,
     intrinsic_algorithm_provenance,
     intrinsic_calibration_directory,
@@ -853,27 +854,24 @@ class IntrinsicServiceTest(unittest.TestCase):
             )
             refined = corners * 4.0 + np.asarray([0.25, 0.5], np.float32)
             refined_objects = np.arange(12, dtype=np.float32).reshape(4, 3)
-            source_detection = intrinsic_solver.BoardDetection(
-                image_points=refined,
-                object_points=refined_objects,
-                coverage=detection.coverage,
-                calibration_image_points=refined,
-                calibration_object_points=refined_objects,
-            )
             with patch.object(
                 intrinsic_solver,
                 "detect_board",
-                side_effect=[detection, source_detection],
-            ) as detect:
+                return_value=detection,
+            ) as detect, patch.object(
+                intrinsic_solver,
+                "localize_aprilgrid_source_corners",
+                return_value=(refined, refined_objects, detection.coverage),
+            ) as localize:
                 service.process_frame(
                     reduced,
                     source_image_size=(640, 480),
                     source_jpeg=encoded.tobytes(),
                 )
             self.assertEqual(
-                [call.args[2] for call in detect.call_args_list], [160, 640]
+                [call.args[2] for call in detect.call_args_list], [160]
             )
-            self.assertEqual(detect.call_args.args[0].shape, (480, 640))
+            self.assertEqual(localize.call_args.args[0].shape, (480, 640))
             np.testing.assert_allclose(service.image_points[0], refined)
             np.testing.assert_allclose(service.object_points[0], refined_objects)
 
@@ -920,6 +918,98 @@ class IntrinsicServiceTest(unittest.TestCase):
             self.assertEqual(service.state()["detection"]["corner_count"], 4)
             self.assertTrue(service.state()["detection"]["accepted"])
             self.assertEqual(service.state()["samples"], 1)
+
+    def test_aprilgrid_search_hold_retries_source_when_vga_evidence_vanishes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = IntrinsicCalibrationService(
+                board_size=(2, 2), square=0.088,
+                output_file=str(Path(directory) / "intrinsics.yaml"),
+                camera_name="usb_cam",
+                board_type="aprilgrid", tag_spacing=0.0264, min_tags=4,
+            )
+            reduced = np.zeros((270, 480, 3), np.uint8)
+            source = np.zeros((2160, 3840, 3), np.uint8)
+            ok, encoded = cv2.imencode(".jpg", source)
+            self.assertTrue(ok)
+            jpeg = encoded.tobytes()
+            corners = np.asarray(
+                [[100, 100], [140, 100], [140, 140], [100, 140]],
+                dtype=np.float32,
+            ).reshape(-1, 1, 2)
+            detection = intrinsic_solver.BoardDetection(
+                image_points=corners,
+                object_points=np.zeros((4, 3), np.float32),
+                coverage=(0.2, 0.3, 0.4, 0.5),
+                calibration_image_points=corners,
+                calibration_object_points=np.zeros((4, 3), np.float32),
+            )
+            localized = (
+                corners * 8.0,
+                np.arange(12, dtype=np.float32).reshape(4, 3),
+                detection.coverage,
+            )
+
+            def process(detect_side_effect, evidence):
+                with patch.object(
+                    intrinsic_solver, "detect_board", side_effect=detect_side_effect
+                ) as detect, patch.object(
+                    intrinsic_solver, "aprilgrid_has_candidate_evidence", return_value=evidence
+                ), patch.object(
+                    intrinsic_solver,
+                    "localize_aprilgrid_source_corners",
+                    return_value=localized,
+                ):
+                    service.process_frame(
+                        reduced,
+                        source_image_size=(3840, 2160),
+                        source_jpeg=jpeg,
+                        source_snapshot_id="hold-{}".format(evidence),
+                    )
+                return [call.args[2] for call in detect.call_args_list]
+
+            first_widths = process([None, None, detection], True)
+            self.assertIn(3840, first_widths)
+            self.assertEqual(service.state()["detection"]["status"], "detected")
+            self.assertEqual(
+                service._aprilgrid_search_hold_frames, APRILGRID_SEARCH_HOLD_FRAMES
+            )
+
+            second_widths = process([None, None, detection], False)
+            self.assertIn(3840, second_widths)
+            self.assertEqual(service.state()["detection"]["status"], "detected")
+
+            service._aprilgrid_search_hold_frames = 0
+            service._aprilgrid_search_hold_width = 0
+            cold_widths = process([None, None], False)
+            self.assertNotIn(3840, cold_widths)
+            self.assertEqual(service.state()["detection"]["status"], "not_detected")
+
+    def test_aprilgrid_empty_scene_does_not_search_source_without_a_hold(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = IntrinsicCalibrationService(
+                board_size=(2, 2), square=0.088,
+                output_file=str(Path(directory) / "intrinsics.yaml"),
+                camera_name="usb_cam",
+                board_type="aprilgrid", tag_spacing=0.0264, min_tags=4,
+            )
+            reduced = np.zeros((270, 480, 3), np.uint8)
+            source = np.zeros((2160, 3840, 3), np.uint8)
+            ok, encoded = cv2.imencode(".jpg", source)
+            self.assertTrue(ok)
+            with patch.object(
+                intrinsic_solver, "detect_board", wraps=intrinsic_solver.detect_board
+            ) as detect:
+                service.process_frame(
+                    reduced,
+                    source_image_size=(3840, 2160),
+                    source_jpeg=encoded.tobytes(),
+                    source_snapshot_id="empty",
+                )
+            widths = [call.args[2] for call in detect.call_args_list]
+            self.assertTrue(widths)
+            self.assertNotIn(3840, widths)
+            self.assertEqual(service.state()["detection"]["status"], "not_detected")
+            self.assertEqual(service._aprilgrid_search_hold_frames, 0)
 
     def test_adaptive_aprilgrid_decode_does_not_upscale_a_reduced_jpeg(self):
         source = np.full((2160, 3840, 3), 127, np.uint8)
@@ -1012,6 +1102,81 @@ class IntrinsicServiceTest(unittest.TestCase):
                     )
                     evidence = Path(service._evidence_root) / "source/000.jpg"
                     self.assertEqual(evidence.read_bytes(), source_jpeg)
+
+    def test_physical_admission_maps_search_corners_instead_of_rerunning_source_aruco(self):
+        if not hasattr(cv2, "aruco") or not hasattr(cv2.aruco, "DICT_APRILTAG_36h11"):
+            self.skipTest("OpenCV AprilTag 36h11 dictionary is unavailable")
+        source_bgr, source_jpeg = render_production_aprilgrid(0.024, 0.0072, 0.50)
+        del source_bgr
+        working = MediaSnapshotClient._decode_detection_jpeg(
+            source_jpeg,
+            PRODUCTION_IMAGE_SIZE[0],
+            PRODUCTION_IMAGE_SIZE[1],
+            640 * 480,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            service = IntrinsicCalibrationService(
+                board_size=(6, 6),
+                square=0.024,
+                output_file=str(Path(directory) / "intrinsics.yaml"),
+                camera_name="usb_cam",
+                calibration_mode="phy",
+                board_type="aprilgrid",
+                tag_spacing=0.0072,
+                min_tags=6,
+                display_width=640,
+            )
+            with patch.object(
+                intrinsic_solver,
+                "detect_board",
+                wraps=intrinsic_solver.detect_board,
+            ) as detect:
+                service.process_frame(
+                    working,
+                    source_image_size=PRODUCTION_IMAGE_SIZE,
+                    source_jpeg=source_jpeg,
+                    source_snapshot_id="map-refine",
+                )
+            widths = [call.args[2] for call in detect.call_args_list]
+            self.assertTrue(widths)
+            self.assertNotIn(PRODUCTION_IMAGE_SIZE[0], widths)
+            state = service.state()
+            self.assertEqual(state["detection"]["status"], "detected")
+            self.assertTrue(state["detection"]["accepted"])
+            self.assertEqual(state["samples"], 1)
+
+    def test_source_jpeg_pixels_win_when_snapshot_metadata_size_is_wrong(self):
+        if not hasattr(cv2, "aruco") or not hasattr(cv2.aruco, "DICT_APRILTAG_36h11"):
+            self.skipTest("OpenCV AprilTag 36h11 dictionary is unavailable")
+        source_bgr, _ignored = render_production_aprilgrid(0.024, 0.0072, 0.50)
+        small = cv2.resize(source_bgr, (1920, 1080), interpolation=cv2.INTER_AREA)
+        ok, encoded = cv2.imencode(".jpg", small, (cv2.IMWRITE_JPEG_QUALITY, 94))
+        self.assertTrue(ok)
+        jpeg = encoded.tobytes()
+        working = small
+        with tempfile.TemporaryDirectory() as directory:
+            service = IntrinsicCalibrationService(
+                board_size=(6, 6),
+                square=0.024,
+                output_file=str(Path(directory) / "intrinsics.yaml"),
+                camera_name="usb_cam",
+                calibration_mode="phy",
+                board_type="aprilgrid",
+                tag_spacing=0.0072,
+                min_tags=6,
+                display_width=640,
+            )
+            service.process_frame(
+                working,
+                source_image_size=PRODUCTION_IMAGE_SIZE,
+                source_jpeg=jpeg,
+                source_snapshot_id="meta-mismatch",
+            )
+            state = service.state()
+            self.assertEqual(state["detection"]["status"], "detected")
+            self.assertTrue(state["detection"]["accepted"])
+            self.assertEqual(state["samples"], 1)
+            self.assertEqual(service.image_size, (1920, 1080))
 
     def test_simulation_pose_gate_still_blocks_untargeted_physical_style_frames(self):
         if not hasattr(cv2, "aruco") or not hasattr(cv2.aruco, "DICT_APRILTAG_36h11"):

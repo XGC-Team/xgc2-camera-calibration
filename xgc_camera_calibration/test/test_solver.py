@@ -67,10 +67,56 @@ class ExtrinsicSolverTest(unittest.TestCase):
 
     def test_rejects_collinear_points(self):
         world = np.array([[value, 0.0, 0.0] for value in range(5)], dtype=np.float64)
-        with self.assertRaises(CalibrationError):
+        with self.assertRaisesRegex(CalibrationError, "world points are collinear or coincident") as raised:
             solve_extrinsic(world, self.pixels[:5], self.intrinsic)
+        self.assertNotRegex(str(raised.exception), r"UAV|UGV|rows")
 
-    def test_recovers_pose_from_planar_robot_rows_and_rejects_outlier(self):
+    def test_recovers_pose_from_same_kind_planar_hexagon(self):
+        world = np.array(
+            [
+                [1.2, -1.5, 0.0],
+                [0.6, -0.4608, 0.0],
+                [-0.6, -0.4608, 0.0],
+                [-1.2, -1.5, 0.0],
+                [-0.6, -2.5392, 0.0],
+                [0.6, -2.5392, 0.0],
+            ],
+            dtype=np.float64,
+        )
+        pixels, _ = cv2.projectPoints(
+            world.reshape(-1, 1, 3), self.rvec, self.tvec, self.intrinsic, np.zeros(5)
+        )
+        observed = pixels.reshape(-1, 2)
+        observed += np.random.RandomState(3).normal(scale=0.1, size=observed.shape)
+        result = solve_extrinsic(
+            world, observed, self.intrinsic, np.zeros(5), ransac_reprojection_error_px=1.5,
+        )
+        expected_rotation, _ = cv2.Rodrigues(self.rvec)
+        expected_translation = -expected_rotation.T.dot(self.tvec)
+        np.testing.assert_allclose(result.translation, expected_translation, atol=0.02)
+        self.assertEqual(len(result.inlier_indices), len(world))
+
+    def test_planar_pose_failure_is_geometry_only(self):
+        world = np.array(
+            [
+                [1.2, -1.5, 0.0],
+                [0.6, -0.4608, 0.0],
+                [-0.6, -0.4608, 0.0],
+                [-1.2, -1.5, 0.0],
+                [-0.6, -2.5392, 0.0],
+                [0.6, -2.5392, 0.0],
+            ],
+            dtype=np.float64,
+        )
+        pixels = np.tile(np.array([[320.0, 240.0]], dtype=np.float64), (len(world), 1))
+        with self.assertRaisesRegex(
+            CalibrationError,
+            "could not estimate a planar camera pose from the selected markers",
+        ) as raised:
+            solve_extrinsic(world, pixels, self.intrinsic)
+        self.assertNotRegex(str(raised.exception), r"UAV|UGV|rows")
+
+    def test_recovers_pose_from_planar_markers_and_rejects_outlier(self):
         world = np.array(
             [[float(x), -1.0, 0.0] for x in range(5)]
             + [[float(x), 1.0, 0.0] for x in range(5)],

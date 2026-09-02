@@ -294,6 +294,7 @@ def refine_aprilgrid_calibration_corners(
     source_tag_corners: np.ndarray,
     source_tag_objects: np.ndarray,
     minimum_tags: int = 1,
+    allow_subpix_fallback: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Return paired, full-resolution AprilGrid corner correspondences.
 
@@ -335,7 +336,17 @@ def refine_aprilgrid_calibration_corners(
         try:
             refined_tag = _refine_aprilgrid_quad_edges(source_gray, raw_tag)
         except (ValueError, np.linalg.LinAlgError, cv2.error):
-            continue
+            if not allow_subpix_fallback or not _aprilgrid_tag_region_has_contrast(
+                source_gray, raw_tag
+            ):
+                continue
+            try:
+                seed = np.asarray(raw_tag, dtype=np.float32).reshape(-1, 1, 2)
+                refined_tag = cv2.cornerSubPix(
+                    source_gray, seed, (5, 5), (-1, -1), _SUBPIX_CRITERIA
+                ).reshape(4, 2)
+            except cv2.error:
+                continue
         orientation_ok = (
             cv2.isContourConvex(refined_tag.reshape(-1, 1, 2))
             and np.sign(cv2.contourArea(raw_tag, oriented=True))
@@ -354,6 +365,92 @@ def refine_aprilgrid_calibration_corners(
     return (
         np.asarray(refined_tags, dtype=np.float32).reshape(-1, 1, 2),
         np.asarray(accepted_objects, dtype=np.float32).reshape(-1, 3),
+    )
+
+
+def _aprilgrid_tag_region_has_contrast(gray: np.ndarray, quad: np.ndarray) -> bool:
+    points = np.asarray(quad, dtype=np.float32).reshape(4, 2)
+    x0, y0 = np.floor(points.min(axis=0)).astype(np.int32)
+    x1, y1 = np.ceil(points.max(axis=0)).astype(np.int32)
+    x0 = int(max(0, x0))
+    y0 = int(max(0, y0))
+    x1 = int(min(gray.shape[1], x1))
+    y1 = int(min(gray.shape[0], y1))
+    if x1 - x0 < 4 or y1 - y0 < 4:
+        return False
+    return float(np.ptp(gray[y0:y1, x0:x1].astype(np.float32))) >= (
+        _APRILGRID_EDGE_MIN_MEDIAN_CONTRAST
+    )
+
+
+def localize_aprilgrid_source_corners(
+    source_gray: np.ndarray,
+    search_tag_corners: np.ndarray,
+    search_tag_objects: np.ndarray,
+    board_size: Sequence[int],
+    square: float,
+    tag_spacing: float,
+    start_id: int,
+    min_tags: int,
+) -> Tuple[np.ndarray, np.ndarray, Tuple[float, float, float, float]]:
+    """Localize search-plane AprilGrid corners on the source grayscale image.
+
+    The continuous detector already recovered unique tag IDs. Re-running ArUco
+    on the 4K JPEG can invent duplicate IDs and drop a usable frame. Map the
+    search corners, refine them on the source plane, and keep the observation
+    only when the lattice stays geometrically consistent.
+    """
+    height, width = source_gray.shape[:2]
+    try:
+        calibration_pixels, calibration_objects = refine_aprilgrid_calibration_corners(
+            source_gray,
+            search_tag_corners,
+            search_tag_objects,
+            minimum_tags=min_tags,
+            allow_subpix_fallback=False,
+        )
+    except CalibrationError:
+        calibration_pixels, calibration_objects = refine_aprilgrid_calibration_corners(
+            source_gray,
+            search_tag_corners,
+            search_tag_objects,
+            minimum_tags=min_tags,
+            allow_subpix_fallback=True,
+        )
+    image_tags = np.asarray(calibration_pixels, dtype=np.float32).reshape(-1, 4, 2)
+    object_tags = np.asarray(calibration_objects, dtype=np.float32).reshape(-1, 4, 3)
+    first_id = int(start_id)
+    last_id = first_id + int(board_size[0]) * int(board_size[1])
+    tag_ids: List[int] = []
+    for object_tag in object_tags:
+        matching = [
+            tag_id
+            for tag_id in range(first_id, last_id)
+            if np.array_equal(
+                object_tag,
+                aprilgrid_tag_object_points(
+                    board_size, square, tag_spacing, start_id, tag_id
+                ),
+            )
+        ]
+        if len(matching) != 1:
+            raise CalibrationError("AprilGrid refined tags lost their lattice identity")
+        tag_ids.append(matching[0])
+    if not _strict_aprilgrid_observation(
+        image_tags,
+        object_tags,
+        tag_ids,
+        board_size,
+        square,
+        tag_spacing,
+        start_id,
+        observation_uncertainty_px("aprilgrid"),
+    ):
+        raise CalibrationError("AprilGrid observation failed geometric consistency")
+    return (
+        calibration_pixels,
+        calibration_objects,
+        _aprilgrid_coverage(calibration_pixels, calibration_objects, width, height),
     )
 
 

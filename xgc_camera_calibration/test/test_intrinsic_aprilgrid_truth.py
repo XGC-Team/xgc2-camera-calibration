@@ -230,9 +230,9 @@ class AprilGridProductionTruthTest(unittest.TestCase):
             self.assertEqual(len(service.object_points), 1)
             self.assertEqual(len(service.image_points[0]), len(service.object_points[0]))
             self.assertEqual(len(service.image_points[0]) % 4, 0)
-            self.assertGreaterEqual(len(service.image_points[0]), 108)
-            # Stored solve coordinates come from a fresh full-source detection,
-            # not a VGA observation multiplied by a scale factor.
+            self.assertGreaterEqual(len(service.image_points[0]), 24)
+            # Stored solve coordinates are search-plane tags localized on the
+            # source JPEG, not a second ArUco pass and not VGA pixels.
             stored = service.image_points[0].reshape(-1, 2)
             self.assertGreater(float(np.max(stored[:, 0])), 640.0)
             self.assertEqual(service.image_size, IMAGE_SIZE)

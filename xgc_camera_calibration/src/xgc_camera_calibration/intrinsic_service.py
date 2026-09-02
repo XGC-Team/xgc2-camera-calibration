@@ -42,6 +42,10 @@ APRILGRID_ADAPTIVE_DETECTION_WIDTH = 2200
 # a higher JPEG decode. Six-quad evidence dropped A4 24 mm boards at arm's
 # length, where VGA recovers 1–5 quads and 4K still decodes the lattice.
 APRILGRID_ADAPTIVE_EVIDENCE_QUADS = 1
+# After a hit, keep using the higher JPEG plane for this many frames even if
+# the current VGA thumbnail has zero quads. Borderline physical views otherwise
+# flicker as rejected-quad counts oscillate around the evidence gate.
+APRILGRID_SEARCH_HOLD_FRAMES = 12
 INTRINSIC_VALIDATION_MIN_JPEG_QUALITY = 95
 CAMERA_NAME_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9._-]{0,63}$")
 _TARGET_CAPTURE_TOKEN_UNSET = object()
@@ -358,6 +362,8 @@ class IntrinsicCalibrationService:
         self._auto_capture_interval = 0.0
         self._auto_capture_error: Optional[str] = None
         self._auto_capture_completed = False
+        self._aprilgrid_search_hold_frames = 0
+        self._aprilgrid_search_hold_width = 0
         self._evidence_temporary = tempfile.TemporaryDirectory(
             prefix="xgc2-intrinsic-evidence-"
         )
@@ -1790,6 +1796,8 @@ class IntrinsicCalibrationService:
             return gray
 
         aprilgrid_search = self.board_type == "aprilgrid"
+        with self.lock:
+            search_hold_frames = self._aprilgrid_search_hold_frames
         detection = detect_on(
             gray,
             width if aprilgrid_search else self.maximum_detect_width,
@@ -1800,10 +1808,11 @@ class IntrinsicCalibrationService:
             and aprilgrid_search
             and source_jpeg
             and source_width > width
-            and intrinsic_solver.aprilgrid_has_candidate_evidence(
-                gray, self.tag_family, APRILGRID_ADAPTIVE_EVIDENCE_QUADS
-            )
         ):
+            # VGA miss: always try the bounded JPEG plane. A one-quad evidence
+            # gate still flickers at arm's length because rejected-quad counts
+            # oscillate through zero. Empty scenes stay cheap: adaptive then
+            # stops unless a recent hit is holding the source plane.
             adaptive = self._decode_adaptive_aprilgrid_frame(source_jpeg, source_width)
             if adaptive is not None and adaptive.shape[1] > width:
                 adaptive_gray = cv2.cvtColor(adaptive, cv2.COLOR_BGR2GRAY)
@@ -1812,9 +1821,9 @@ class IntrinsicCalibrationService:
                 )
                 if detection is not None:
                     adopt_working_image(adaptive, adaptive_gray)
-                elif (
-                    source_width > adaptive.shape[1]
-                    and intrinsic_solver.aprilgrid_has_candidate_evidence(
+                elif source_width > adaptive.shape[1] and (
+                    search_hold_frames > 0
+                    or intrinsic_solver.aprilgrid_has_candidate_evidence(
                         adaptive_gray,
                         self.tag_family,
                         APRILGRID_ADAPTIVE_EVIDENCE_QUADS,
@@ -1824,15 +1833,13 @@ class IntrinsicCalibrationService:
                         np.frombuffer(source_jpeg, dtype=np.uint8),
                         cv2.IMREAD_GRAYSCALE,
                     )
-                    if (
-                        isinstance(source_gray, np.ndarray)
-                        and source_gray.ndim == 2
-                        and source_gray.shape[:2] == (source_height, source_width)
-                    ):
+                    if isinstance(source_gray, np.ndarray) and source_gray.ndim == 2:
                         detection = detect_on(
-                            source_gray, source_width, require_refinement=True
+                            source_gray,
+                            source_gray.shape[1],
+                            require_refinement=False,
                         )
-                        if detection is not None:
+                        if detection is not None or search_hold_frames > 0:
                             adopt_working_image(
                                 cv2.cvtColor(source_gray, cv2.COLOR_GRAY2BGR),
                                 source_gray,
@@ -1847,6 +1854,14 @@ class IntrinsicCalibrationService:
 
         with self.lock:
             self._frame_sequence += 1
+            if aprilgrid_search:
+                if detection is not None:
+                    self._aprilgrid_search_hold_frames = APRILGRID_SEARCH_HOLD_FRAMES
+                    self._aprilgrid_search_hold_width = width
+                elif self._aprilgrid_search_hold_frames > 0:
+                    self._aprilgrid_search_hold_frames -= 1
+                    if self._aprilgrid_search_hold_frames == 0:
+                        self._aprilgrid_search_hold_width = 0
             # A frame that began while the camera was moving may acknowledge the
             # new pose, but its missing capture token prevents that same frame
             # from becoming solve evidence. Only the next transaction is fresh.
@@ -1915,43 +1930,20 @@ class IntrinsicCalibrationService:
                             and detection.calibration_image_points is not None
                             and detection.calibration_object_points is not None
                         )
+                        candidate_image_size = (source_width, source_height)
                         if self.board_type == "aprilgrid" and source_jpeg and not already_source_refined:
                             try:
-                                source_gray = cv2.imdecode(
-                                    np.frombuffer(source_jpeg, dtype=np.uint8),
-                                    cv2.IMREAD_GRAYSCALE,
+                                (
+                                    calibration_corners,
+                                    calibration_objects,
+                                    params,
+                                    candidate_image_size,
+                                ) = self._localize_aprilgrid_on_source_jpeg(
+                                    source_jpeg,
+                                    working_width=width,
+                                    working_height=height,
+                                    detection=detection,
                                 )
-                                if (
-                                    not isinstance(source_gray, np.ndarray)
-                                    or source_gray.shape[:2] != (source_height, source_width)
-                                ):
-                                    raise ValueError(
-                                        "source JPEG dimensions do not match snapshot metadata"
-                                    )
-                                source_detection = intrinsic_solver.detect_board(
-                                    source_gray,
-                                    self.board_size,
-                                    source_width,
-                                    board_type=self.board_type,
-                                    square=self.square,
-                                    tag_spacing=self.tag_spacing,
-                                    tag_family=self.tag_family,
-                                    start_id=self.tag_start_id,
-                                    min_tags=self.min_tags,
-                                    require_refinement=True,
-                                )
-                                if source_detection is None:
-                                    raise CalibrationError(
-                                        "AprilGrid source-resolution refinement "
-                                        "did not retain enough complete tags"
-                                    )
-                                calibration_corners = source_detection.calibration_image_points
-                                calibration_objects = source_detection.calibration_object_points
-                                if calibration_corners is None or calibration_objects is None:
-                                    raise CalibrationError(
-                                        "AprilGrid source-resolution correspondences are missing"
-                                    )
-                                params = source_detection.coverage
                             except Exception as error:
                                 # Keep the live detection, but never admit a
                                 # solve sample containing mixed refined/raw
@@ -1967,7 +1959,6 @@ class IntrinsicCalibrationService:
                             )
                             accepted = False
                         if accepted:
-                            candidate_image_size = (source_width, source_height)
                             if (
                                 self.image_size is not None
                                 and self.image_size != candidate_image_size
@@ -1975,8 +1966,8 @@ class IntrinsicCalibrationService:
                                 self._recovery_error = (
                                     "Calibration candidate image dimensions {}x{} do not match "
                                     "the frozen {}x{} observation pool".format(
-                                        source_width,
-                                        source_height,
+                                        candidate_image_size[0],
+                                        candidate_image_size[1],
                                         self.image_size[0],
                                         self.image_size[1],
                                     )
@@ -1988,7 +1979,7 @@ class IntrinsicCalibrationService:
                                 # Freeze only when this observation actually
                                 # enters the pool. Undetected frames and failed
                                 # evidence transactions cannot poison it.
-                                self.image_size = (source_width, source_height)
+                                self.image_size = candidate_image_size
                             self.samples.append(params)
                             self.image_points.append(calibration_corners)
                             self.object_points.append(calibration_objects)
@@ -1998,8 +1989,8 @@ class IntrinsicCalibrationService:
                                 try:
                                     self._record_evidence_sample_locked(
                                         source_jpeg=source_jpeg,
-                                        source_width=source_width,
-                                        source_height=source_height,
+                                        source_width=candidate_image_size[0],
+                                        source_height=candidate_image_size[1],
                                         image_points=calibration_corners,
                                         coverage=params,
                                         target_index=target_index,
@@ -2082,6 +2073,57 @@ class IntrinsicCalibrationService:
                 interpolation=cv2.INTER_AREA,
             )
         return image
+
+    def _localize_aprilgrid_on_source_jpeg(
+        self,
+        source_jpeg: bytes,
+        *,
+        working_width: int,
+        working_height: int,
+        detection: intrinsic_solver.BoardDetection,
+    ) -> Tuple[
+        np.ndarray,
+        np.ndarray,
+        Tuple[float, float, float, float],
+        Tuple[int, int],
+    ]:
+        source_gray = cv2.imdecode(
+            np.frombuffer(source_jpeg, dtype=np.uint8),
+            cv2.IMREAD_GRAYSCALE,
+        )
+        if not isinstance(source_gray, np.ndarray) or source_gray.ndim != 2:
+            raise CalibrationError("source JPEG could not be decoded")
+        actual_height, actual_width = source_gray.shape[:2]
+        search_image = np.asarray(detection.image_points, dtype=np.float32).reshape(-1, 2)
+        search_objects = np.asarray(detection.object_points, dtype=np.float32).reshape(-1, 3)
+        if (
+            len(search_image) != len(search_objects)
+            or len(search_image) < 4
+            or len(search_image) % 4 != 0
+        ):
+            raise CalibrationError("AprilGrid search correspondences are missing")
+        scale = np.asarray(
+            [
+                float(actual_width) / float(working_width),
+                float(actual_height) / float(working_height),
+            ],
+            dtype=np.float32,
+        )
+        source_tags = (search_image * scale).reshape(-1, 4, 2)
+        source_objects = search_objects.reshape(-1, 4, 3)
+        calibration_pixels, calibration_objects, coverage = (
+            intrinsic_solver.localize_aprilgrid_source_corners(
+                source_gray,
+                source_tags,
+                source_objects,
+                self.board_size,
+                self.square,
+                self.tag_spacing,
+                self.tag_start_id,
+                self.min_tags,
+            )
+        )
+        return calibration_pixels, calibration_objects, coverage, (actual_width, actual_height)
 
     def image_jpeg(self) -> bytes:
         with self.lock:
@@ -2239,6 +2281,8 @@ class IntrinsicCalibrationService:
         self._target_expected_pose = None
         self._target_pose_ack_enabled = False
         self._auto_capture_completed = False
+        self._aprilgrid_search_hold_frames = 0
+        self._aprilgrid_search_hold_width = 0
         self._evidence_temporary.cleanup()
         self._evidence_temporary = tempfile.TemporaryDirectory(
             prefix="xgc2-intrinsic-evidence-"
