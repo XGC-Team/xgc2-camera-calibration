@@ -72,6 +72,10 @@ class WebCalibrationServiceTest(unittest.TestCase):
             self.assertIn('rospy.get_param("~camera_name")', source)
         self.assertNotIn('rospy.get_param("~output_file"', calibrator)
         self.assertNotIn('rospy.get_param("~extrinsic_file"', publisher)
+        self.assertIn("optional_selected_intrinsic_path", calibrator)
+        self.assertIn("Select a timestamped intrinsic calibration YAML before freezing", calibrator)
+        self.assertIn("default_transform_chain", publisher)
+        self.assertIn("Publishing default camera extrinsic", publisher)
 
     def test_web_assets_use_proxy_safe_relative_urls(self):
         web_root = Path(__file__).resolve().parents[1] / "web" / "extrinsic"

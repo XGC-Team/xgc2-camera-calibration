@@ -12,6 +12,7 @@ from xgc_camera_calibration.solver import (
     extrinsic_selection_path,
     load_extrinsic_selection,
     load_extrinsic,
+    optional_selected_intrinsic_path,
     save_extrinsic,
     selected_extrinsic_path,
     selected_intrinsic_path,
@@ -209,6 +210,32 @@ class ExtrinsicSolverTest(unittest.TestCase):
                     selected_intrinsic_path(
                         str(root), "phy", invalid_camera_name, str(selected_file)
                     )
+            self.assertIsNone(
+                optional_selected_intrinsic_path(str(root), "phy", "usb_cam", "")
+            )
+            self.assertIsNone(
+                optional_selected_intrinsic_path(str(root), "phy", "usb_cam", "  ")
+            )
+            self.assertEqual(
+                optional_selected_intrinsic_path(
+                    str(root), "phy", "usb_cam", str(selected_file)
+                ),
+                selected_file,
+            )
+            with self.assertRaises(ValueError):
+                optional_selected_intrinsic_path(
+                    str(root), "phy", "usb_cam", str(other_file)
+                )
+
+    def test_default_identity_optical_pose_splits_into_rep103_link(self):
+        chain = split_parent_to_optical_pose(
+            [0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]
+        )
+        parent_r_link = quaternion_to_rotation_matrix(chain["parent_q_link_xyzw"])
+        recomposed = parent_r_link.dot(link_to_optical_rotation())
+        np.testing.assert_allclose(recomposed, np.eye(3), atol=1e-12)
+        np.testing.assert_allclose(chain["parent_t_link"], [0.0, 0.0, 0.0])
+        np.testing.assert_allclose(chain["link_t_optical"], [0.0, 0.0, 0.0])
 
     def test_parent_link_optical_chain_recomposes_calibrated_optical_pose(self):
         result = solve_extrinsic(self.world, self.pixels, self.intrinsic)

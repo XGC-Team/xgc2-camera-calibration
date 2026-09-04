@@ -49,6 +49,17 @@ def extrinsic_calibration_directory(root: str, mode: str, camera_name: str) -> P
     return calibration_root / calibration_mode / identity
 
 
+def optional_selected_intrinsic_path(
+    root: str, mode: str, camera_name: str, intrinsic_file: str
+):
+    """Return a validated intrinsic path, or None when the operator left it empty."""
+
+    selected = str(intrinsic_file).strip()
+    if not selected:
+        return None
+    return selected_intrinsic_path(root, mode, camera_name, selected)
+
+
 def selected_intrinsic_path(
     root: str, mode: str, camera_name: str, intrinsic_file: str
 ) -> Path:

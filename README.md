@@ -159,7 +159,10 @@ timestamped result that existed when the node started; the directory watcher
 then activates the concrete result from the current run. `watch_file` also
 applies later re-solves while the workflow remains open, and the publisher
 exposes the active absolute path as its private `active_extrinsic_file` ROS
-parameter.
+parameter. When `wait_for_file` is false and the partition has no timestamped
+YAML, the node publishes a default identity parent→link→optical chain immediately
+so 3D/AR still have a camera frame; `watch_file` later hot-loads the first saved
+file. That default is not a calibration result.
 
 The stable REP-103 chain is:
 

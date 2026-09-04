@@ -23,7 +23,7 @@ from xgc_camera_calibration.web_service import (
 from xgc_camera_calibration.intrinsic_solver import load_intrinsic
 from xgc_camera_calibration.intrinsic_validation import intrinsic_parameters
 from xgc_camera_calibration.media_snapshot import MediaSnapshotClient, MediaSnapshotError
-from xgc_camera_calibration.solver import selected_intrinsic_path
+from xgc_camera_calibration.solver import optional_selected_intrinsic_path
 
 
 def normalize_topic(value):
@@ -44,19 +44,26 @@ class RosCalibrationSource:
     ):
         self.lock = threading.RLock()
         self.snapshot_client = snapshot_client
-        self.intrinsic_file = selected_intrinsic_path(
+        selected = optional_selected_intrinsic_path(
             calibration_root, calibration_mode, camera_name, intrinsic_file
         )
-        intrinsic_document = load_intrinsic(self.intrinsic_file)
-        if str(intrinsic_document.get("camera_name", "")).strip() != camera_name:
-            raise ValueError(
-                "selected intrinsic camera_name does not match ~camera_name"
-            )
-        (
-            self.intrinsic_matrix,
-            self.intrinsic_distortion,
-            self.intrinsic_size,
-        ) = intrinsic_parameters(intrinsic_document)
+        if selected is None:
+            self.intrinsic_file = ""
+            self.intrinsic_matrix = None
+            self.intrinsic_distortion = None
+            self.intrinsic_size = None
+        else:
+            self.intrinsic_file = selected
+            intrinsic_document = load_intrinsic(self.intrinsic_file)
+            if str(intrinsic_document.get("camera_name", "")).strip() != camera_name:
+                raise ValueError(
+                    "selected intrinsic camera_name does not match ~camera_name"
+                )
+            (
+                self.intrinsic_matrix,
+                self.intrinsic_distortion,
+                self.intrinsic_size,
+            ) = intrinsic_parameters(intrinsic_document)
         self.image_topic = normalize_topic(rospy.get_param("~image_topic", "/usb_cam/image_raw"))
         self.preview_image_topic = normalize_topic(
             rospy.get_param(
@@ -188,7 +195,7 @@ class RosCalibrationSource:
                 "pose_prefix": self.pose_prefix,
                 "image_ready": preview_ready,
                 "preview_ready": preview_ready,
-                "intrinsic_ready": True,
+                "intrinsic_ready": self.intrinsic_matrix is not None,
                 "marker_count": len(marker_names),
                 "marker_names": marker_names,
                 "latest_image_stamp_sec": self.preview_stamp_sec,
@@ -241,6 +248,11 @@ class RosCalibrationSource:
         frame_id,
         parent_frame,
     ):
+        if self.intrinsic_matrix is None or self.intrinsic_size is None:
+            raise ApiError(
+                409,
+                "Select a timestamped intrinsic calibration YAML before freezing",
+            )
         image_size = (int(image.shape[1]), int(image.shape[0]))
         if image_size != self.intrinsic_size:
             raise ApiError(
@@ -365,10 +377,16 @@ def main():
         "WebRTC" if snapshot_client is not None else source.preview_image_topic,
         source.pose_prefix,
     )
-    rospy.loginfo(
-        "Camera extrinsic calibration uses intrinsics from %s",
-        source.intrinsic_file,
-    )
+    if source.intrinsic_file:
+        rospy.loginfo(
+            "Camera extrinsic calibration uses intrinsics from %s",
+            source.intrinsic_file,
+        )
+    else:
+        rospy.logwarn(
+            "Camera extrinsic WebUI started without an intrinsic YAML; "
+            "Freeze/Solve stay closed until a timestamped file is selected"
+        )
     rospy.loginfo(
         "Camera extrinsic results will be saved under %s (%s/%s)",
         calibration_root,

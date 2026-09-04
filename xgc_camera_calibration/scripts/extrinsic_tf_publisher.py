@@ -83,6 +83,40 @@ def load_transform_chain(
     )
 
 
+def default_transform_chain(
+    parent_frame,
+    camera_link_frame,
+    optical_frame,
+    parent_t_optical=(0.0, 0.0, 0.0),
+    parent_q_optical_xyzw=(0.0, 0.0, 0.0, 1.0),
+    parent_offsets=(0.0, 0.0, 0.0),
+    link_to_optical_translation=(0.0, 0.0, 0.0),
+):
+    optical_translation = tuple(
+        float(parent_t_optical[index]) + float(parent_offsets[index])
+        for index in range(3)
+    )
+    chain = split_parent_to_optical_pose(
+        optical_translation,
+        parent_q_optical_xyzw,
+        tuple(float(value) for value in link_to_optical_translation),
+    )
+    return (
+        make_transform(
+            parent_frame,
+            camera_link_frame,
+            chain["parent_t_link"],
+            chain["parent_q_link_xyzw"],
+        ),
+        make_transform(
+            camera_link_frame,
+            optical_frame,
+            chain["link_t_optical"],
+            chain["link_q_optical_xyzw"],
+        ),
+    )
+
+
 def wait_for_transform_chain(
     extrinsic_directory,
     calibration_mode,
@@ -92,13 +126,16 @@ def wait_for_transform_chain(
     poll_rate,
     expected_parent_frame=None,
     expected_optical_frame=None,
+    default_transforms=None,
 ):
     announced_wait = False
     while not rospy.is_shutdown():
         result_revision = watcher.next_revision()
         if result_revision is None:
             if not wait_for_file:
-                raise RuntimeError("calibration asset does not exist")
+                if default_transforms is None:
+                    raise RuntimeError("calibration asset does not exist")
+                return default_transforms, None
             if not announced_wait:
                 rospy.loginfo(
                     "Waiting for a newly solved camera extrinsic under %s",
@@ -180,6 +217,21 @@ def main():
     if file_poll_rate <= 0.0:
         rospy.logfatal("~file_poll_rate must be positive")
         return 2
+    default_transforms = default_transform_chain(
+        str(rospy.get_param("~parent_frame", "world")).strip() or "world",
+        str(rospy.get_param("~camera_link_frame", "usb_cam_link")).strip()
+        or "usb_cam_link",
+        str(rospy.get_param("~optical_frame", "usb_cam_optical_frame")).strip()
+        or "usb_cam_optical_frame",
+        parent_offsets=tuple(
+            float(rospy.get_param("~{}_offset".format(axis), 0.0))
+            for axis in ("x", "y", "z")
+        ),
+        link_to_optical_translation=tuple(
+            float(rospy.get_param("~link_to_optical_{}".format(axis), 0.0))
+            for axis in ("x", "y", "z")
+        ),
+    )
     watcher = ExtrinsicSelectionWatcher(
         calibration_root,
         selected_mode,
@@ -197,6 +249,7 @@ def main():
             poll_rate,
             expected_parent_frame,
             expected_optical_frame,
+            default_transforms=None if wait_for_file else default_transforms,
         )
     except Exception as error:
         rospy.logfatal("Could not load camera extrinsic under %s: %s", extrinsic_directory, error)
@@ -206,8 +259,18 @@ def main():
     transforms, extrinsic_file = loaded
 
     static = bool(rospy.get_param("~static", True))
-    log_transform_chain(extrinsic_file, transforms)
-    rospy.set_param("~active_extrinsic_file", str(extrinsic_file))
+    if extrinsic_file:
+        log_transform_chain(extrinsic_file, transforms)
+        rospy.set_param("~active_extrinsic_file", str(extrinsic_file))
+    else:
+        rospy.logwarn(
+            "Publishing default camera extrinsic %s -> %s -> %s until a timestamped YAML is saved under %s",
+            transforms[0].header.frame_id,
+            transforms[0].child_frame_id,
+            transforms[1].child_frame_id,
+            extrinsic_directory,
+        )
+        rospy.set_param("~active_extrinsic_file", "")
     if static:
         broadcaster = tf2_ros.StaticTransformBroadcaster()
         while not rospy.is_shutdown():
