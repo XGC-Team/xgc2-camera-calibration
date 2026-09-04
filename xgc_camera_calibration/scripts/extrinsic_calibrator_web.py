@@ -350,7 +350,7 @@ def main():
         calibration_mode = str(rospy.get_param("~calibration_mode")).strip()
         camera_name = str(rospy.get_param("~camera_name")).strip()
         source = RosCalibrationSource(
-            rospy.get_param("~intrinsic_file"),
+            rospy.get_param("~intrinsic_file", ""),
             calibration_root,
             calibration_mode,
             camera_name,

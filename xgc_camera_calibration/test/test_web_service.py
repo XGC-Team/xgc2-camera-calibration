@@ -73,6 +73,7 @@ class WebCalibrationServiceTest(unittest.TestCase):
         self.assertNotIn('rospy.get_param("~output_file"', calibrator)
         self.assertNotIn('rospy.get_param("~extrinsic_file"', publisher)
         self.assertIn("optional_selected_intrinsic_path", calibrator)
+        self.assertIn('rospy.get_param("~intrinsic_file", "")', calibrator)
         self.assertIn("Select a timestamped intrinsic calibration YAML before freezing", calibrator)
         self.assertIn("snapshot_health_timer", calibrator)
         self.assertIn("except MediaSnapshotError as error", calibrator)
