@@ -46,6 +46,7 @@ APRILGRID_ADAPTIVE_EVIDENCE_QUADS = 1
 # the current VGA thumbnail has zero quads. Borderline physical views otherwise
 # flicker as rejected-quad counts oscillate around the evidence gate.
 APRILGRID_SEARCH_HOLD_FRAMES = 12
+DEFAULT_AUTO_CAPTURE_INTERVAL_SECONDS = 0.2
 INTRINSIC_VALIDATION_MIN_JPEG_QUALITY = 95
 CAMERA_NAME_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9._-]{0,63}$")
 _TARGET_CAPTURE_TOKEN_UNSET = object()
@@ -416,6 +417,17 @@ class IntrinsicCalibrationService:
             "last_error": self._auto_capture_error,
             "coverage_complete": self._auto_capture_completed,
         }
+
+    def _resume_auto_capture_interval_locked(self) -> float:
+        """Keep the last positive cadence across Pause/Resume.
+
+        The HTTP start body is empty, so Resume cannot pass 0.2. Defaulting
+        ``start_auto_capture()`` to 0.0 would replace the boot 5 Hz loop with
+        an unbounded 4K detect spin after the first Pause.
+        """
+        if self._auto_capture_interval > 0.0:
+            return float(self._auto_capture_interval)
+        return DEFAULT_AUTO_CAPTURE_INTERVAL_SECONDS
 
     def start_auto_capture(self, interval: float = 0.0) -> Dict[str, Any]:
         """Continuously inspect snapshots from either camera origin.

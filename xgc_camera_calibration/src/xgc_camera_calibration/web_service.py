@@ -958,7 +958,10 @@ class CalibrationRequestHandler(BaseHTTPRequestHandler):
             if path == "/api/v1/intrinsic/auto_capture/start":
                 if request not in ({}, None):
                     raise ApiError(HTTPStatus.BAD_REQUEST, "auto_capture start request must be an empty object")
-                self._send_json(HTTPStatus.OK, self._intrinsic().start_auto_capture())
+                intrinsic = self._intrinsic()
+                with intrinsic.lock:
+                    interval = intrinsic._resume_auto_capture_interval_locked()
+                self._send_json(HTTPStatus.OK, intrinsic.start_auto_capture(interval=interval))
                 return
             if path == "/api/v1/intrinsic/auto_capture/stop":
                 if request not in ({}, None):

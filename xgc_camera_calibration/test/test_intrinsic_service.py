@@ -23,6 +23,7 @@ from xgc_camera_calibration import intrinsic_solver, intrinsic_validation
 from xgc_camera_calibration.intrinsic_service import (
     APRILGRID_ADAPTIVE_EVIDENCE_QUADS,
     APRILGRID_SEARCH_HOLD_FRAMES,
+    DEFAULT_AUTO_CAPTURE_INTERVAL_SECONDS,
     IntrinsicCalibrationService,
     intrinsic_algorithm_provenance,
     intrinsic_calibration_directory,
@@ -540,6 +541,10 @@ class IntrinsicServiceTest(unittest.TestCase):
         self.assertIn('rospy.get_param("~auto_capture", True)', source)
         self.assertIn('rospy.get_param("~auto_capture_interval", 0.2)', source)
         self.assertNotIn('rospy.get_param("~auto_capture", not bool(', source)
+        web_source = WEB_SERVICE_SOURCE.read_text(encoding="utf-8")
+        self.assertIn("_resume_auto_capture_interval_locked()", web_source)
+        self.assertIn("start_auto_capture(interval=interval)", web_source)
+        self.assertEqual(DEFAULT_AUTO_CAPTURE_INTERVAL_SECONDS, 0.2)
         self.assertIn('rospy.get_param("~maximum_detect_width", display_width)', source)
         self.assertIn('rospy.get_param("~detection_target_pixels", 640 * 480)', " ".join(source.split()))
         self.assertIn('kwargs={"poll_interval": 0.05}', source)
@@ -2110,6 +2115,88 @@ class IntrinsicServiceTest(unittest.TestCase):
             self.assertGreaterEqual(len(starts), 5)
             periods = [right - left for left, right in zip(starts, starts[1:])]
             self.assertLess(max(periods[:4]), 0.05)
+
+    def test_http_resume_keeps_boot_auto_capture_interval(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = make_service(Path(directory) / "intrinsics.yaml")
+            service.attach_frame_capture(
+                lambda: np.full((200, 320, 3), 127, np.uint8)
+            )
+            booted = service.start_auto_capture(
+                interval=DEFAULT_AUTO_CAPTURE_INTERVAL_SECONDS
+            )
+            self.assertEqual(
+                booted["auto_capture"]["interval_seconds"],
+                DEFAULT_AUTO_CAPTURE_INTERVAL_SECONDS,
+            )
+            stopped = service.stop_auto_capture()
+            self.assertFalse(stopped["auto_capture"]["enabled"])
+            self.assertEqual(
+                stopped["auto_capture"]["interval_seconds"],
+                DEFAULT_AUTO_CAPTURE_INTERVAL_SECONDS,
+            )
+
+            server = CalibrationHttpServer(
+                ("127.0.0.1", 0), object(), WEB_ROOT,
+                frame_ancestors="'self'", intrinsic_service=service,
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                request = urllib.request.Request(
+                    "http://127.0.0.1:{}/api/v1/intrinsic/auto_capture/start".format(
+                        server.server_address[1]
+                    ),
+                    data=b"{}",
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(request) as response:
+                    payload = json.loads(response.read())
+                self.assertTrue(payload["auto_capture"]["enabled"])
+                self.assertEqual(
+                    payload["auto_capture"]["interval_seconds"],
+                    DEFAULT_AUTO_CAPTURE_INTERVAL_SECONDS,
+                )
+            finally:
+                service.stop_auto_capture()
+                server.shutdown()
+                server.server_close()
+
+    def test_http_start_does_not_resume_unbounded_detection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = make_service(Path(directory) / "intrinsics.yaml")
+            service.attach_frame_capture(
+                lambda: np.full((200, 320, 3), 127, np.uint8)
+            )
+            self.assertEqual(service.state()["auto_capture"]["interval_seconds"], 0.0)
+
+            server = CalibrationHttpServer(
+                ("127.0.0.1", 0), object(), WEB_ROOT,
+                frame_ancestors="'self'", intrinsic_service=service,
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                request = urllib.request.Request(
+                    "http://127.0.0.1:{}/api/v1/intrinsic/auto_capture/start".format(
+                        server.server_address[1]
+                    ),
+                    data=b"{}",
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(request) as response:
+                    payload = json.loads(response.read())
+                self.assertTrue(payload["auto_capture"]["enabled"])
+                self.assertEqual(
+                    payload["auto_capture"]["interval_seconds"],
+                    DEFAULT_AUTO_CAPTURE_INTERVAL_SECONDS,
+                )
+            finally:
+                service.stop_auto_capture()
+                server.shutdown()
+                server.server_close()
 
     def test_physical_auto_capture_does_not_retain_invalid_frames(self):
         with tempfile.TemporaryDirectory() as directory:
