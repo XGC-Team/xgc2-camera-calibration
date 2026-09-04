@@ -41,9 +41,11 @@ class RosCalibrationSource:
         calibration_mode,
         camera_name,
         snapshot_client=None,
+        snapshot_available=False,
     ):
         self.lock = threading.RLock()
         self.snapshot_client = snapshot_client
+        self.snapshot_available = bool(snapshot_available)
         selected = optional_selected_intrinsic_path(
             calibration_root, calibration_mode, camera_name, intrinsic_file
         )
@@ -102,7 +104,24 @@ class RosCalibrationSource:
                 buff_size=2**20,
             )
         self.discovery_timer = rospy.Timer(rospy.Duration(1.0), self._refresh_markers)
+        self.snapshot_health_timer = None
+        if self.snapshot_client is not None:
+            self.snapshot_health_timer = rospy.Timer(
+                rospy.Duration(1.0), self._refresh_snapshot_health
+            )
         self._refresh_markers(None)
+
+    def _refresh_snapshot_health(self, _event):
+        try:
+            self.snapshot_client.health()
+            available = True
+        except MediaSnapshotError as error:
+            available = False
+            rospy.logwarn_throttle(
+                5.0, "Calibration Media Edge source is unavailable: %s", error
+            )
+        with self.lock:
+            self.snapshot_available = available
 
     def _preview_callback(self, message):
         image_format = str(message.format).strip().lower()
@@ -181,7 +200,7 @@ class RosCalibrationSource:
 
     def status(self):
         with self.lock:
-            snapshot_ready = self.snapshot_client is not None
+            snapshot_ready = self.snapshot_available
             preview_ready = snapshot_ready or self.preview_jpeg is not None
             marker_names = sorted(self.marker_latest)
             return {
@@ -206,9 +225,13 @@ class RosCalibrationSource:
             try:
                 snapshot = self.snapshot_client.capture()
             except MediaSnapshotError as error:
+                with self.lock:
+                    self.snapshot_available = False
                 raise ApiError(
                     503, "Could not capture a Media Edge camera snapshot: {}".format(error)
                 ) from error
+            with self.lock:
+                self.snapshot_available = True
             stamp_sec = float(snapshot.timestamp_nanoseconds) / 1.0e9
             return self._frame_snapshot(
                 snapshot.bgr,
@@ -311,7 +334,18 @@ def main():
                 rospy.get_param("~media_source_id", "usb_cam"),
                 float(rospy.get_param("~snapshot_timeout", 5.0)),
             )
-            snapshot_client.health()
+            try:
+                snapshot_client.health()
+                snapshot_available = True
+            except MediaSnapshotError as error:
+                snapshot_available = False
+                rospy.logwarn(
+                    "Camera extrinsic WebUI started with its Media Edge source unavailable; "
+                    "the source will be rechecked without failing the Experiment: %s",
+                    error,
+                )
+        else:
+            snapshot_available = False
         calibration_root = str(rospy.get_param("~calibration_root")).strip()
         calibration_mode = str(rospy.get_param("~calibration_mode")).strip()
         camera_name = str(rospy.get_param("~camera_name")).strip()
@@ -321,6 +355,7 @@ def main():
             calibration_mode,
             camera_name,
             snapshot_client=snapshot_client,
+            snapshot_available=snapshot_available,
         )
         package_root = Path(rospkg.RosPack().get_path("xgc_camera_calibration"))
         web_root = Path(rospy.get_param("~web_root", str(package_root / "web" / "extrinsic")))
