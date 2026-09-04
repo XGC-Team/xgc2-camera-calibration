@@ -21,7 +21,10 @@ from xgc_camera_calibration.web_service import (
     image_message_to_bgr,
 )
 from xgc_camera_calibration.intrinsic_solver import load_intrinsic
-from xgc_camera_calibration.intrinsic_validation import intrinsic_parameters
+from xgc_camera_calibration.intrinsic_validation import (
+    ideal_intrinsic_parameters,
+    intrinsic_parameters,
+)
 from xgc_camera_calibration.media_snapshot import MediaSnapshotClient, MediaSnapshotError
 from xgc_camera_calibration.solver import optional_selected_intrinsic_path
 
@@ -49,6 +52,11 @@ class RosCalibrationSource:
         selected = optional_selected_intrinsic_path(
             calibration_root, calibration_mode, camera_name, intrinsic_file
         )
+        self.use_ideal_intrinsics = selected is None
+        self.ideal_horizontal_fov_degrees = float(
+            rospy.get_param("~ideal_horizontal_fov_degrees", 110.0)
+        )
+        ideal_intrinsic_parameters(1, 1, self.ideal_horizontal_fov_degrees)
         if selected is None:
             self.intrinsic_file = ""
             self.intrinsic_matrix = None
@@ -211,10 +219,13 @@ class RosCalibrationSource:
                 ),
                 "preview_image_topic": self.preview_image_topic,
                 "intrinsic_file": str(self.intrinsic_file),
+                "intrinsic_source": (
+                    "ideal-pinhole" if self.use_ideal_intrinsics else "selected-file"
+                ),
                 "pose_prefix": self.pose_prefix,
                 "image_ready": preview_ready,
                 "preview_ready": preview_ready,
-                "intrinsic_ready": self.intrinsic_matrix is not None,
+                "intrinsic_ready": True,
                 "marker_count": len(marker_names),
                 "marker_names": marker_names,
                 "latest_image_stamp_sec": self.preview_stamp_sec,
@@ -271,18 +282,27 @@ class RosCalibrationSource:
         frame_id,
         parent_frame,
     ):
-        if self.intrinsic_matrix is None or self.intrinsic_size is None:
-            raise ApiError(
-                409,
-                "Select a timestamped intrinsic calibration YAML before freezing",
-            )
         image_size = (int(image.shape[1]), int(image.shape[0]))
-        if image_size != self.intrinsic_size:
+        if self.use_ideal_intrinsics:
+            (
+                intrinsic_matrix,
+                intrinsic_distortion,
+                intrinsic_size,
+            ) = ideal_intrinsic_parameters(
+                image_size[0],
+                image_size[1],
+                self.ideal_horizontal_fov_degrees,
+            )
+        else:
+            intrinsic_matrix = self.intrinsic_matrix.copy()
+            intrinsic_distortion = self.intrinsic_distortion.copy()
+            intrinsic_size = self.intrinsic_size
+        if not self.use_ideal_intrinsics and image_size != intrinsic_size:
             raise ApiError(
                 409,
-                "Selected intrinsic calibration is {}x{}, but the captured image is {}x{}".format(
-                    self.intrinsic_size[0],
-                    self.intrinsic_size[1],
+                "Camera intrinsics are {}x{}, but the captured image is {}x{}".format(
+                    intrinsic_size[0],
+                    intrinsic_size[1],
                     image_size[0],
                     image_size[1],
                 ),
@@ -311,8 +331,8 @@ class RosCalibrationSource:
             image=image,
             stamp_sec=stamp_sec,
             frame_id=frame_id,
-            camera_matrix=self.intrinsic_matrix.copy(),
-            distortion=self.intrinsic_distortion.copy(),
+            camera_matrix=intrinsic_matrix,
+            distortion=intrinsic_distortion,
             markers=markers,
         )
 
@@ -418,9 +438,10 @@ def main():
             source.intrinsic_file,
         )
     else:
-        rospy.logwarn(
-            "Camera extrinsic WebUI started without an intrinsic YAML; "
-            "Freeze/Solve stay closed until a timestamped file is selected"
+        rospy.loginfo(
+            "Camera extrinsic calibration uses a %.3f-degree ideal pinhole at "
+            "the captured image geometry until a timestamped intrinsic YAML is selected",
+            source.ideal_horizontal_fov_degrees,
         )
     rospy.loginfo(
         "Camera extrinsic results will be saved under %s (%s/%s)",

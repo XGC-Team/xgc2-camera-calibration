@@ -355,6 +355,37 @@ def intrinsic_parameters(
     return matrix, distortion, (width, height)
 
 
+def ideal_intrinsic_parameters(
+    width: int,
+    height: int,
+    horizontal_fov_degrees: float = 110.0,
+) -> Tuple[np.ndarray, np.ndarray, Tuple[int, int]]:
+    """Return the canonical zero-distortion pinhole for an uncalibrated frame."""
+    width = int(width)
+    height = int(height)
+    horizontal_fov_degrees = float(horizontal_fov_degrees)
+    if width <= 0 or height <= 0:
+        raise ValueError("ideal pinhole requires positive capture geometry")
+    if (
+        not np.isfinite(horizontal_fov_degrees)
+        or horizontal_fov_degrees <= 0.0
+        or horizontal_fov_degrees >= 180.0
+    ):
+        raise ValueError("ideal pinhole horizontal FOV must be between 0 and 180 degrees")
+    focal = float(width) / (
+        2.0 * np.tan(np.deg2rad(horizontal_fov_degrees) / 2.0)
+    )
+    matrix = np.asarray(
+        [
+            [focal, 0.0, (float(width) - 1.0) / 2.0],
+            [0.0, focal, (float(height) - 1.0) / 2.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    return matrix, np.zeros(5, dtype=np.float64), (width, height)
+
+
 def scale_intrinsics(
     matrix: np.ndarray,
     calibration_size: Tuple[int, int],

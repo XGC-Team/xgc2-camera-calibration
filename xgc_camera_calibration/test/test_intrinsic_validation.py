@@ -6,6 +6,7 @@ import numpy as np
 
 from xgc_camera_calibration.intrinsic_validation import (
     generate_intrinsic_comparison,
+    ideal_intrinsic_parameters,
 )
 from xgc_camera_calibration.solver import CalibrationError
 
@@ -33,6 +34,23 @@ def intrinsic_document(
 
 
 class IntrinsicValidationTest(unittest.TestCase):
+    def test_empty_selection_uses_the_canonical_ideal_pinhole(self):
+        matrix, distortion, size = ideal_intrinsic_parameters(3840, 2160)
+
+        expected_focal = 3840.0 / (2.0 * np.tan(np.deg2rad(110.0) / 2.0))
+        self.assertEqual(size, (3840, 2160))
+        self.assertAlmostEqual(matrix[0, 0], expected_focal)
+        self.assertAlmostEqual(matrix[1, 1], expected_focal)
+        self.assertEqual(matrix[0, 2], 1919.5)
+        self.assertEqual(matrix[1, 2], 1079.5)
+        np.testing.assert_array_equal(distortion, np.zeros(5))
+
+    def test_ideal_pinhole_rejects_invalid_geometry_and_fov(self):
+        with self.assertRaisesRegex(ValueError, "positive capture geometry"):
+            ideal_intrinsic_parameters(0, 2160)
+        with self.assertRaisesRegex(ValueError, "between 0 and 180"):
+            ideal_intrinsic_parameters(3840, 2160, 180.0)
+
     def test_calibrated_comparison_uses_high_quality_lanczos_remap(self):
         raw = np.full((180, 320, 3), 91, dtype=np.uint8)
         document = intrinsic_document(320, 180, -0.08, "2026-08-30T12:00:00Z")
