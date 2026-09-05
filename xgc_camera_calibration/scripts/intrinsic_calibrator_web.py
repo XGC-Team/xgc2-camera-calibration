@@ -8,8 +8,10 @@ updates the annotated result and coverage independently from WebRTC FPS.
 Frames themselves are never persisted.
 """
 
+import math
 import sys
 import threading
+import time
 from pathlib import Path
 
 import rospkg
@@ -44,20 +46,28 @@ def maybe_camera_control(board_center):
         return None
     model_name = str(rospy.get_param("~camera_model_name", "gazebo_static_camera"))
     timeout = float(rospy.get_param("~camera_control_timeout", 8.0))
+    if not math.isfinite(timeout) or timeout <= 0.0:
+        raise ValueError("~camera_control_timeout must be finite and positive")
+    # Startup must also finish when /use_sim_time is true and /clock is paused.
+    # Share the budget with subscriber discovery instead of starting it twice.
+    deadline = time.monotonic() + timeout
     try:
         from xgc_camera_calibration.camera_control import GazeboCameraControl
 
-        control = GazeboCameraControl(model_name, board_center)
+        control = GazeboCameraControl(
+            model_name, board_center, connection_timeout=timeout
+        )
     except Exception as error:
         rospy.logwarn("Sim camera control unavailable (%s); running camera-agnostic", error)
         return None
-    deadline = rospy.Time.now() + rospy.Duration(timeout)
-    poll = rospy.Rate(10)
-    while not rospy.is_shutdown() and rospy.Time.now() < deadline:
+    while not rospy.is_shutdown():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            break
         if control.available():
             rospy.loginfo("Sim camera control attached for model '%s'", model_name)
             return control
-        poll.sleep()
+        time.sleep(min(0.1, remaining))
     rospy.logwarn(
         "Gazebo model '%s' not seen in %.1fs; running camera-agnostic", model_name, timeout
     )
