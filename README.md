@@ -257,3 +257,17 @@ exact shared selection. A running TF publisher with `watch_file=true` consumes t
 selection, allowing repeated calibration after moving the camera without restarting
 the Experiment. This file/service contract does not by itself certify downstream
 browser rendering or capture/pose time synchronization.
+
+
+### Resolve a workflow intrinsic input
+
+`resolve_intrinsic.sh --root /path/to/calibration --mode phy --camera usb_cam
+--file '' --policy latest --width 3840 --height 2160` selects the newest valid
+same-mode, same-camera timestamped YAML at the requested source resolution.
+The command emits the exact path on stdout and a JSON receipt on stderr. An
+empty path means no valid saved calibration was selected. An explicit `--file`
+is validated and fails on invalid input instead of falling back. `--policy default`
+disables history discovery. Resolution does not modify calibration storage.
+
+New intrinsic saves include `calibration_mode`; legacy files without that field
+retain directory-based mode identity, reported as `legacy-directory`.

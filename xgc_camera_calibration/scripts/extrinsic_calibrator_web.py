@@ -68,6 +68,8 @@ class RosCalibrationSource:
         else:
             self.intrinsic_file = selected
             intrinsic_document = load_intrinsic(self.intrinsic_file)
+            if intrinsic_document.get("calibration_mode", calibration_mode) != calibration_mode:
+                raise ValueError("selected intrinsic mode does not match ~calibration_mode")
             self.intrinsic_provenance = {"intrinsic_source": "selected-file",
                 "intrinsic_file": str(self.intrinsic_file),
                                          "intrinsic_sha256": intrinsic_document["source_sha256"],

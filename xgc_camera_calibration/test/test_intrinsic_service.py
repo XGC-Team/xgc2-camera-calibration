@@ -720,6 +720,23 @@ class IntrinsicServiceTest(unittest.TestCase):
             self.assertTrue(service.target_done[1])
             self.assertEqual(len(service.samples), 1)
 
+    def test_wrong_mode_file_cannot_be_restored_or_compared(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "intrinsics-20260907T010000.000000Z.yaml"
+            result = intrinsic_solver.IntrinsicResult(
+                camera_matrix=np.array([[638.,0.,600.],[0.,637.,390.],[0.,0.,1.]]),
+                distortion=np.zeros(5), image_size=(1280,720),
+                rms_reprojection_error_px=0.9,sample_count=40)
+            intrinsic_solver.save_intrinsic(output,result,camera_name="usb_cam",calibration_mode="phy",
+                board_size=(7,5),square=0.20)
+            service=make_service(Path(directory)/"intrinsics.yaml")
+            self.assertEqual(service.calibration_mode,"sim")
+            self.assertEqual(service.calibration_history()["items"],[])
+            self.assertFalse(service._load_saved_result())
+            with self.assertRaises(ApiError) as failure:
+                service._calibration_document(output.name)
+            self.assertEqual(failure.exception.status,HTTPStatus.UNPROCESSABLE_ENTITY)
+
     def test_simulation_target_requires_fresh_pose_metadata_and_keeps_mirror_samples(self):
         with tempfile.TemporaryDirectory() as directory:
             service = make_service(Path(directory) / "intrinsics.yaml")
@@ -1973,6 +1990,7 @@ class IntrinsicServiceTest(unittest.TestCase):
                 Path(saved["output_file"]).name,
             )
             saved_document = intrinsic_solver.load_intrinsic(saved["output_file"])
+            self.assertEqual(saved_document["calibration_mode"], service.calibration_mode)
             self.assertEqual(
                 saved_document["metadata"]["quality_contract"],
                 "xgc2.camera.intrinsic-quality.v2",

@@ -12,6 +12,9 @@ catkin_install_python(PROGRAMS
   scripts/gazebo_camera_from_extrinsic.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
+install(PROGRAMS scripts/resolve_intrinsic.sh
+  DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
 install(DIRECTORY launch
   DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}
 )
@@ -23,6 +26,7 @@ if(CATKIN_ENABLE_TESTING)
   catkin_add_nosetests(test/test_solver.py)
   catkin_add_nosetests(test/test_planar_ransac.py)
   catkin_add_nosetests(test/test_intrinsic_solver.py)
+  catkin_add_nosetests(test/test_intrinsic_selection.py)
   catkin_add_nosetests(test/test_intrinsic_aprilgrid_truth.py)
   catkin_add_nosetests(test/test_camera_control.py)
   catkin_add_nosetests(test/test_camera_initial_pose.py)

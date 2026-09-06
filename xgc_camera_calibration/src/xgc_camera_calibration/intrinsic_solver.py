@@ -1859,6 +1859,7 @@ def save_intrinsic(
     result: IntrinsicResult,
     *,
     camera_name: str,
+    calibration_mode: Optional[str] = None,
     board_size: Sequence[int],
     square: float,
     metadata: Optional[Dict[str, Any]] = None,
@@ -1871,6 +1872,10 @@ def save_intrinsic(
         result, camera_name=camera_name, board_size=board_size, square=square,
         metadata=metadata, board=board
     )
+    if calibration_mode is not None:
+        if calibration_mode not in ("sim", "phy"):
+            raise ValueError("calibration mode must be sim or phy")
+        document["calibration_mode"] = calibration_mode
     descriptor, temporary_name = tempfile.mkstemp(
         prefix="." + destination.name + ".", suffix=".tmp", dir=str(destination.parent)
     )

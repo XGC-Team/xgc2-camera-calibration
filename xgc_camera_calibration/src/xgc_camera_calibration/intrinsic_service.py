@@ -562,6 +562,9 @@ class IntrinsicCalibrationService:
         }
 
     def _saved_board_matches(self, document: Dict[str, Any]) -> bool:
+        if (document.get("camera_name") != self.camera_name
+                or document.get("calibration_mode", self.calibration_mode) != self.calibration_mode):
+            return False
         metadata = document.get("metadata")
         if (
             not isinstance(metadata, dict)
@@ -888,7 +891,8 @@ class IntrinsicCalibrationService:
                 intrinsic_validation.intrinsic_parameters(document)
             except (OSError, ValueError, CalibrationError):
                 continue
-            if document.get("camera_name") != self.camera_name:
+            if (document.get("camera_name") != self.camera_name
+                    or document.get("calibration_mode", self.calibration_mode) != self.calibration_mode):
                 continue
             validated = self._saved_board_matches(document)
             metadata = document.get("metadata", {})
@@ -950,6 +954,8 @@ class IntrinsicCalibrationService:
                 HTTPStatus.UNPROCESSABLE_ENTITY,
                 "Selected intrinsic calibration belongs to another camera",
             )
+        if document.get("calibration_mode", self.calibration_mode) != self.calibration_mode:
+            raise ApiError(HTTPStatus.UNPROCESSABLE_ENTITY, "Selected intrinsic calibration belongs to another mode")
         document = dict(document)
         document["xgc_file_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
         return path, document
@@ -2932,6 +2938,7 @@ class IntrinsicCalibrationService:
                 intrinsic_solver.save_intrinsic(
                     output_file,
                     result,
+                    calibration_mode=self.calibration_mode,
                     camera_name=self.camera_name,
                     board_size=self.board_size,
                     square=self.square,
