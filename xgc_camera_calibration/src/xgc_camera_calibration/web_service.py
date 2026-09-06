@@ -8,7 +8,7 @@ import math
 import mimetypes
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -55,6 +55,7 @@ class FrameSnapshot:
     camera_matrix: np.ndarray
     distortion: np.ndarray
     markers: Mapping[str, MarkerObservation]
+    camera_model: Mapping[str, Any] = field(default_factory=dict)
 
     @property
     def width(self) -> int:
@@ -256,6 +257,7 @@ class CalibrationService:
             "warnings": [str(value) for value in warnings],
             "projections": [],
             "points": list(points),
+            "camera_model": metadata.get("camera_model"),
             "output_file": str(output_file),
             "save_blocked": None,
             "selection_file": str(
@@ -304,6 +306,7 @@ class CalibrationService:
                     "frame_id": frozen.frame_id,
                     "width": frozen.width,
                     "height": frozen.height,
+                    "camera_model": frozen.camera_model,
                 }
                 payload["markers"] = [
                     {
@@ -334,6 +337,18 @@ class CalibrationService:
                 HTTPStatus.CONFLICT,
                 "No pose marker is available",
             )
+        # Copy mutable source buffers and capture model identity once. Save and
+        # subsequent status changes cannot replace evidence of the frozen solve.
+        model = json.loads(json.dumps(dict(snapshot.camera_model), allow_nan=False))
+        model.update({"camera_matrix": intrinsic.reshape(-1).tolist(),
+                      "distortion": np.asarray(snapshot.distortion).reshape(-1).tolist(),
+                      "image_width": snapshot.width, "image_height": snapshot.height,
+                      "stamp_sec": snapshot.stamp_sec, "frame_id": snapshot.frame_id})
+        model.setdefault("intrinsic_source", "unspecified")
+        model.setdefault("distortion_model", "plumb_bob")
+        snapshot = replace(snapshot, image=snapshot.image.copy(), camera_matrix=intrinsic.copy(),
+                           distortion=np.asarray(snapshot.distortion).copy(),
+                           markers=dict(snapshot.markers), camera_model=model)
         encoded = self._encode_jpeg(snapshot.image)
         with self.lock:
             self.generation += 1
@@ -461,8 +476,10 @@ class CalibrationService:
                 np.asarray(snapshot.distortion, dtype=np.float64),
             )
             payload["points"] = persisted_points
+            payload["camera_model"] = dict(snapshot.camera_model)
             candidate_document = {
                 "generation": self.generation,
+                "camera_model": snapshot.camera_model,
                 "points": persisted_points,
                 "translation": payload["translation"],
                 "quaternion_xyzw": payload["quaternion_xyzw"],
@@ -551,7 +568,8 @@ class CalibrationService:
                         metadata={
                             "candidate_id": identity,
                             "image_topic": self.source.image_topic,
-                            "intrinsic_file": str(self.source.intrinsic_file),
+                            "intrinsic_file": snapshot.camera_model.get("intrinsic_file", ""),
+                            "camera_model": snapshot.camera_model,
                             "pose_prefix": self.source.pose_prefix,
                             "image_width": snapshot.width,
                             "image_height": snapshot.height,

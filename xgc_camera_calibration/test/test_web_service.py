@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 
+import hashlib
+from dataclasses import replace
 import json
 import shutil
 import tempfile
@@ -164,6 +166,65 @@ class WebCalibrationServiceTest(unittest.TestCase):
                 for name, pixel in zip(sorted(self.snapshot.markers), self.pixels)
             ],
         }
+
+    def test_actual_source_frame_model_matches_ideal_and_selected_inputs(self):
+        import ast
+        import threading
+        from types import SimpleNamespace
+        from xgc_camera_calibration.intrinsic_validation import ideal_intrinsic_parameters
+        # Compile the actual ROS adapter method with its numerical dependencies;
+        # ROS subscription/transport setup is outside this offline regression.
+        source_path = Path(__file__).resolve().parents[1] / "scripts" / "extrinsic_calibrator_web.py"
+        tree = ast.parse(source_path.read_text())
+        cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "RosCalibrationSource")
+        method = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "_frame_snapshot")
+        namespace = {"FrameSnapshot": FrameSnapshot, "MarkerObservation": MarkerObservation,
+                     "ApiError": ApiError, "ideal_intrinsic_parameters": ideal_intrinsic_parameters}
+        exec(compile(ast.Module(body=[method], type_ignores=[]), str(source_path), "exec"), namespace)
+        for ideal in (True, False):
+            expected_k, expected_d, size = ideal_intrinsic_parameters(640, 480, 110.)
+            model = {"intrinsic_source": "ideal-pinhole" if ideal else "selected-file"}
+            source = SimpleNamespace(use_ideal_intrinsics=ideal, ideal_horizontal_fov_degrees=110.,
+                intrinsic_matrix=expected_k, intrinsic_distortion=expected_d, intrinsic_size=size,
+                intrinsic_provenance=model, lock=threading.RLock(), marker_latest=self.snapshot.markers)
+            result = namespace["_frame_snapshot"](source, self.snapshot.image, 12.34, "optical", "map")
+            np.testing.assert_array_equal(result.camera_matrix, expected_k)
+            np.testing.assert_array_equal(result.distortion, expected_d)
+            self.assertEqual(result.camera_model, model)
+            self.assertIsNot(result.camera_model, model)
+
+    def test_frozen_model_survives_source_changes_save_and_restart(self):
+        for kind in ("ideal-pinhole", "selected-file"):
+            with self.subTest(kind=kind):
+                model = {"intrinsic_source": kind, "distortion_model": "plumb_bob"}
+                if kind == "ideal-pinhole":
+                    model.update(ideal_horizontal_fov_degrees=110., assumption="Assumed ideal pinhole", intrinsic_file="")
+                else:
+                    from xgc_camera_calibration.intrinsic_solver import load_intrinsic
+                    asset = Path(self.temporary.name) / "intrinsics.yaml"
+                    original = json.dumps({"schema": "xgc2.camera.intrinsic.v1", "camera_matrix": {"data": self.intrinsic.reshape(-1).tolist()}}).encode()
+                    asset.write_bytes(original)
+                    loaded = load_intrinsic(asset)
+                    self.assertEqual(loaded["source_sha256"], hashlib.sha256(original).hexdigest())
+                    model.update(intrinsic_file=str(asset), intrinsic_sha256=loaded["source_sha256"])
+                self.service.source.snapshot = replace(self.snapshot, camera_matrix=self.intrinsic.copy(), camera_model=model)
+                frozen = self.service.freeze()["frame"]["camera_model"]
+                expected = json.loads(json.dumps(frozen))
+                self.service.source.snapshot.camera_matrix[0, 0] *= 2
+                model["intrinsic_source"] = "changed-after-freeze"
+                candidate = self.service.solve(self.point_request())
+                if kind == "selected-file":
+                    asset.write_text("replaced after load and solve")
+                self.service.source.intrinsic_file = "/different.yaml"
+                saved = self.service.save(candidate["candidate_id"])
+                document = load_extrinsic(saved["output_file"])
+                self.assertEqual(document["metadata"]["camera_model"], expected)
+                self.assertEqual(saved["camera_model"], expected)
+                self.assertEqual(expected["camera_matrix"], self.intrinsic.reshape(-1).tolist())
+                self.assertEqual(expected["stamp_sec"], self.snapshot.stamp_sec)
+                restored = CalibrationService(self.service.source, calibration_root=str(self.calibration_root),
+                    calibration_mode="sim", camera_name="usb_cam", parent_frame="map", child_frame="camera_optical_frame")
+                self.assertEqual(restored.state()["result"]["camera_model"], expected)
 
     def test_freeze_solve_and_save_round_trip(self):
         state = self.service.freeze()

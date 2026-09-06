@@ -215,7 +215,10 @@ function renderState(serverState) {
   ui.inputChip.textContent = ready ? `${source.marker_count} pose markers` : "Waiting for ROS inputs";
   ui.inputChip.classList.toggle("muted", !ready);
   ui.imageTopic.textContent = source.image_topic;
-  ui.intrinsicFile.textContent = source.intrinsic_file;
+  const model = serverState.frame?.camera_model || source;
+  ui.intrinsicFile.textContent = model.intrinsic_source === "ideal-pinhole"
+    ? `Ideal pinhole · HFOV ${model.ideal_horizontal_fov_degrees}° · assumed, not measured`
+    : model.intrinsic_file || source.intrinsic_file || "Model source unspecified";
   ui.posePrefix.textContent = source.pose_prefix;
   ui.outputFile.textContent = serverState.output_file;
   if (serverState.frame) {

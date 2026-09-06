@@ -18,7 +18,7 @@ candidate = {'candidate_id':'candidate-1','saved':False,'points':points,'project
              'mean_reprojection_error_px':.1,'max_reprojection_error_px':.1}
 state = {'mode':'frozen','generation':1,'result':candidate,'parent_frame':'world','child_frame':'camera',
          'markers':[{'name':str(i)} for i in range(6)],'output_file':'',
-         'source':{'image_ready':True,'intrinsic_ready':True,'marker_count':6,'image_topic':'image','intrinsic_file':'k.yaml','pose_prefix':'pose'},
+         'source':{'image_ready':True,'intrinsic_ready':True,'marker_count':6,'image_topic':'image','intrinsic_file':'','intrinsic_source':'ideal-pinhole','ideal_horizontal_fov_degrees':110,'pose_prefix':'pose'},
          'frame':{'width':640,'height':480,'stamp_sec':1}}
 with sync_playwright() as p:
     browser = p.chromium.launch(headless=True)
@@ -45,6 +45,8 @@ with sync_playwright() as p:
             # Production source uses no TS-only syntax; load exactly as a module.
             page.add_script_tag(type='module',content=source)
             page.wait_for_function("!document.getElementById('solve-button').disabled")
+            assert "HFOV 110°" in page.locator("#intrinsic-file").inner_text()
+            assert "assumed, not measured" in page.locator("#intrinsic-file").inner_text()
             page.click('#solve-button')
             page.wait_for_function("!document.getElementById('save-button').disabled")
             page.route('http://fixture.test/api/v1/image.jpg*', lambda r: r.fulfill(content_type='image/svg+xml',body='<svg xmlns="http://www.w3.org/2000/svg" width="640" height="480"/>'))

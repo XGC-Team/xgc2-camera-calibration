@@ -62,9 +62,17 @@ class RosCalibrationSource:
             self.intrinsic_matrix = None
             self.intrinsic_distortion = None
             self.intrinsic_size = None
+            self.intrinsic_provenance = {"intrinsic_source": "ideal-pinhole", "distortion_model": "plumb_bob",
+                                         "ideal_horizontal_fov_degrees": self.ideal_horizontal_fov_degrees,
+                                         "assumption": "Assumed ideal pinhole; not measured camera intrinsics.", "intrinsic_file": ""}
         else:
             self.intrinsic_file = selected
             intrinsic_document = load_intrinsic(self.intrinsic_file)
+            self.intrinsic_provenance = {"intrinsic_source": "selected-file",
+                                         **self.intrinsic_provenance,
+                "intrinsic_file": str(self.intrinsic_file),
+                                         "intrinsic_sha256": intrinsic_document["source_sha256"],
+                                         "distortion_model": intrinsic_document.get("distortion_model", "plumb_bob")}
             if str(intrinsic_document.get("camera_name", "")).strip() != camera_name:
                 raise ValueError(
                     "selected intrinsic camera_name does not match ~camera_name"
@@ -334,6 +342,7 @@ class RosCalibrationSource:
             camera_matrix=intrinsic_matrix,
             distortion=intrinsic_distortion,
             markers=markers,
+            camera_model=dict(self.intrinsic_provenance),
         )
 
 

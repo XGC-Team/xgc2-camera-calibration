@@ -10,6 +10,7 @@ resolution.
 
 from __future__ import annotations
 
+import hashlib
 import math
 import os
 import tempfile
@@ -1847,8 +1848,8 @@ def save_intrinsic(
 
 def load_intrinsic(path: os.PathLike) -> Dict[str, Any]:
     source = Path(path).expanduser()
-    with source.open("r", encoding="utf-8") as stream:
-        document = yaml.safe_load(stream) or {}
+    raw = source.read_bytes()
+    document = yaml.safe_load(raw.decode("utf-8")) or {}
     if not isinstance(document, dict):
         raise CalibrationError("intrinsic document must be a mapping")
     if document.get("schema") != "xgc2.camera.intrinsic.v1":
@@ -1858,4 +1859,5 @@ def load_intrinsic(path: os.PathLike) -> Dict[str, Any]:
     if not isinstance(data, list) or len(data) != 9:
         raise CalibrationError("camera_matrix.data must contain nine values")
     document["camera_matrix_array"] = np.asarray(data, dtype=np.float64).reshape(3, 3)
+    document["source_sha256"] = hashlib.sha256(raw).hexdigest()
     return document
