@@ -1,8 +1,12 @@
 """Planar solver regressions with projected inputs, not camera/ROS acceptance."""
 
 import itertools
+import json
 import random
 import tempfile
+import threading
+import urllib.error
+import urllib.request
 import unittest
 from pathlib import Path
 
@@ -11,7 +15,7 @@ import numpy as np
 
 from xgc_camera_calibration import solver
 from xgc_camera_calibration.web_service import (
-    ApiError, CalibrationService, FrameSnapshot, MarkerObservation,
+    CalibrationHttpServer, CalibrationService, FrameSnapshot, MarkerObservation,
 )
 
 
@@ -125,7 +129,7 @@ class PlanarRansacTest(unittest.TestCase):
         result = solver.solve_extrinsic(world, pixels, intrinsic, distortion)
         self.assert_pose(result, rotation, position, range(len(world)), tolerance=1e-5)
 
-    def test_service_candidate_then_explicit_save_uses_recovered_consensus(self):
+    def test_http_candidate_then_explicit_save_uses_recovered_consensus(self):
         world, pixels, intrinsic, distortion, _, position = scene()
         pixels[0] += [400., 0.]
         markers = {str(index): MarkerObservation(str(index), tuple(point), 'world')
@@ -151,25 +155,51 @@ class PlanarRansacTest(unittest.TestCase):
             service = CalibrationService(ProjectedFrameSource(), calibration_root=root,
                                          calibration_mode='sim', camera_name='camera',
                                          parent_frame='world', child_frame='camera_optical')
-            frozen = service.freeze()
-            candidate = service.solve({'generation': frozen['generation'], 'points': [
-                {'marker': str(index), 'pixel': pixel.tolist()} for index, pixel in enumerate(pixels)
-            ]})
-            self.assertFalse(candidate['saved'])
-            self.assertEqual(list(Path(root).rglob('*.yaml')), [])
-            self.assertEqual(set(candidate['inlier_indices']), set(range(1, 16)))
-            np.testing.assert_allclose(candidate['translation'], position, atol=1e-7, rtol=0)
-            with self.assertRaises(ApiError):
-                service.save('wrong-candidate')
-            saved = service.save(candidate['candidate_id'])
-            output = Path(saved['output_file'])
-            self.assertEqual(output.parent, Path(root) / 'sim' / 'camera')
-            self.assertRegex(output.name, r'^extrinsics-\d{8}T\d{6}\.\d{6}Z(?:-\d{2})?\.yaml$')
-            document = solver.load_extrinsic(output)
-            np.testing.assert_allclose(document['translation_array'], position, atol=1e-7, rtol=0)
-            self.assertFalse(document['points'][0]['inlier'])
-            self.assertEqual(len(document['inlier_indices']), 15)
-            self.assertEqual(service.save(candidate['candidate_id'])['output_file'], str(output))
+            web_root = Path(__file__).resolve().parents[1] / 'web' / 'extrinsic'
+            server = CalibrationHttpServer(
+                ('127.0.0.1', 0), service, web_root, frame_ancestors="'self'",
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            base = 'http://127.0.0.1:{}'.format(server.server_address[1])
+
+            def post(path, body):
+                request = urllib.request.Request(
+                    base + path, data=json.dumps(body).encode('utf-8'),
+                    headers={'Content-Type': 'application/json'}, method='POST',
+                )
+                with urllib.request.urlopen(request, timeout=3) as response:
+                    self.assertEqual(response.status, 200)
+                    return json.loads(response.read().decode('utf-8'))
+
+            try:
+                frozen = post('/api/v1/freeze', {})
+                candidate = post('/api/v1/solve', {'generation': frozen['generation'], 'points': [
+                    {'marker': str(index), 'pixel': pixel.tolist()} for index, pixel in enumerate(pixels)
+                ]})
+                self.assertFalse(candidate['saved'])
+                self.assertEqual(list(Path(root).rglob('*.yaml')), [])
+                self.assertEqual(set(candidate['inlier_indices']), set(range(1, 16)))
+                np.testing.assert_allclose(candidate['translation'], position, atol=1e-7, rtol=0)
+                with self.assertRaises(urllib.error.HTTPError) as rejected:
+                    post('/api/v1/save', {'candidate_id': 'wrong-candidate'})
+                self.assertEqual(rejected.exception.code, 409)
+                self.assertEqual(list(Path(root).rglob('*.yaml')), [])
+                saved = post('/api/v1/save', {'candidate_id': candidate['candidate_id']})
+                output = Path(saved['output_file'])
+                self.assertEqual(output.parent, Path(root) / 'sim' / 'camera')
+                self.assertRegex(output.name, r'^extrinsics-\d{8}T\d{6}\.\d{6}Z(?:-\d{2})?\.yaml$')
+                document = solver.load_extrinsic(output)
+                np.testing.assert_allclose(document['translation_array'], position, atol=1e-7, rtol=0)
+                self.assertFalse(document['points'][0]['inlier'])
+                self.assertEqual(len(document['inlier_indices']), 15)
+                repeated = post('/api/v1/save', {'candidate_id': candidate['candidate_id']})
+                self.assertEqual(repeated['output_file'], str(output))
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=3)
+                self.assertFalse(thread.is_alive())
 
 
 if __name__ == '__main__':
