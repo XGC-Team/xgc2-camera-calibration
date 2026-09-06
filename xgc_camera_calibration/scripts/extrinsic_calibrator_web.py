@@ -4,6 +4,8 @@
 import re
 import sys
 import threading
+import time
+import math
 from pathlib import Path
 
 import cv2
@@ -11,6 +13,8 @@ import rospkg
 import rospy
 from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import CompressedImage, Image
+
+from xgc_camera_calibration.pose_freshness import pose_is_fresh
 
 from xgc_camera_calibration.web_service import (
     ApiError,
@@ -115,6 +119,10 @@ class RosCalibrationSource:
         self.preview_jpeg = None
         self.preview_stamp_sec = None
         self.marker_latest = {}
+        self.marker_receipts = {}
+        self.pose_max_age = float(rospy.get_param("~pose_max_age", 2.0))
+        if not math.isfinite(self.pose_max_age) or self.pose_max_age <= 0:
+            raise ValueError("pose_max_age must be finite and positive")
         self.marker_subscribers = {}
         self.marker_topics = {}
         self.preview_subscriber = None
@@ -208,6 +216,7 @@ class RosCalibrationSource:
             )
             with self.lock:
                 self.marker_latest[name] = observation
+                self.marker_receipts[name] = (time.monotonic(), message.header.stamp.to_sec())
 
         return callback
 
@@ -225,7 +234,9 @@ class RosCalibrationSource:
         with self.lock:
             snapshot_ready = self.snapshot_available
             preview_ready = snapshot_ready or self.preview_jpeg is not None
-            marker_names = sorted(self.marker_latest)
+            wall_now, ros_now = time.monotonic(), rospy.Time.now().to_sec()
+            marker_names = sorted(name for name in self.marker_latest
+                if pose_is_fresh(self.marker_receipts.get(name), wall_now, ros_now, self.pose_max_age))
             return {
                 "image_topic": (
                     "media:{}".format(self.snapshot_client.source_id)
@@ -323,7 +334,9 @@ class RosCalibrationSource:
                 ),
             )
         with self.lock:
-            observations = dict(self.marker_latest)
+            wall_now, ros_now = time.monotonic(), rospy.Time.now().to_sec()
+            observations = {name: observation for name, observation in self.marker_latest.items()
+                if pose_is_fresh(self.marker_receipts.get(name), wall_now, ros_now, self.pose_max_age)}
         provenance = {}
         if self.pose_coordinate_source != "unspecified":
             provenance = coordinate_provenance("experiment-world", parent_frame, self.pose_world_offset)

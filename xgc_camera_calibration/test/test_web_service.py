@@ -172,6 +172,7 @@ class WebCalibrationServiceTest(unittest.TestCase):
         import ast
         import threading
         from types import SimpleNamespace
+        from xgc_camera_calibration.pose_freshness import pose_is_fresh
         from xgc_camera_calibration.intrinsic_validation import ideal_intrinsic_parameters
         # Compile the actual ROS adapter method with its numerical dependencies;
         # ROS subscription/transport setup is outside this offline regression.
@@ -181,7 +182,10 @@ class WebCalibrationServiceTest(unittest.TestCase):
         method = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "_frame_snapshot")
         namespace = {"FrameSnapshot": FrameSnapshot, "MarkerObservation": MarkerObservation,
                      "ApiError": ApiError, "ideal_intrinsic_parameters": ideal_intrinsic_parameters,
-                     "coordinate_provenance": coordinate_provenance}
+                     "coordinate_provenance": coordinate_provenance,
+                     "pose_is_fresh": pose_is_fresh,
+                     "time": SimpleNamespace(monotonic=lambda: 100.),
+                     "rospy": SimpleNamespace(Time=SimpleNamespace(now=lambda: SimpleNamespace(to_sec=lambda: 12.34)))}
         exec(compile(ast.Module(body=[method], type_ignores=[]), str(source_path), "exec"), namespace)
         for ideal in (True, False):
             expected_k, expected_d, size = ideal_intrinsic_parameters(640, 480, 110.)
@@ -189,7 +193,8 @@ class WebCalibrationServiceTest(unittest.TestCase):
             source = SimpleNamespace(use_ideal_intrinsics=ideal, ideal_horizontal_fov_degrees=110.,
                 intrinsic_matrix=expected_k, intrinsic_distortion=expected_d, intrinsic_size=size,
                 intrinsic_provenance=model, lock=threading.RLock(), marker_latest=self.snapshot.markers,
-                pose_coordinate_source="raw-vrpn", pose_world_offset=(10., -5., 2.))
+                pose_coordinate_source="raw-vrpn", pose_world_offset=(10., -5., 2.),
+                marker_receipts={name:(100.,12.34) for name in self.snapshot.markers}, pose_max_age=2.)
             result = namespace["_frame_snapshot"](source, self.snapshot.image, 12.34, "optical", "map")
             np.testing.assert_array_equal(result.camera_matrix, expected_k)
             np.testing.assert_array_equal(result.distortion, expected_d)
