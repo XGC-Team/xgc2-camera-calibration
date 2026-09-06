@@ -1,5 +1,19 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
+
+report_failure() {
+  local code=$?
+  echo "Installed-package check failed near line ${BASH_LINENO[0]} (exit ${code})" >&2
+  if [[ -n "${RUNTIME:-}" && -d "${RUNTIME}" ]]; then
+    for log in "${RUNTIME}"/*.log; do
+      [[ -f "${log}" ]] || continue
+      echo "Diagnostic: ${log##*/}" >&2
+      tail -n 80 "${log}" >&2
+    done
+  fi
+  return "${code}"
+}
+trap report_failure ERR
 
 ROS_DISTRO="${ROS_DISTRO:-noetic}"
 PREFIX="/opt/ros/${ROS_DISTRO}"

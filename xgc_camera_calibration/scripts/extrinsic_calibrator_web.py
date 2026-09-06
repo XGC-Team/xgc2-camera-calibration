@@ -69,7 +69,6 @@ class RosCalibrationSource:
             self.intrinsic_file = selected
             intrinsic_document = load_intrinsic(self.intrinsic_file)
             self.intrinsic_provenance = {"intrinsic_source": "selected-file",
-                                         **self.intrinsic_provenance,
                 "intrinsic_file": str(self.intrinsic_file),
                                          "intrinsic_sha256": intrinsic_document["source_sha256"],
                                          "distortion_model": intrinsic_document.get("distortion_model", "plumb_bob")}
