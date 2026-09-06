@@ -10,6 +10,7 @@ resolution.
 
 from __future__ import annotations
 
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import hashlib
 import math
 import os
@@ -1512,7 +1513,7 @@ def _select_calibration_views(
     List[IntrinsicRejectedView],
     Tuple[float, ...],
 ]:
-    """Iteratively remove only the worst robust per-view RMS outlier."""
+    """Refit after each batch of robust per-view RMS outliers; retain originals."""
     if progress:
         progress("filtering", 0, len(image_points))
     initial = _run_extended_calibration(object_points, image_points, image_size)
@@ -1531,21 +1532,22 @@ def _select_calibration_views(
         numerical_sigma = np.finfo(np.float64).eps * max(1.0, abs(median))
         sigma = max(math.hypot(robust_sigma, detector_sigma), numerical_sigma)
         envelope = median + 3.0 * sigma
-        worst_local_index = int(np.argmax(errors))
-        worst_error = float(errors[worst_local_index])
-        if worst_error <= envelope:
+        outliers = np.flatnonzero(errors > envelope).tolist()
+        if not outliers:
             break
-        original_index = selected_indices[worst_local_index]
-        rejected.append(
-            IntrinsicRejectedView(
+        # Keep at least three views even if most of this batch is inconsistent.
+        outliers = sorted(outliers, key=lambda i: (-errors[i], i))[:len(selected_indices)-3]
+        for local_index in outliers:
+            original_index = selected_indices[local_index]
+            rejected.append(IntrinsicRejectedView(
                 original_view_index=original_index,
                 reason="per_view_rms_above_robust_3sigma_envelope",
                 initial_rms_reprojection_error_px=initial_errors[original_index],
-                rejection_rms_reprojection_error_px=worst_error,
+                rejection_rms_reprojection_error_px=float(errors[local_index]),
                 rejection_envelope_px=envelope,
-            )
-        )
-        del selected_indices[worst_local_index]
+            ))
+        rejected_indices = set(outliers)
+        selected_indices = [value for i,value in enumerate(selected_indices) if i not in rejected_indices]
         if progress:
             progress("filtering", len(rejected), len(image_points))
         calibration = _run_extended_calibration(
@@ -1554,6 +1556,12 @@ def _select_calibration_views(
             image_size,
         )
     return calibration, selected_indices, rejected, initial_errors
+
+
+def _intrinsic_validation_workers(view_count: int) -> int:
+    """Leave CPU capacity for acquisition, media and the ground station."""
+    available = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
+    return max(1, min(8, view_count, available // 2))
 
 
 def _leave_one_out_stability(
@@ -1572,9 +1580,7 @@ def _leave_one_out_stability(
         original_view_indices = tuple(range(len(image_points)))
     if len(original_view_indices) != len(image_points):
         raise CalibrationError("LOO original view indices do not match selected views")
-    for omitted in range(len(image_points)):
-        if progress:
-            progress("validating", omitted, len(image_points))
+    def estimate_fold(omitted):
         fold_objects = [
             value for index, value in enumerate(object_points) if index != omitted
         ]
@@ -1600,10 +1606,8 @@ def _leave_one_out_stability(
                 reference, fold, image_size
             )
         except CalibrationError:
-            failed.append(int(original_view_indices[omitted]))
-            continue
-        folds.append(
-            IntrinsicFoldEstimate(
+            return None
+        return IntrinsicFoldEstimate(
                 omitted_view_index=int(original_view_indices[omitted]),
                 rms_reprojection_error_px=fold.rms_reprojection_error_px,
                 parameters=tuple(float(value) for value in parameters),
@@ -1620,7 +1624,36 @@ def _leave_one_out_stability(
                 undistorted_ray_rms_equivalent_px=ray_rms,
                 undistorted_ray_max_equivalent_px=ray_max,
             )
-        )
+    # Folds have no shared mutable numerical state. Bound both workers and
+    # pending work so progress/deadline failures stop admitting further folds.
+    workers = _intrinsic_validation_workers(len(image_points))
+    completed_folds = {}
+    executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="intrinsic-loo")
+    pending = {}
+    remaining = iter(range(len(image_points)))
+    try:
+        for omitted in range(workers):
+            index = next(remaining)
+            pending[executor.submit(estimate_fold, index)] = index
+        while pending:
+            done, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for future in done:
+                omitted = pending.pop(future)
+                completed_folds[omitted] = future.result()
+                if progress:
+                    progress("validating", len(completed_folds), len(image_points))
+                index = next(remaining, None)
+                if index is not None:
+                    pending[executor.submit(estimate_fold, index)] = index
+    finally:
+        for future in pending:
+            future.cancel()
+        executor.shutdown(wait=True)
+    for omitted, fold in sorted(completed_folds.items()):
+        if fold is None:
+            failed.append(int(original_view_indices[omitted]))
+        else:
+            folds.append(fold)
     if not folds:
         standard_deviation = span = maximum_delta = relative_delta = None
         held_out_rms_mean = held_out_rms_max = None

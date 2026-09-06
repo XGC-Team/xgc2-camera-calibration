@@ -237,3 +237,23 @@ npm --prefix web-src run build
 
 Generated `app.js` and `styles.css` files remain beside each packaged HTML
 entry. CI and release jobs rebuild them and reject source/generated drift.
+
+## Interactive calibration acceptance
+
+Intrinsic Analyze starts a revision-bound background job and returns immediately.
+Save commits the completed candidate; it does not start another solve. Selection
+removes all observations outside the unchanged robust envelope in each refit.
+Independent leave-one-out fits use bounded parallel workers (at most eight), with
+canonical observation identities and result order. All retained observations still
+receive a full free-parameter QR fit; final points and intrinsics stay in the source
+image coordinate system. Parallel speed is machine-dependent, not a one-minute SLA.
+
+Extrinsic correspondences use arbitrary discovered pose markers, independent of
+Experiment participants or robot type. The selected pixel must represent the rigid
+body coordinate origin. Freeze captures a static scene; keep bodies stationary.
+Solve estimates a candidate and rejects outliers; Save alone persists a versioned
+`<calibrationRoot>/<sim|phy>/<cameraName>/extrinsics-<UTC>.yaml` and advances the
+exact shared selection. A running TF publisher with `watch_file=true` consumes that
+selection, allowing repeated calibration after moving the camera without restarting
+the Experiment. This file/service contract does not by itself certify downstream
+browser rendering or capture/pose time synchronization.

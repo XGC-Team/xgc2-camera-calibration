@@ -257,6 +257,41 @@ class WebCalibrationServiceTest(unittest.TestCase):
         self.assertEqual(document["metadata"]["image_topic"], FakeSource.image_topic)
         self.assertEqual(self.service.save(result["candidate_id"]), saved)
 
+    def test_arbitrary_bodies_recalibrate_and_publish_selection_without_restart(self):
+        from xgc_camera_calibration.extrinsic_file_watcher import ExtrinsicSelectionWatcher
+        names = ["calibration_stand", "ceiling_fixture", "desk_reference",
+                 "reference_bar", "tripod", "wall_target"]
+        snapshot = replace(self.snapshot, markers={
+            name: MarkerObservation(name=name, position=tuple(position), frame_id="map")
+            for name, position in zip(names, self.world)
+        })
+        source = FakeSource(snapshot)
+        service = CalibrationService(source, calibration_root=str(self.calibration_root),
+            calibration_mode="phy", camera_name="usb_cam", parent_frame="map",
+            child_frame="camera_optical_frame", maximum_inlier_error_px=1.0)
+        watcher = ExtrinsicSelectionWatcher(str(self.calibration_root), "phy", "usb_cam")
+        paths = []
+        revisions = []
+        for translation in (self.tvec, self.tvec + np.array([0.2, 0.05, 0.1])):
+            service.live()
+            state = service.freeze()
+            self.assertEqual([m["name"] for m in state["markers"]], names)
+            pixels, _ = cv2.projectPoints(self.world, self.rvec, translation,
+                                          self.intrinsic, self.distortion)
+            candidate = service.solve({"generation": state["generation"], "points": [
+                {"marker": name, "pixel": pixel.tolist()}
+                for name, pixel in zip(names, pixels.reshape(-1, 2))]})
+            self.assertIsNone(watcher.next_revision(), "Solve must not activate a candidate")
+            saved = service.save(candidate["candidate_id"])
+            revision = watcher.next_revision()
+            self.assertEqual(str(revision.path), saved["output_file"])
+            self.assertIsNone(watcher.next_revision())
+            paths.append(revision.path)
+            revisions.append(load_extrinsic(revision.path))
+        self.assertNotEqual(paths[0], paths[1])
+        self.assertTrue(all(path.is_file() for path in paths))
+        self.assertNotEqual(revisions[0]["translation"], revisions[1]["translation"])
+
     def test_restart_restores_only_the_exact_shared_selection(self):
         self.service.freeze()
         candidate = self.service.solve(self.point_request())

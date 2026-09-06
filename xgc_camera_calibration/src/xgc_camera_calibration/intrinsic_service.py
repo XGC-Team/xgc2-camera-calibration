@@ -1256,7 +1256,7 @@ class IntrinsicCalibrationService:
                 self._solve_job = dict(previous_job)
                 if self._solve_job.get("status") != "failed":
                     self._solve_job.update(status="failed", stage="complete",
-                        error="Calibration process restarted; original samples retained. Save to compute again.")
+                        error="Calibration process restarted; original samples retained. Analyze to compute again.")
                 self._persist_capture_manifest_locked(write_job=False)
         return bool(self.samples)
 

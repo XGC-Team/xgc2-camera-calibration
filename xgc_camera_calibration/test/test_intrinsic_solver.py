@@ -242,6 +242,44 @@ class IntrinsicSolverTest(unittest.TestCase):
         np.testing.assert_allclose(result.camera_matrix, truth_k, atol=0.01)
         np.testing.assert_allclose(result.distortion, truth_d, atol=0.001)
 
+    def test_parallel_leave_one_out_matches_serial_results_and_order(self):
+        board, square, _k, _d, images = _project_nonzero_distortion_views()
+        with mock.patch.object(solver, "_intrinsic_validation_workers", return_value=1):
+            serial = solver.calibrate_intrinsic(images, board, square, (1280, 720))
+        with mock.patch.object(solver, "_intrinsic_validation_workers", return_value=4):
+            parallel = solver.calibrate_intrinsic(images, board, square, (1280, 720))
+        np.testing.assert_array_equal(serial.camera_matrix, parallel.camera_matrix)
+        self.assertEqual(serial.diagnostics.stability, parallel.diagnostics.stability)
+
+    def test_parallel_fold_failures_keep_original_view_identity(self):
+        board, square, _k, _d, images = _project_nonzero_distortion_views()
+        objects, corners, size = solver._prepare_calibration_observations(images, board, square, (1280, 720), None)
+        reference = solver._run_extended_calibration(objects, corners, size)
+        original = solver._held_out_reprojection
+        def fail_one(obj, image, fold):
+            if image is corners[3]:
+                raise CalibrationError("isolated validation failure")
+            return original(obj, image, fold)
+        with mock.patch.object(solver, "_held_out_reprojection", side_effect=fail_one):
+            result = solver._leave_one_out_stability(objects, corners, size, reference,
+                original_view_indices=tuple(range(100, 113)))
+        self.assertEqual(result.failed_omitted_view_indices, (103,))
+        self.assertEqual(tuple(f.omitted_view_index for f in result.folds),
+            tuple(i for i in range(100, 113) if i != 103))
+
+    def test_parallel_progress_failure_propagates_without_finishing_all_folds(self):
+        board, square, _k, _d, images = _project_nonzero_distortion_views()
+        objects, corners, size = solver._prepare_calibration_observations(images, board, square, (1280, 720), None)
+        reference = solver._run_extended_calibration(objects, corners, size)
+        original = solver._run_extended_calibration
+        def expired(*_args):
+            raise TimeoutError("analysis deadline")
+        with mock.patch.object(solver, "_intrinsic_validation_workers", return_value=2), \
+             mock.patch.object(solver, "_run_extended_calibration", wraps=original) as fits:
+            with self.assertRaisesRegex(TimeoutError, "analysis deadline"):
+                solver._leave_one_out_stability(objects, corners, size, reference, progress=expired)
+            self.assertLessEqual(fits.call_count, 2)
+
     def test_consistent_high_noise_is_not_rejected_by_an_absolute_rms_gate(self):
         board, square, _truth_k, _truth_d, image_points = (
             _project_nonzero_distortion_views()
