@@ -285,11 +285,18 @@ async function liveFrame() {
   }
 }
 
+function invalidateCandidate() {
+  state.candidate = null;
+  state.projections = [];
+  for (const point of state.points) point.error = null;
+  state.restoredResultGeneration = state.server ? state.server.generation : null;
+  ui.result.textContent = "Correspondences changed; solve again before saving.";
+  showBanner(ui.success, "");
+}
+
 function clearPoints() {
   state.points = [];
-  state.projections = [];
-  state.candidate = null;
-  state.restoredResultGeneration = state.server ? state.server.generation : null;
+  invalidateCandidate();
   ui.result.textContent = "Select at least four markers.";
   renderControls();
   fitCanvas();
@@ -297,6 +304,8 @@ function clearPoints() {
 
 async function solve() {
   clearMessages();
+  invalidateCandidate();
+  fitCanvas();
   setBusy(true);
   try {
     const result = await post("api/v1/solve", {
@@ -358,7 +367,7 @@ ui.canvas.addEventListener("click", (event) => {
   const x = (event.clientX - bounds.left) * state.frameImage.naturalWidth / bounds.width;
   const y = (event.clientY - bounds.top) * state.frameImage.naturalHeight / bounds.height;
   state.points.push({ marker, pixel: [x, y], error: null });
-  state.projections = [];
+  invalidateCandidate();
   renderControls();
   fitCanvas();
 });
@@ -367,7 +376,7 @@ ui.freeze.addEventListener("click", freezeFrame);
 ui.live.addEventListener("click", liveFrame);
 ui.remove.addEventListener("click", () => {
   state.points.pop();
-  state.projections = [];
+  invalidateCandidate();
   renderControls();
   fitCanvas();
 });
