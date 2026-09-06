@@ -7,9 +7,10 @@ import hashlib
 import json
 import os
 import re
+import random
 import stat
 import tempfile
-from itertools import chain, combinations, islice
+from itertools import chain
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -353,6 +354,42 @@ def rotation_matrix_to_quaternion(rotation: np.ndarray) -> np.ndarray:
     return quaternion
 
 
+def _planar_sample_indices(
+    point_count: int, iterations: int
+) -> Iterable[Tuple[int, int, int, int]]:
+    """Sample distinct four-point sets across the whole combination space.
+
+    Sample combination ranks, not a lexicographic prefix. Floyd sampling keeps
+    memory/work bounded by the iteration budget even for large point sets; the
+    shuffle also makes an early-stopped prefix unbiased. A local RNG makes
+    repeated solves reproducible without changing application-global state.
+    """
+    total = math.comb(point_count, 4)
+    count = min(int(iterations), total)
+    random_source = random.Random(0)
+    selected = set()
+    ranks = []
+    for upper in range(total - count, total):
+        rank = random_source.randrange(upper + 1)
+        if rank in selected:
+            rank = upper
+        selected.add(rank)
+        ranks.append(rank)
+    random_source.shuffle(ranks)
+    for rank in ranks:
+        indices = []
+        start = 0
+        for remaining in (3, 2, 1, 0):
+            for index in range(start, point_count - remaining):
+                block = math.comb(point_count - index - 1, remaining)
+                if rank < block:
+                    indices.append(index)
+                    start = index + 1
+                    break
+                rank -= block
+        yield tuple(indices)
+
+
 def _planar_pose_ransac(
     world: np.ndarray,
     pixels: np.ndarray,
@@ -360,15 +397,17 @@ def _planar_pose_ransac(
     coefficients: np.ndarray,
     reprojection_error_px: float,
     iterations: int,
+    confidence: float,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Estimate a planar pose without relying on EPNP's ambiguous coplanar branch."""
 
     best = None
+    required_trials = int(iterations)
     index_sets = chain(
         (tuple(range(len(world))),),
-        islice(combinations(range(len(world)), 4), int(iterations)),
+        _planar_sample_indices(len(world), int(iterations)),
     )
-    for indices in index_sets:
+    for trial, indices in enumerate(index_sets):
         subset_world = world[list(indices)]
         singular_values = np.linalg.svd(
             subset_world - np.mean(subset_world, axis=0), compute_uv=False
@@ -434,6 +473,22 @@ def _planar_pose_ransac(
             )
             if best is None or score < best[0]:
                 best = (score, rotation_vector, translation_vector, inliers)
+                # The all-point fit is trial zero, not a random minimal trial.
+                # Use the exact all-inlier probability of a four-point draw.
+                # Sampling distinct sets only lowers the miss probability, so
+                # this with-replacement bound is conservative. As in RANSAC,
+                # this estimates an all-inlier draw, not that the subset is
+                # nondegenerate or that the assumed camera model is accurate.
+                if len(inliers) == len(world):
+                    required_trials = 0
+                else:
+                    probability = math.comb(len(inliers), 4) / math.comb(len(world), 4)
+                    required_trials = min(
+                        required_trials,
+                        int(math.ceil(math.log1p(-confidence) / math.log1p(-probability))),
+                    )
+        if best is not None and trial >= required_trials:
+            break
     if best is None:
         raise CalibrationError(
             "could not estimate a planar camera pose from the selected markers; "
@@ -491,6 +546,7 @@ def solve_extrinsic(
             coefficients,
             ransac_reprojection_error_px,
             ransac_iterations,
+            confidence,
         )
     else:
         ok, rvec, tvec, inliers = cv2.solvePnPRansac(

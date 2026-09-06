@@ -21,6 +21,7 @@ install(DIRECTORY web
 
 if(CATKIN_ENABLE_TESTING)
   catkin_add_nosetests(test/test_solver.py)
+  catkin_add_nosetests(test/test_planar_ransac.py)
   catkin_add_nosetests(test/test_intrinsic_solver.py)
   catkin_add_nosetests(test/test_intrinsic_aprilgrid_truth.py)
   catkin_add_nosetests(test/test_camera_control.py)
