@@ -117,18 +117,22 @@ function renderDetection(detection, board) {
 function applyState(s) {
   const wasAutoRunning = autoRunning;
   const action = s.action || null;
-  autoRunning = !!(action && action.name === "auto_run" && action.status === "running");
+  const solveJob = s.solve_job || null;
+  autoRunning = !!(action && action.name === "auto_run" && action.status === "running")
+    || !!(solveJob && solveJob.status === "running");
   if (action && action.status === "failed") {
     setStatus("Auto-run failed: " + (action.error || "camera control failed"));
   } else if (wasAutoRunning && !autoRunning) {
     setStatus(`Auto-run done — ${s.samples} observations analyzed.`);
   }
+  if (solveJob && solveJob.status === "failed") setStatus(solveJob.error || "Calibration failed; samples retained.");
   const phase = s.phase;
   const candidate = phase === "candidate_ready" ? s.candidate : null;
   currentCandidateId = candidate && candidate.candidate_id || "";
   el("conn").textContent = "connected";
   el("conn").className = "legacy-state-source pill pill-on";
-  el("samples").textContent = `${s.samples} samples`;
+  el("samples").textContent = solveJob && solveJob.status === "running"
+    ? `${solveJob.stage}: ${solveJob.completed} / ${solveJob.total}` : `${s.samples} samples`;
   renderBars(s.coverage || []);
 
   const poolCount = Number(s.candidate_pool && s.candidate_pool.count) || 0;
@@ -203,7 +207,8 @@ function wireButtons() {
   el("btn-candidate").addEventListener("click", async () => {
     setStatus("Analyzing the candidate pool…");
     const r = await postJSON("api/v1/intrinsic/candidate");
-    setStatus(r.ok === false ? (r.error || "Candidate analysis failed.")
+    setStatus(r.accepted ? "Analyzing the preserved candidate pool…"
+      : r.ok === false ? (r.error || "Candidate analysis failed.")
       : r.quality && r.quality.status === "save_ready"
         ? "Candidate stability checks passed."
         : "Candidate needs more diverse observations.");

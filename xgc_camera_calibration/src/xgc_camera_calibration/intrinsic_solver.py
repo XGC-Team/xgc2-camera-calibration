@@ -17,7 +17,7 @@ import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Callable, Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -1245,7 +1245,7 @@ def _run_extended_calibration(
             image_size,
             None,
             None,
-            flags=0,
+            flags=cv2.CALIB_USE_QR,
             criteria=_CALIBRATION_CRITERIA,
         )
     except cv2.error as error:
@@ -1505,6 +1505,7 @@ def _select_calibration_views(
     image_points: Sequence[np.ndarray],
     image_size: Tuple[int, int],
     observation_uncertainty: Optional[float],
+    progress: Optional[Callable[[str, int, int], None]] = None,
 ) -> Tuple[
     _ExtendedCalibration,
     List[int],
@@ -1512,6 +1513,8 @@ def _select_calibration_views(
     Tuple[float, ...],
 ]:
     """Iteratively remove only the worst robust per-view RMS outlier."""
+    if progress:
+        progress("filtering", 0, len(image_points))
     initial = _run_extended_calibration(object_points, image_points, image_size)
     initial_errors = tuple(float(value) for value in initial.per_view_errors_px)
     selected_indices = list(range(len(image_points)))
@@ -1543,6 +1546,8 @@ def _select_calibration_views(
             )
         )
         del selected_indices[worst_local_index]
+        if progress:
+            progress("filtering", len(rejected), len(image_points))
         calibration = _run_extended_calibration(
             [object_points[index] for index in selected_indices],
             [image_points[index] for index in selected_indices],
@@ -1557,6 +1562,7 @@ def _leave_one_out_stability(
     image_size: Tuple[int, int],
     reference: _ExtendedCalibration,
     original_view_indices: Optional[Sequence[int]] = None,
+    progress: Optional[Callable[[str, int, int], None]] = None,
 ) -> IntrinsicStabilityDiagnostics:
     names = _intrinsic_parameter_names(reference.distortion.size)
     reference_parameters = _intrinsic_parameter_vector(reference)
@@ -1567,6 +1573,8 @@ def _leave_one_out_stability(
     if len(original_view_indices) != len(image_points):
         raise CalibrationError("LOO original view indices do not match selected views")
     for omitted in range(len(image_points)):
+        if progress:
+            progress("validating", omitted, len(image_points))
         fold_objects = [
             value for index, value in enumerate(object_points) if index != omitted
         ]
@@ -1670,6 +1678,7 @@ def calibrate_intrinsic(
     image_size: Sequence[int],
     object_points: Optional[Sequence[np.ndarray]] = None,
     observation_uncertainty: Optional[float] = None,
+    progress: Optional[Callable[[str, int, int], None]] = None,
 ) -> IntrinsicResult:
     """Batch-estimate free K/D and return continuous solve-quality evidence."""
     if len(image_points) < 3:
@@ -1692,6 +1701,7 @@ def calibrate_intrinsic(
         corners,
         size,
         observation_uncertainty,
+        progress=progress,
     )
     selected_objects = [prepared_object[index] for index in selected_indices]
     selected_corners = [corners[index] for index in selected_indices]
@@ -1705,6 +1715,7 @@ def calibrate_intrinsic(
         size,
         calibration,
         original_view_indices=selected_indices,
+        progress=progress,
     )
     diagnostics = IntrinsicCalibrationDiagnostics(
         finite=True,

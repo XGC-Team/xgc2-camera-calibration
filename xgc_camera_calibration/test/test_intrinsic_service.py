@@ -1239,7 +1239,10 @@ class IntrinsicServiceTest(unittest.TestCase):
                 ((300, 360), 1.50, (0.08, 0.00, 0.00)),
                 ((640, 180), 1.05, (0.00, 0.08, 0.00)),
             ):
-                service.process_frame(render_aprilgrid_view(center, depth, rotation))
+                frame = render_aprilgrid_view(center, depth, rotation)
+                ok, source = cv2.imencode(".jpg", frame, (cv2.IMWRITE_JPEG_QUALITY, 100))
+                self.assertTrue(ok)
+                service.process_frame(frame, source_jpeg=source.tobytes())
             self.assertEqual(len(service.samples), 3)
 
             frontal_source = render_aprilgrid_view(
@@ -1882,7 +1885,7 @@ class IntrinsicServiceTest(unittest.TestCase):
                 source_timestamp_nanoseconds=123456789,
             )
             self.assertEqual(service.state()["samples"], 1)
-            self.assertFalse(service.state()["evidence"]["available"])
+            self.assertTrue(service.state()["evidence"]["available"])
 
             result = make_diagnostic_result(
                 (frame.shape[1], frame.shape[0]), 1
@@ -1993,7 +1996,8 @@ class IntrinsicServiceTest(unittest.TestCase):
 
             old_evidence_root = service._evidence_root
             service.reset()
-            self.assertFalse(old_evidence_root.exists())
+            self.assertTrue(old_evidence_root.exists())
+            self.assertTrue((old_evidence_root / "source/000.jpg").is_file())
             with self.assertRaisesRegex(ApiError, "evidence is unavailable"):
                 service.evidence_bundle()
 
@@ -2243,7 +2247,8 @@ class IntrinsicServiceTest(unittest.TestCase):
             self.addCleanup(service.stop_auto_capture)
 
             with patch.object(
-                service, "_calibrate_locked", return_value={"output_file": str(Path(directory) / "intrinsics.yaml")}
+                intrinsic_solver, "calibrate_intrinsic",
+                return_value=make_diagnostic_result((400, 320), 15)
             ):
                 started = monotonic()
                 accepted = service.auto_run(settle=0.03)
@@ -2481,7 +2486,7 @@ class IntrinsicServiceTest(unittest.TestCase):
             try:
                 with patch.object(
                     service,
-                    "calibrate",
+                    "start_candidate",
                     return_value={"candidate_id": "intrinsic-candidate-abc"},
                 ) as candidate, patch.object(
                     service,

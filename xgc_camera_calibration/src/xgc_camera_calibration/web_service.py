@@ -925,7 +925,8 @@ class CalibrationRequestHandler(BaseHTTPRequestHandler):
                         HTTPStatus.BAD_REQUEST,
                         "Intrinsic candidate request must be an empty object",
                     )
-                self._send_json(HTTPStatus.OK, self._intrinsic().calibrate())
+                payload = self._intrinsic().start_candidate()
+                self._send_json(HTTPStatus.ACCEPTED if payload.get("accepted") else HTTPStatus.OK, payload)
                 return
             if path == "/api/v1/intrinsic/save":
                 if not isinstance(request, dict) or set(request) != {"candidate_id"}:

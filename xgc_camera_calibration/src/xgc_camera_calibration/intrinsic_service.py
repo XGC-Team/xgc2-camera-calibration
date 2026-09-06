@@ -17,6 +17,8 @@ camera through the catalogue (goto / auto-run / reset).
 from __future__ import annotations
 
 import json
+import copy
+import uuid
 import hashlib
 import math
 import os
@@ -72,27 +74,27 @@ def intrinsic_feature_model(board_type: str) -> str:
     )
 
 
+def _installed_algorithm_digest() -> str:
+    package = Path(__file__).resolve().parent
+    digest = hashlib.sha256()
+    for name in ("board_profiles.py", "intrinsic_service.py", "intrinsic_solver.py", "intrinsic_validation.py"):
+        digest.update(name.encode("utf-8"))
+        digest.update(b"\x00")
+        digest.update(hashlib.sha256((package / name).read_bytes()).digest())
+    return digest.hexdigest()
+
+
+# A mounted source checkout may change while this Python process is running.
+# Attribute results to the loaded generation, never to later on-disk edits.
+_LOADED_ALGORITHM_SHA256 = _installed_algorithm_digest()
+
+
 def intrinsic_algorithm_provenance(
     feature_model: str = intrinsic_solver.APRILGRID_FEATURE_MODEL,
 ) -> Dict[str, str]:
-    """Fingerprint the exact installed modules that produce and validate K/D."""
-
-    package = Path(__file__).resolve().parent
-    names = (
-        "board_profiles.py",
-        "intrinsic_service.py",
-        "intrinsic_solver.py",
-        "intrinsic_validation.py",
-    )
-    digest = hashlib.sha256()
-    for name in names:
-        payload = (package / name).read_bytes()
-        digest.update(name.encode("utf-8"))
-        digest.update(b"\x00")
-        digest.update(hashlib.sha256(payload).digest())
     return {
         "contract": "xgc2.camera.intrinsic-algorithm.v1",
-        "sha256": digest.hexdigest(),
+        "sha256": _LOADED_ALGORITHM_SHA256,
         "opencv_version": str(cv2.__version__),
         "feature_model": str(feature_model),
     }
@@ -365,12 +367,11 @@ class IntrinsicCalibrationService:
         self._auto_capture_completed = False
         self._aprilgrid_search_hold_frames = 0
         self._aprilgrid_search_hold_width = 0
-        self._evidence_temporary = tempfile.TemporaryDirectory(
-            prefix="xgc2-intrinsic-evidence-"
-        )
-        self._evidence_root = Path(self._evidence_temporary.name)
+        self._evidence_root = self._new_capture_path()
         self._evidence_samples: List[Dict[str, Any]] = []
         self._evidence_bundle_path: Optional[Path] = None
+        self._solve_job = None
+        self._solve_thread = None
         self._load_refs()
         self._load_recovery()
 
@@ -1189,6 +1190,7 @@ class IntrinsicCalibrationService:
             target_ids = np.asarray(archive["sample_target_ids"], dtype=np.int64).reshape(-1)
             snapshot_ids = np.asarray(archive["sample_snapshot_ids"], dtype=np.str_).reshape(-1)
             collection_revision = int(np.asarray(archive["collection_revision"]).item())
+            capture_id = str(archive["capture_id"].item()) if "capture_id" in archive else ""
             if samples.ndim != 2 or samples.shape[1] != 4 or len(image_size_values) != 2:
                 raise CalibrationError("calibration checkpoint shape is invalid")
             if len(target_ids) != len(samples):
@@ -1225,6 +1227,37 @@ class IntrinsicCalibrationService:
         self.target_done = [index in simulation_ids for index in range(len(self.views))]
         self.image_size = (int(image_size_values[0]), int(image_size_values[1]))
         self.collection_revision = collection_revision
+        if capture_id:
+            if not re.fullmatch(r"[0-9]{8}T[0-9]{6}\.[0-9]{6}Z-[0-9a-f]{32}", capture_id):
+                raise CalibrationError("Checkpoint capture identity is invalid")
+            capture = Path(self.output_file_base).parent / "captures" / capture_id
+            if capture.is_symlink():
+                raise CalibrationError("Checkpoint capture must not be a symlink")
+            manifest = json.loads((capture / "manifest.json").read_text())
+            entries = manifest.get("samples", [])
+            if manifest.get("board_fingerprint") != fingerprint or len(entries) != len(samples):
+                raise CalibrationError("Capture manifest does not match checkpoint observations")
+            for index, entry in enumerate(entries):
+                if entry.get("index") != index or entry.get("snapshot_id") != self.sample_snapshot_ids[index]:
+                    raise CalibrationError("Capture sample identity does not match checkpoint")
+                for kind in ("source", "annotated"):
+                    relative = "{}/{:03d}.jpg".format(kind, index)
+                    if entry.get(kind + "_path") != relative:
+                        raise CalibrationError("Capture evidence path is invalid")
+                    path = capture / relative
+                    if path.is_symlink() or path.parent.is_symlink():
+                        raise CalibrationError("Capture evidence must not be a symlink")
+                    if hashlib.sha256(path.read_bytes()).hexdigest() != entry.get(kind + "_sha256"):
+                        raise CalibrationError("Capture evidence checksum does not match")
+            self._evidence_root = capture
+            self._evidence_samples = entries
+            previous_job = manifest.get("solve_job")
+            if previous_job:
+                self._solve_job = dict(previous_job)
+                if self._solve_job.get("status") != "failed":
+                    self._solve_job.update(status="failed", stage="complete",
+                        error="Calibration process restarted; original samples retained. Save to compute again.")
+                self._persist_capture_manifest_locked(write_job=False)
         return bool(self.samples)
 
     def _load_recovery(self) -> None:
@@ -1257,6 +1290,7 @@ class IntrinsicCalibrationService:
         destination.parent.mkdir(parents=True, exist_ok=True)
         payload: Dict[str, Any] = {
             "fingerprint": np.asarray(json.dumps(self._recovery_fingerprint(), sort_keys=True)),
+            "capture_id": np.asarray(self._evidence_root.name if self._evidence_samples else ""),
             "samples": np.asarray(self.samples, dtype=np.float64),
             "image_size": np.asarray(self.image_size, dtype=np.int64),
             "sample_target_ids": np.asarray(
@@ -1279,6 +1313,9 @@ class IntrinsicCalibrationService:
                 os.fsync(stream.fileno())
             os.chmod(temporary_name, 0o644)
             os.replace(temporary_name, str(destination))
+            if self._evidence_samples:
+                self._write_evidence_file(self._evidence_root / "observations.npz", destination.read_bytes())
+                self._persist_capture_manifest_locked()
             self._recovery_error = None
         except Exception:
             try:
@@ -1342,6 +1379,8 @@ class IntrinsicCalibrationService:
         timestamp_nanoseconds: Optional[int],
     ) -> None:
         """Persist one solver-admitted source frame and its full-resolution overlay."""
+        if len(self._evidence_samples) != len(self.samples) - 1:
+            raise CalibrationError("Restored observations are missing original image evidence; preserve or reset before collecting")
         if not source_jpeg:
             raise CalibrationError("accepted calibration sample has no source JPEG evidence")
         source = cv2.imdecode(np.frombuffer(source_jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
@@ -1415,8 +1454,7 @@ class IntrinsicCalibrationService:
 
     def _evidence_document_locked(self) -> Dict[str, Any]:
         available = bool(
-            (self.candidate_result is not None or self.result is not None)
-            and not self.result_restored
+            not self.result_restored
             and self._evidence_samples
             and len(self._evidence_samples) == len(self.image_points)
         )
@@ -1425,7 +1463,7 @@ class IntrinsicCalibrationService:
             identity = (
                 str(self._saved_candidate_id)
                 if self.result is not None
-                else str((self.candidate_payload or {}).get("candidate_id", "candidate"))
+                else str((self.candidate_payload or {}).get("candidate_id", self._evidence_root.name))
             )
             filename = "{}-evidence.zip".format(identity)
         return {
@@ -1907,7 +1945,7 @@ class IntrinsicCalibrationService:
                         )
                 else:
                     cv2.drawChessboardCorners(display, self.board_size, scaled, True)
-                if self.result is None and self.candidate_result is None:
+                if self.result is None and self.candidate_result is None and not self._solve_running():
                     target_index = self._explicit_target_index_locked()
                     if target_index is not None:
                         accepted = self._target_frame_is_admissible_locked(
@@ -2197,6 +2235,7 @@ class IntrinsicCalibrationService:
             phase = self._phase_locked()
             document = {
                 "mode": "intrinsic",
+                "solve_job": dict(self._solve_job) if self._solve_job else None,
                 "phase": phase,
                 "session_revision": self.session_revision,
                 "collection_revision": self.collection_revision,
@@ -2246,12 +2285,14 @@ class IntrinsicCalibrationService:
                 document["candidate_pool"] = {
                     "count": len(self.image_points),
                     "image_size": list(self.image_size) if self.image_size is not None else None,
-                    "solve_frozen": False,
+                    "solve_frozen": self._solve_running(),
                 }
             return document
 
     # -- sim camera guidance actions -----------------------------------------
     def _require_idle_locked(self) -> None:
+        if self._solve_running():
+            raise ApiError(HTTPStatus.CONFLICT, "Intrinsic calibration solve is already running")
         if self.action is not None and self.action.get("status") == "running":
             raise ApiError(
                 HTTPStatus.CONFLICT,
@@ -2295,13 +2336,10 @@ class IntrinsicCalibrationService:
         self._auto_capture_completed = False
         self._aprilgrid_search_hold_frames = 0
         self._aprilgrid_search_hold_width = 0
-        self._evidence_temporary.cleanup()
-        self._evidence_temporary = tempfile.TemporaryDirectory(
-            prefix="xgc2-intrinsic-evidence-"
-        )
-        self._evidence_root = Path(self._evidence_temporary.name)
+        self._evidence_root = self._new_capture_path()
         self._evidence_samples = []
         self._evidence_bundle_path = None
+        self._solve_job = None
 
     def _require_camera(self) -> Any:
         if self.camera is None:
@@ -2511,7 +2549,8 @@ class IntrinsicCalibrationService:
                         "automatic sweep did not capture every authored target identity "
                         "({}/{} samples)".format(len(self.samples), len(self.views))
                     )
-                result = self._calibrate_locked()
+            result = self.calibrate(_auto_run=True)
+            with self.lock:
                 self.action = {
                     "name": "auto_run",
                     "status": "succeeded",
@@ -2584,9 +2623,108 @@ class IntrinsicCalibrationService:
             self.reset()
         return {"ok": True, "saved": saved}
 
-    def calibrate(self) -> Dict[str, Any]:
+    def _new_capture_path(self) -> Path:
+        # Created lazily on first accepted source frame, retained across Reset/exit.
+        return Path(self.output_file_base).parent / "captures" / (
+            datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ-") + uuid.uuid4().hex
+        )
+
+    def _solve_running(self) -> bool:
+        return self._solve_job is not None and self._solve_job["status"] == "running"
+
+    def _persist_capture_manifest_locked(self, *, write_job: bool = True) -> None:
+        document = {
+            "schema": "xgc2.camera.intrinsic-capture.v1",
+            "board_fingerprint": self._recovery_fingerprint(),
+            "session_revision": self.session_revision,
+            "collection_revision": self.collection_revision,
+            "image_size": list(self.image_size) if self.image_size else None,
+            "samples": self._evidence_samples,
+            "solve_job": self._solve_job,
+        }
+        self._write_evidence_file(
+            self._evidence_root / "manifest.json",
+            (json.dumps(document, sort_keys=True, allow_nan=False) + "\n").encode(),
+        )
+        if write_job and self._solve_job is not None:
+            self._write_evidence_file(self._evidence_root / "jobs" / (self._solve_job["id"] + ".json"),
+                json.dumps(self._solve_job, allow_nan=False).encode())
+
+    def start_candidate(self, *, _auto_run: bool = False) -> Dict[str, Any]:
+        """Accept one frozen solve; HTTP/browser lifetimes do not own the worker."""
         with self.lock:
-            self._require_idle_locked()
+            if self._solve_running():
+                return {"accepted": True, "job": dict(self._solve_job)}
+            if self.candidate_result is not None or self.result is not None:
+                return self._calibrate_locked()
+            if not _auto_run:
+                self._require_idle_locked()
+            if not self.image_points or self.image_size is None:
+                raise ApiError(HTTPStatus.CONFLICT, "No calibration-board samples collected yet")
+            self._save_checkpoint_locked()
+            if self._recovery_error:
+                raise ApiError(HTTPStatus.SERVICE_UNAVAILABLE, "Could not preserve observations: " + self._recovery_error)
+            frozen = copy.copy(self)
+            frozen.image_points = [value.copy() for value in self.image_points]
+            frozen.object_points = [value.copy() for value in self.object_points]
+            frozen.samples = list(self.samples)
+            frozen.sample_target_ids = list(self.sample_target_ids)
+            frozen.sample_snapshot_ids = list(self.sample_snapshot_ids)
+            revision = (self.session_revision, self.collection_revision)
+            deadline = time.monotonic() + 30 * 60
+            job = {"id": uuid.uuid4().hex, "status": "running", "stage": "solving",
+                   "session_revision": self.session_revision, "collection_revision": self.collection_revision,
+                   "completed": 0, "total": len(self.image_points), "error": None}
+            self._solve_job = job
+            def progress(stage, completed, total):
+                if time.monotonic() >= deadline:
+                    raise CalibrationError("Calibration computation exceeded its 30 minute deadline; samples retained")
+                with self.lock:
+                    if self._solve_job is not job:
+                        raise CalibrationError("Calibration session changed; result discarded")
+                    job.update(stage=stage, completed=completed, total=total)
+            frozen._solve_progress = progress
+            self._persist_capture_manifest_locked()
+            def work():
+                error = None
+                try:
+                    frozen._calibrate_locked()
+                except Exception as cause:
+                    error = str(cause) or cause.__class__.__name__
+                with self.lock:
+                    if self._solve_job is not job or revision != (self.session_revision, self.collection_revision):
+                        return
+                    for name in ("candidate_result", "candidate_payload", "_candidate_diagnostics_full", "_candidate_error"):
+                        setattr(self, name, getattr(frozen, name))
+                    self.session_revision = frozen.session_revision
+                    self._evidence_bundle_path = None
+                    job.update(status="failed" if error else "succeeded", stage="complete", error=error)
+                    if not error:
+                        job["completed"] = job["total"]
+                    try:
+                        self._persist_capture_manifest_locked()
+                        if self.candidate_payload is not None:
+                            self._write_evidence_file(self._evidence_root / "candidate.json",
+                                json.dumps(self.candidate_payload, allow_nan=False).encode())
+                            self._write_evidence_file(self._evidence_root / "diagnostics.json",
+                                json.dumps(self._candidate_diagnostics_full, allow_nan=False).encode())
+                    except Exception as cause:
+                        job.update(status="failed", error="Could not persist solve result: " + str(cause))
+            self._solve_thread = threading.Thread(target=work, name="intrinsic-candidate", daemon=True)
+            self._solve_thread.start()
+            return {"accepted": True, "job": dict(job)}
+
+    def calibrate(self, *, _auto_run: bool = False) -> Dict[str, Any]:
+        receipt = self.start_candidate(_auto_run=_auto_run)
+        if not receipt.get("accepted"):
+            return receipt
+        thread = self._solve_thread
+        if thread is not None:
+            thread.join()
+        with self.lock:
+            if self.candidate_result is None:
+                raise ApiError(HTTPStatus.UNPROCESSABLE_ENTITY,
+                               (self._solve_job or {}).get("error") or "Calibration failed")
             return self._calibrate_locked()
 
     def continue_collection(self) -> Dict[str, Any]:
@@ -2913,6 +3051,7 @@ class IntrinsicCalibrationService:
                 observation_uncertainty=intrinsic_solver.observation_uncertainty_px(
                     self.board_type
                 ),
+                **({"progress": self._solve_progress} if hasattr(self, "_solve_progress") else {}),
             )
         except (CalibrationError, cv2.error) as error:
             raise ApiError(HTTPStatus.UNPROCESSABLE_ENTITY, str(error)) from error
@@ -2929,6 +3068,7 @@ class IntrinsicCalibrationService:
             "diagnostics": self._compact_diagnostics_document(diagnostics),
         }
         self.candidate_result = result
+        self._evidence_bundle_path = None
         self.candidate_payload = candidate
         self._candidate_diagnostics_full = diagnostics
         assessment, quality_reasons = self._candidate_save_assessment_locked()

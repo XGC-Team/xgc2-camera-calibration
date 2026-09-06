@@ -354,7 +354,7 @@ class IntrinsicSolverTest(unittest.TestCase):
         self.assertEqual(len(first_call.args), 5)
         self.assertIsNone(first_call.args[3])
         self.assertIsNone(first_call.args[4])
-        self.assertEqual(first_call.kwargs["flags"], 0)
+        self.assertEqual(first_call.kwargs["flags"], cv2.CALIB_USE_QR)
         self.assertEqual(first_call.kwargs["criteria"], solver._CALIBRATION_CRITERIA)
         np.testing.assert_allclose(result.camera_matrix, returned_matrix)
         np.testing.assert_allclose(result.distortion, returned_distortion)

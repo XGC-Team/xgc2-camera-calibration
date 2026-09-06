@@ -69,15 +69,35 @@ that creates a timestamped YAML; `continue` discards the candidate while
 retaining its observations. There is no `calibrate` alias. `image.jpg` is the
 most recently annotated detector snapshot, not a live-video transport.
 
-Every solver-admitted sample retains the exact source JPEG from its immutable
-Media Edge transaction plus a full-resolution annotated derivative in a
-session-local temporary directory. A candidate already makes `evidence.zip`
-available with the paired images, full solver/held-out diagnostics and a
-SHA-256 manifest; it intentionally contains no YAML. After explicit Save the
-bundle is rebuilt with the exact timestamped intrinsic YAML. This contract is
-identical for `sim` and `phy`. Images are never automatically persisted under
-Documents; Reset or process exit removes the temporary set, while a saved YAML
-remains versioned as before.
+Every solver-admitted sample retains its exact source JPEG and annotation under
+`<calibration directory>/captures/<capture identity>/`, together with a
+correspondence checkpoint and checksum manifest. Reset and process exit retain
+these captures; deletion is an explicit user file-management operation.
+Evidence ZIP download is available during collection, before solving or saving.
+
+`POST /api/v1/intrinsic/candidate` accepts a frozen observation revision and
+returns HTTP 202 with a job receipt. Repeated submissions during that solve
+return the same job. State includes `solve_job` (stage and progress); computation
+runs outside the state lock, so live detection and short status requests remain
+responsive. No new sample enters the frozen pool while solving. Reconnecting
+clients observe the job; only the exact resulting candidate ID can be saved.
+An interrupted process retains the original capture and exposes a failed job on
+checkpoint recovery; it does not silently resume computation or save an asset.
+
+The optimizer uses OpenCV QR for its linear solves while retaining free K/D,
+the same convergence criteria, iterative robust view exclusion, projected-rank
+checks and complete leave-one-view-out validation. A 30-minute cooperative job
+deadline is checked between fits; it does not forcibly interrupt a native OpenCV
+call. A failed solve retains evidence and never creates a successful YAML.
+
+Replay a preserved physical capture through real HTTP and an explicit Save:
+
+```bash
+python3 tools/verify_intrinsic_capture.py --capture /path/to/capture --output /new/analysis/directory
+```
+
+The output must be new; the source capture is verified and remains unchanged.
+This regression does not activate its resulting YAML in an experiment.
 
 ### Fixed-world-camera extrinsic calibration
 
