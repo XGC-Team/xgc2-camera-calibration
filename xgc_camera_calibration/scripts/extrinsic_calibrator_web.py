@@ -27,6 +27,7 @@ from xgc_camera_calibration.intrinsic_validation import (
 )
 from xgc_camera_calibration.media_snapshot import MediaSnapshotClient, MediaSnapshotError
 from xgc_camera_calibration.solver import optional_selected_intrinsic_path
+from xgc_camera_calibration.extrinsic_coordinates import coordinate_provenance
 
 
 def normalize_topic(value):
@@ -46,6 +47,11 @@ class RosCalibrationSource:
         snapshot_client=None,
         snapshot_available=False,
     ):
+        self.pose_coordinate_source = str(rospy.get_param("~pose_coordinate_source", "unspecified"))
+        if self.pose_coordinate_source not in ("unspecified", "raw-vrpn", "experiment-world"):
+            raise ValueError("invalid pose coordinate source")
+        self.pose_world_offset = tuple(float(rospy.get_param("~pose_world_offset_" + axis, 0.0))
+                                       for axis in ("x", "y", "z"))
         self.lock = threading.RLock()
         self.snapshot_client = snapshot_client
         self.snapshot_available = bool(snapshot_available)
@@ -318,6 +324,11 @@ class RosCalibrationSource:
             )
         with self.lock:
             observations = dict(self.marker_latest)
+        provenance = {}
+        if self.pose_coordinate_source != "unspecified":
+            provenance = coordinate_provenance("experiment-world", parent_frame, self.pose_world_offset)
+            provenance["input_kind"] = self.pose_coordinate_source
+            provenance["input_frame"] = parent_frame
         markers = {}
         wrong_frames = []
         for name, observation in observations.items():
@@ -326,8 +337,10 @@ class RosCalibrationSource:
                 continue
             markers[name] = MarkerObservation(
                 name=observation.name,
-                position=observation.position,
+                position=(tuple(float(observation.position[i]) + self.pose_world_offset[i] for i in range(3))
+                          if self.pose_coordinate_source == "raw-vrpn" else observation.position),
                 frame_id=observation.frame_id,
+                source_position=observation.position,
             )
         if wrong_frames:
             raise ApiError(
@@ -344,6 +357,7 @@ class RosCalibrationSource:
             distortion=intrinsic_distortion,
             markers=markers,
             camera_model=dict(self.intrinsic_provenance),
+            pose_coordinates=provenance,
         )
 
 

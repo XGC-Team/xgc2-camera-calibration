@@ -16,6 +16,7 @@ import cv2
 import numpy as np
 
 from xgc_camera_calibration.solver import load_extrinsic
+from xgc_camera_calibration.extrinsic_coordinates import coordinate_provenance, optical_translation_in_world
 from xgc_camera_calibration.web_service import (
     ApiError,
     CalibrationHttpServer,
@@ -179,19 +180,48 @@ class WebCalibrationServiceTest(unittest.TestCase):
         cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "RosCalibrationSource")
         method = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "_frame_snapshot")
         namespace = {"FrameSnapshot": FrameSnapshot, "MarkerObservation": MarkerObservation,
-                     "ApiError": ApiError, "ideal_intrinsic_parameters": ideal_intrinsic_parameters}
+                     "ApiError": ApiError, "ideal_intrinsic_parameters": ideal_intrinsic_parameters,
+                     "coordinate_provenance": coordinate_provenance}
         exec(compile(ast.Module(body=[method], type_ignores=[]), str(source_path), "exec"), namespace)
         for ideal in (True, False):
             expected_k, expected_d, size = ideal_intrinsic_parameters(640, 480, 110.)
             model = {"intrinsic_source": "ideal-pinhole" if ideal else "selected-file"}
             source = SimpleNamespace(use_ideal_intrinsics=ideal, ideal_horizontal_fov_degrees=110.,
                 intrinsic_matrix=expected_k, intrinsic_distortion=expected_d, intrinsic_size=size,
-                intrinsic_provenance=model, lock=threading.RLock(), marker_latest=self.snapshot.markers)
+                intrinsic_provenance=model, lock=threading.RLock(), marker_latest=self.snapshot.markers,
+                pose_coordinate_source="raw-vrpn", pose_world_offset=(10., -5., 2.))
             result = namespace["_frame_snapshot"](source, self.snapshot.image, 12.34, "optical", "map")
             np.testing.assert_array_equal(result.camera_matrix, expected_k)
             np.testing.assert_array_equal(result.distortion, expected_d)
             self.assertEqual(result.camera_model, model)
             self.assertIsNot(result.camera_model, model)
+            self.assertEqual(result.pose_coordinates["kind"], "experiment-world")
+            self.assertEqual(result.pose_coordinates["input_kind"], "raw-vrpn")
+            for name, observation in result.markers.items():
+                np.testing.assert_allclose(observation.position, np.asarray(self.snapshot.markers[name].position) + [10., -5., 2.])
+                self.assertEqual(observation.source_position, self.snapshot.markers[name].position)
+
+    def test_shifted_world_pose_is_saved_and_simulation_uses_it_directly(self):
+        offset = np.asarray([-8., 3., 1.])
+        provenance = coordinate_provenance("experiment-world", "map", offset)
+        provenance["input_kind"] = "raw-vrpn"
+        markers = {name: replace(marker, position=tuple(np.asarray(marker.position)+offset),
+                                 source_position=marker.position)
+                   for name, marker in self.snapshot.markers.items()}
+        self.service.source.snapshot = replace(self.snapshot, markers=markers, pose_coordinates=provenance)
+        self.service.freeze()
+        provenance["world_offset"][0] = 999.
+        candidate = self.service.solve(self.point_request())
+        saved = self.service.save(candidate["candidate_id"])
+        document = load_extrinsic(saved["output_file"])
+        raw_camera = -cv2.Rodrigues(self.rvec)[0].T.dot(self.tvec)
+        np.testing.assert_allclose(document["translation_array"], raw_camera + offset, atol=1e-5)
+        np.testing.assert_allclose(optical_translation_in_world(document, None), raw_camera + offset, atol=1e-5)
+        np.testing.assert_allclose(optical_translation_in_world(document, offset), raw_camera + offset, atol=1e-5)
+        np.testing.assert_allclose(optical_translation_in_world(document, [2., 4., 6.]), raw_camera + [2., 4., 6.], atol=1e-5)
+        self.assertEqual(document["metadata"]["pose_coordinates"]["world_offset"], offset.tolist())
+        for point in document["points"]:
+            np.testing.assert_allclose(point["world"], np.asarray(point["source_world"])+offset)
 
     def test_frozen_model_survives_source_changes_save_and_restart(self):
         for kind in ("ideal-pinhole", "selected-file"):

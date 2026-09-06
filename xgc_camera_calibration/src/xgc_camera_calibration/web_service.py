@@ -45,6 +45,7 @@ class MarkerObservation:
     name: str
     position: Tuple[float, float, float]
     frame_id: str
+    source_position: Optional[Tuple[float, float, float]] = None
 
 
 @dataclass(frozen=True)
@@ -56,6 +57,7 @@ class FrameSnapshot:
     distortion: np.ndarray
     markers: Mapping[str, MarkerObservation]
     camera_model: Mapping[str, Any] = field(default_factory=dict)
+    pose_coordinates: Mapping[str, Any] = field(default_factory=dict)
 
     @property
     def width(self) -> int:
@@ -307,6 +309,7 @@ class CalibrationService:
                     "width": frozen.width,
                     "height": frozen.height,
                     "camera_model": frozen.camera_model,
+                    "pose_coordinates": frozen.pose_coordinates,
                 }
                 payload["markers"] = [
                     {
@@ -348,7 +351,8 @@ class CalibrationService:
         model.setdefault("distortion_model", "plumb_bob")
         snapshot = replace(snapshot, image=snapshot.image.copy(), camera_matrix=intrinsic.copy(),
                            distortion=np.asarray(snapshot.distortion).copy(),
-                           markers=dict(snapshot.markers), camera_model=model)
+                           markers=dict(snapshot.markers), camera_model=model,
+                           pose_coordinates=json.loads(json.dumps(dict(snapshot.pose_coordinates), allow_nan=False)))
         encoded = self._encode_jpeg(snapshot.image)
         with self.lock:
             self.generation += 1
@@ -460,6 +464,8 @@ class CalibrationService:
                         "marker": name,
                         "pixel": list(map(float, pixel)),
                         "world": list(map(float, position)),
+                        **({"source_world": list(snapshot.markers[name].source_position)}
+                           if snapshot.markers[name].source_position is not None else {}),
                         "inlier": index in inliers,
                         "reprojection_error_px": float(result.reprojection_errors_px[index]),
                     }
@@ -477,9 +483,11 @@ class CalibrationService:
             )
             payload["points"] = persisted_points
             payload["camera_model"] = dict(snapshot.camera_model)
+            payload["pose_coordinates"] = dict(snapshot.pose_coordinates)
             candidate_document = {
                 "generation": self.generation,
                 "camera_model": snapshot.camera_model,
+                "pose_coordinates": snapshot.pose_coordinates,
                 "points": persisted_points,
                 "translation": payload["translation"],
                 "quaternion_xyzw": payload["quaternion_xyzw"],
@@ -566,6 +574,7 @@ class CalibrationService:
                         child_frame=self.child_frame,
                         points=self.candidate_points,
                         metadata={
+                            **({"pose_coordinates": dict(snapshot.pose_coordinates)} if snapshot.pose_coordinates else {}),
                             "candidate_id": identity,
                             "image_topic": self.source.image_topic,
                             "intrinsic_file": snapshot.camera_model.get("intrinsic_file", ""),

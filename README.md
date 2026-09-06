@@ -284,3 +284,16 @@ With ROS sourced and the package on `PYTHONPATH`, run
 xgc_camera_calibration/scripts/extrinsic_tf_publisher.py --output /new/evidence/path`.
 The check creates an isolated ROS master on port 11429 and synthetic calibration
 assets; `--port` chooses another free port and `--static false` checks dynamic TF.
+
+
+Physical workflows declare `poseCoordinateSource=raw-vrpn` and supply the frozen
+Session world offset. Frozen marker coordinates include that offset; saved
+extrinsics therefore describe the camera in experiment-world coordinates. Saved
+points retain both `source_world` and `world`; `metadata.pose_coordinates` records
+the input coordinate source and saved offset.
+
+TF `worldOffsetMode=stored` consumes the saved pose directly, including for
+simulation comparison. `rebase` applies target offset minus saved offset. A
+nonzero rebase of a legacy result without coordinate provenance is rejected.
+The ROS acceptance tool also accepts `--saved-offset X Y Z`, `--target-offset X Y Z`
+and `--world-offset-mode stored|rebase`.

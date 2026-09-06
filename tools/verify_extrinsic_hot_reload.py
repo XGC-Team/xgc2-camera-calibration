@@ -14,6 +14,7 @@ import time
 import xmlrpc.client
 
 import numpy as np
+from xgc_camera_calibration.extrinsic_coordinates import coordinate_provenance
 from xgc_camera_calibration.solver import (
     ExtrinsicResult, extrinsic_selection_path, save_extrinsic, write_extrinsic_selection,
 )
@@ -25,6 +26,9 @@ def main():
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--port', type=int, default=11429)
     parser.add_argument('--static', choices=['true', 'false'], default='true')
+    parser.add_argument("--saved-offset", type=float, nargs=3, default=[0., 0., 0.])
+    parser.add_argument("--target-offset", type=float, nargs=3, default=[0., 0., 0.])
+    parser.add_argument("--world-offset-mode", choices=["stored", "rebase"], default="stored")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=False)
     with socket.socket() as probe:
@@ -36,7 +40,9 @@ def main():
     processes = []
     receipt = {'status': 'failed', 'synthetic_assets': True, 'static': args.static,
                'publisher_sha256': hashlib.sha256(args.publisher.read_bytes()).hexdigest(),
-               'clock': 'use_sim_time=true; no clock publisher', 'checks': []}
+               'clock': 'use_sim_time=true; no clock publisher', 'checks': [],
+               'saved_offset': args.saved_offset, 'target_offset': args.target_offset,
+               'world_offset_mode': args.world_offset_mode}
     def wait(check, description, timeout=5):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
@@ -70,7 +76,8 @@ def main():
             with lock:
                 for transform in message.transforms:
                     if transform.child_frame_id == 'acceptance_link':
-                        received.append((time.monotonic(), transform.transform.translation.x))
+                        received.append((time.monotonic(), [transform.transform.translation.x,
+                            transform.transform.translation.y, transform.transform.translation.z]))
         topic = '/tf_static' if args.static == 'true' else '/tf'
         subscriber = rospy.Subscriber(topic, TFMessage, observe, queue_size=20)
         publisher = spawn([sys.executable, str(args.publisher),
@@ -79,11 +86,13 @@ def main():
             '_runtime_source_parent_frame:=world', '_optical_frame:=acceptance_optical',
             '_runtime_source_optical_frame:=acceptance_optical', '_camera_link_frame:=acceptance_link',
             '_watch_file:=true', '_wait_for_file:=false', '_static:='+args.static,
-            '_file_poll_rate:=10'], 'publisher.log')
+            '_file_poll_rate:=10', '_world_offset_mode:='+args.world_offset_mode,
+            '_x_offset:='+str(args.target_offset[0]), '_y_offset:='+str(args.target_offset[1]),
+            '_z_offset:='+str(args.target_offset[2])], 'publisher.log')
         def saw(x):
             with lock:
-                return any(abs(value-x) < 1e-9 for _, value in received)
-        wait(lambda: saw(0), 'default transform not published with paused clock')
+                return any(np.allclose(value, x, rtol=0., atol=1e-9) for _, value in received)
+        wait(lambda: saw(args.target_offset), 'default transform not published with paused clock')
         def save(index, x):
             path = root/'phy'/'usb_cam'/('extrinsics-20260907T00000{}.000000Z.yaml'.format(index))
             identity = 'synthetic-{}'.format(index)
@@ -92,11 +101,15 @@ def main():
                 rotation_world_to_camera=np.eye(3), translation_world_to_camera=np.asarray([-x, 0., 0.]),
                 reprojection_errors_px=np.asarray([.1]*4), inlier_indices=np.arange(4), warnings=()),
                 calibration_mode='phy', camera_name='usb_cam', parent_frame='world',
-                child_frame='acceptance_optical', metadata={'candidate_id': identity})
+                child_frame='acceptance_optical', metadata={'candidate_id': identity,
+                    'pose_coordinates': coordinate_provenance('experiment-world', 'world', args.saved_offset)})
             start = time.monotonic()
             write_extrinsic_selection(str(root), 'phy', 'usb_cam', path, identity)
-            wait(lambda: saw(x), 'saved transform {} not published'.format(index))
-            receipt['checks'].append({'saved_x': x, 'latency_seconds': time.monotonic()-start})
+            expected = np.asarray([x, 0., 0.])
+            if args.world_offset_mode == 'rebase':
+                expected += np.asarray(args.target_offset)-np.asarray(args.saved_offset)
+            wait(lambda: saw(expected), 'saved transform {} not published'.format(index))
+            receipt['checks'].append({'saved_x': x, 'published_translation': expected.tolist(), 'latency_seconds': time.monotonic()-start})
             return path
         first = save(1, 1.)
         pointer = extrinsic_selection_path(str(root), 'phy', 'usb_cam')

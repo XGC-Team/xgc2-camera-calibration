@@ -9,6 +9,7 @@ import tf2_ros
 from geometry_msgs.msg import TransformStamped
 
 from xgc_camera_calibration.extrinsic_file_watcher import ExtrinsicSelectionWatcher
+from xgc_camera_calibration.extrinsic_coordinates import optical_translation_in_world
 from xgc_camera_calibration.solver import (
     extrinsic_calibration_directory,
     load_extrinsic,
@@ -59,7 +60,10 @@ def load_transform_chain(
     offsets = tuple(
         float(rospy.get_param("~{}_offset".format(axis), 0.0)) for axis in ("x", "y", "z")
     )
-    optical_translation = document["translation_array"] + offsets
+    offset_mode = str(rospy.get_param("~world_offset_mode", "stored"))
+    if offset_mode not in ("stored", "rebase"):
+        raise ValueError("world_offset_mode must be stored or rebase")
+    optical_translation = optical_translation_in_world(document, offsets if offset_mode == "rebase" else None)
     chain = split_parent_to_optical_pose(
         optical_translation,
         document["quaternion_xyzw_array"],
