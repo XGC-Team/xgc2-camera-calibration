@@ -271,3 +271,16 @@ disables history discovery. Resolution does not modify calibration storage.
 
 New intrinsic saves include `calibration_mode`; legacy files without that field
 retain directory-based mode identity, reported as `legacy-directory`.
+
+
+The extrinsic TF watcher polls selection changes using wall time, including while
+simulation time is paused. Invalid updates retain the last transform and expose
+`~extrinsic_update_error`; a subsequent valid update clears the error. Successful
+publication records the previous and current file in `~active_extrinsic_transition`.
+An invalid initial selection remains a startup error.
+
+With ROS sourced and the package on `PYTHONPATH`, run
+`python3 tools/verify_extrinsic_hot_reload.py --publisher
+xgc_camera_calibration/scripts/extrinsic_tf_publisher.py --output /new/evidence/path`.
+The check creates an isolated ROS master on port 11429 and synthetic calibration
+assets; `--port` chooses another free port and `--static false` checks dynamic TF.

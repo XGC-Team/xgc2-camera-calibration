@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import sys
+import math
 import time
 
 import rospy
@@ -123,15 +124,24 @@ def wait_for_transform_chain(
     camera_name,
     watcher,
     wait_for_file,
-    poll_rate,
+    poll_interval,
     expected_parent_frame=None,
     expected_optical_frame=None,
     default_transforms=None,
 ):
     announced_wait = False
     while not rospy.is_shutdown():
-        result_revision = watcher.next_revision()
-        if result_revision is None:
+        try:
+            result_revision = watcher.next_revision()
+            if result_revision is not None:
+                return (
+                    load_transform_chain(
+                        result_revision.path, calibration_mode, camera_name,
+                        expected_parent_frame, expected_optical_frame,
+                        result_revision.document,
+                    ),
+                    result_revision.path,
+                )
             if not wait_for_file:
                 if default_transforms is None:
                     raise RuntimeError("calibration asset does not exist")
@@ -142,27 +152,24 @@ def wait_for_transform_chain(
                     extrinsic_directory,
                 )
                 announced_wait = True
-            poll_rate.sleep()
-            continue
-        extrinsic_file = result_revision.path
-        try:
-            return (
-                load_transform_chain(
-                    extrinsic_file, calibration_mode, camera_name,
-                    expected_parent_frame, expected_optical_frame,
-                    result_revision.document,
-                ),
-                extrinsic_file,
-            )
         except Exception as error:
             if not wait_for_file:
                 raise
-            rospy.logwarn("Ignoring unreadable camera extrinsic %s: %s", extrinsic_file, error)
-            poll_rate.sleep()
+            # A damaged/replaced selection must not terminate a running broadcaster.
+            rospy.set_param("~extrinsic_update_error", str(error))
+            rospy.logwarn_throttle(5.0, "Ignoring unavailable camera extrinsic: %s", error)
+        # Save is a wall-clock action, including while Gazebo /clock is paused.
+        time.sleep(poll_interval)
     return None
 
 
 def log_transform_chain(extrinsic_file, transforms):
+    previous = rospy.get_param("~active_extrinsic_file", "")
+    rospy.set_param("~extrinsic_update_error", "")
+    rospy.set_param("~active_extrinsic_transition", {
+        "previous_file": previous, "file": str(extrinsic_file),
+        "applied_at_unix_sec": time.time(),
+    })
     parent_to_link, link_to_optical = transforms
     rospy.loginfo(
         "Publishing camera extrinsic chain %s -> %s -> %s from %s",
@@ -214,7 +221,7 @@ def main():
         rospy.logfatal("~require_file_update requires ~wait_for_file=true")
         return 2
     file_poll_rate = float(rospy.get_param("~file_poll_rate", 5.0))
-    if file_poll_rate <= 0.0:
+    if not math.isfinite(file_poll_rate) or file_poll_rate <= 0.0:
         rospy.logfatal("~file_poll_rate must be positive")
         return 2
     default_transforms = default_transform_chain(
@@ -238,7 +245,7 @@ def main():
         camera_name,
         require_update=require_file_update,
     )
-    poll_rate = rospy.Rate(file_poll_rate)
+    poll_interval = 1.0 / file_poll_rate
     try:
         loaded = wait_for_transform_chain(
             extrinsic_directory,
@@ -246,7 +253,7 @@ def main():
             camera_name,
             watcher,
             wait_for_file,
-            poll_rate,
+            poll_interval,
             expected_parent_frame,
             expected_optical_frame,
             default_transforms=None if wait_for_file else default_transforms,
@@ -259,10 +266,7 @@ def main():
     transforms, extrinsic_file = loaded
 
     static = bool(rospy.get_param("~static", True))
-    if extrinsic_file:
-        log_transform_chain(extrinsic_file, transforms)
-        rospy.set_param("~active_extrinsic_file", str(extrinsic_file))
-    else:
+    if not extrinsic_file:
         rospy.logwarn(
             "Publishing default camera extrinsic %s -> %s -> %s until a timestamped YAML is saved under %s",
             transforms[0].header.frame_id,
@@ -279,6 +283,9 @@ def main():
             parent_to_link.header.stamp = stamp
             link_to_optical.header.stamp = stamp
             broadcaster.sendTransform([parent_to_link, link_to_optical])
+            if extrinsic_file:
+                log_transform_chain(extrinsic_file, transforms)
+                rospy.set_param("~active_extrinsic_file", str(extrinsic_file))
             if not watch_file:
                 rospy.spin()
                 return 0
@@ -288,14 +295,12 @@ def main():
                 camera_name,
                 watcher,
                 True,
-                poll_rate,
+                poll_interval,
                 expected_parent_frame,
                 expected_optical_frame,
             )
             if loaded is not None:
                 transforms, extrinsic_file = loaded
-                log_transform_chain(extrinsic_file, transforms)
-                rospy.set_param("~active_extrinsic_file", str(extrinsic_file))
         return 0
 
     broadcaster = tf2_ros.TransformBroadcaster()
@@ -303,15 +308,19 @@ def main():
     parent_to_link, link_to_optical = transforms
     link_to_optical.header.stamp = rospy.Time.now()
     optical_broadcaster.sendTransform(link_to_optical)
-    rate = rospy.Rate(float(rospy.get_param("~publish_rate", 10.0)))
+    publish_rate = float(rospy.get_param("~publish_rate", 10.0))
+    if not math.isfinite(publish_rate) or publish_rate <= 0.0:
+        rospy.logfatal("~publish_rate must be positive and finite")
+        return 2
+    pending_transition = bool(extrinsic_file)
     next_file_poll = time.monotonic()
     while not rospy.is_shutdown():
         if watch_file and time.monotonic() >= next_file_poll:
             next_file_poll = time.monotonic() + (1.0 / file_poll_rate)
-            result_revision = watcher.next_revision()
-            if result_revision is not None:
-                candidate_file = result_revision.path
-                try:
+            try:
+                result_revision = watcher.next_revision()
+                if result_revision is not None:
+                    candidate_file = result_revision.path
                     transforms = load_transform_chain(
                         candidate_file, selected_mode, camera_name,
                         expected_parent_frame, expected_optical_frame,
@@ -321,15 +330,17 @@ def main():
                     parent_to_link, link_to_optical = transforms
                     link_to_optical.header.stamp = rospy.Time.now()
                     optical_broadcaster.sendTransform(link_to_optical)
-                    log_transform_chain(extrinsic_file, transforms)
-                    rospy.set_param("~active_extrinsic_file", str(extrinsic_file))
-                except Exception as error:
-                    rospy.logwarn(
-                        "Ignoring unreadable camera extrinsic %s: %s", candidate_file, error
-                    )
+                    pending_transition = True
+            except Exception as error:
+                rospy.set_param("~extrinsic_update_error", str(error))
+                rospy.logwarn_throttle(5.0, "Ignoring unavailable camera extrinsic: %s", error)
         parent_to_link.header.stamp = rospy.Time.now()
         broadcaster.sendTransform(parent_to_link)
-        rate.sleep()
+        if pending_transition:
+            log_transform_chain(extrinsic_file, transforms)
+            rospy.set_param("~active_extrinsic_file", str(extrinsic_file))
+            pending_transition = False
+        time.sleep(1.0 / publish_rate)
     return 0
 
 
