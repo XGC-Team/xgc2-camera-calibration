@@ -12,7 +12,7 @@
   <arg name="parent_frame" default="map" />
   <arg name="child_frame" default="usb_cam_optical_frame" />
   <arg name="ransac_threshold_px" default="3.0" />
-  <arg name="maximum_inlier_error_px" default="5.0" />
+  <arg name="maximum_inlier_error_px" default="10.0" />
   <arg name="freeze_image_timeout" default="2.0" />
   <arg name="jpeg_quality" default="80" />
   <arg name="bind_address" default="127.0.0.1" />

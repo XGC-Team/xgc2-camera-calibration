@@ -425,7 +425,7 @@ def main():
             child_frame=rospy.get_param("~child_frame", "usb_cam_optical_frame"),
             ransac_threshold_px=float(rospy.get_param("~ransac_threshold_px", 3.0)),
             maximum_inlier_error_px=float(
-                rospy.get_param("~maximum_inlier_error_px", 5.0)
+                rospy.get_param("~maximum_inlier_error_px", 10.0)
             ),
             jpeg_quality=int(rospy.get_param("~jpeg_quality", 80)),
         )

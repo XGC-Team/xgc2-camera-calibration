@@ -179,7 +179,7 @@ class CalibrationService:
         parent_frame: str,
         child_frame: str,
         ransac_threshold_px: float = 3.0,
-        maximum_inlier_error_px: float = 5.0,
+        maximum_inlier_error_px: float = 10.0,
         jpeg_quality: int = 80,
     ):
         if not parent_frame or not child_frame:
