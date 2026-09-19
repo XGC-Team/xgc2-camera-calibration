@@ -2188,6 +2188,43 @@ class IntrinsicCalibrationService:
             raise ApiError(HTTPStatus.SERVICE_UNAVAILABLE, "No camera image has arrived")
         return self._encode_jpeg(display)
 
+    def snapshot_jpeg(self) -> bytes:
+        """Read one source frame without detection or calibration state changes.
+
+        A restored result is terminal for collection, but its source remains
+        available for viewing. Keep this separate from the annotated image and
+        serialize it with detection/validation captures of the same source.
+        """
+        with self._capture_lock:
+            with self.lock:
+                capture = self.frame_capture
+            if capture is None:
+                raise ApiError(HTTPStatus.SERVICE_UNAVAILABLE, "No calibration frame source is available")
+            try:
+                frame = capture()
+            except ApiError:
+                raise
+            except Exception as error:
+                raise ApiError(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    "Could not capture a calibration snapshot: {}".format(error),
+                ) from error
+            jpeg = getattr(frame, "jpeg", None)
+            if jpeg is not None:
+                # Preserve the native source bytes, not its reduced detection
+                # BGR buffer. Reduced decoding only validates the JPEG payload.
+                image = None
+                if isinstance(jpeg, bytes) and jpeg.startswith(b"\xff\xd8"):
+                    try:
+                        image = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_REDUCED_COLOR_8)
+                    except cv2.error:
+                        pass
+                if image is not None and image.size:
+                    return jpeg
+            elif isinstance(frame, np.ndarray) and frame.ndim == 3 and frame.shape[2] == 3 and frame.size:
+                return self._encode_jpeg(frame)
+            raise ApiError(HTTPStatus.SERVICE_UNAVAILABLE, "Calibration frame source returned no snapshot image")
+
     def _board_document(self) -> Dict[str, Any]:
         document: Dict[str, Any] = {
             "type": self.board_type,

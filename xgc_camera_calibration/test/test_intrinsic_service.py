@@ -426,6 +426,165 @@ class FakeCameraControl:
 
 
 class IntrinsicServiceTest(unittest.TestCase):
+    def test_saved_snapshot_is_fresh_native_jpeg_without_calibration_mutation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory) / "intrinsics.yaml"
+            saved = Path(directory) / "intrinsics-20260919T120000.000000Z.yaml"
+            intrinsic_solver.save_intrinsic(
+                saved,
+                intrinsic_solver.IntrinsicResult(
+                    camera_matrix=PRODUCTION_K.copy(),
+                    distortion=np.array([0.02, -0.03, 0.0, 0.0, 0.0]),
+                    image_size=PRODUCTION_IMAGE_SIZE,
+                    rms_reprojection_error_px=0.6,
+                    sample_count=45,
+                ),
+                camera_name="usb_cam", board_size=(7, 5), square=0.20,
+                metadata={
+                    "quality_contract": "xgc2.camera.intrinsic-quality.v2",
+                    "candidate_id": "intrinsic-candidate-snapshot",
+                    "stability_assessment": {"passed": True},
+                },
+            )
+            service = make_service(base)
+            frames = []
+            for value in (30, 190):
+                native = np.full((2160, 3840, 3), value, np.uint8)
+                ok, encoded = cv2.imencode(".jpg", native)
+                self.assertTrue(ok)
+                frames.append(encoded.tobytes())
+            captures = []
+
+            def capture():
+                jpeg = frames[len(captures)]
+                captures.append(jpeg)
+                return SimpleNamespace(jpeg=jpeg, bgr=np.zeros((270, 480, 3), np.uint8))
+
+            service.attach_frame_capture(capture)
+            # The restored result deliberately stops automatic collection.
+            service.start_auto_capture()
+            before = service.state()
+            files_before = {p.name: p.read_bytes() for p in Path(directory).iterdir() if p.is_file()}
+            self.assertEqual(before["phase"], "saved")
+            self.assertTrue(before["result_restored"])
+            self.assertFalse(before["image_ready"])
+            for expected in frames:
+                actual = service.snapshot_jpeg()
+                self.assertEqual(actual, expected)
+                decoded = cv2.imdecode(np.frombuffer(actual, np.uint8), cv2.IMREAD_COLOR)
+                self.assertEqual(decoded.shape, (2160, 3840, 3))
+            self.assertEqual(captures, frames)
+            self.assertEqual(service.state(), before)
+            self.assertEqual(service.samples, [])
+            np.testing.assert_array_equal(service.result.camera_matrix, PRODUCTION_K)
+            np.testing.assert_array_equal(service.result.distortion, [0.02, -0.03, 0.0, 0.0, 0.0])
+            self.assertEqual(
+                {p.name: p.read_bytes() for p in Path(directory).iterdir() if p.is_file()},
+                files_before,
+            )
+            # Detection image semantics remain separate from a raw source snapshot.
+            with self.assertRaises(ApiError) as absent:
+                service.image_jpeg()
+            self.assertEqual(absent.exception.status, HTTPStatus.SERVICE_UNAVAILABLE)
+
+    def test_snapshot_rejects_missing_or_failed_source_without_cached_display_fallback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = make_service(Path(directory) / "intrinsics.yaml")
+            service.process_frame(render_board())
+            detection = service.image_jpeg()
+            before = service.state()
+
+            def unavailable():
+                raise TimeoutError("source deadline expired")
+
+            for capture in (None, unavailable, lambda: None,
+                            lambda: SimpleNamespace(jpeg=b"", bgr=render_board()),
+                            lambda: SimpleNamespace(jpeg=b"\xff\xd8invalid\xff\xd9", bgr=render_board())):
+                service.attach_frame_capture(capture)
+                with self.subTest(capture=capture), self.assertRaises(ApiError) as caught:
+                    service.snapshot_jpeg()
+                self.assertEqual(caught.exception.status, HTTPStatus.SERVICE_UNAVAILABLE)
+                self.assertEqual(service.state(), before)
+                self.assertEqual(service.image_jpeg(), detection)
+
+    def test_snapshot_serializes_with_existing_capture_consumers(self):
+        for other in ("snapshot_jpeg", "_capture_validation_frame", "_capture_frame"):
+            with self.subTest(other=other), tempfile.TemporaryDirectory() as directory:
+                service = make_service(Path(directory) / "intrinsics.yaml")
+                entered = threading.Event()
+                release = threading.Event()
+                second_started = threading.Event()
+                second_captured = threading.Event()
+                errors = []
+                captures = []
+
+                def capture():
+                    captures.append(threading.current_thread().name)
+                    if len(captures) == 1:
+                        entered.set()
+                        if not release.wait(3):
+                            raise TimeoutError("test did not release first capture")
+                    else:
+                        second_captured.set()
+                    return render_board()
+
+                def call(method, started=None):
+                    if started is not None:
+                        started.set()
+                    try:
+                        getattr(service, method)()
+                    except Exception as error:
+                        errors.append(error)
+
+                service.attach_frame_capture(capture)
+                first = threading.Thread(target=call, args=("snapshot_jpeg",), daemon=True)
+                second = threading.Thread(target=call, args=(other, second_started), daemon=True)
+                first.start()
+                try:
+                    self.assertTrue(entered.wait(2))
+                    second.start()
+                    self.assertTrue(second_started.wait(2))
+                    self.assertFalse(second_captured.wait(0.1), "capture sources ran concurrently")
+                finally:
+                    release.set()
+                    first.join(3)
+                    if second.ident is not None:
+                        second.join(3)
+                self.assertFalse(first.is_alive())
+                self.assertFalse(second.is_alive())
+                self.assertEqual(errors, [])
+                self.assertEqual(len(captures), 2)
+
+    def test_snapshot_http_is_uncached_and_separate_from_detection_image(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = make_service(Path(directory) / "intrinsics.yaml")
+            ok, jpeg = cv2.imencode(".jpg", render_board())
+            self.assertTrue(ok)
+            service.attach_frame_capture(lambda: SimpleNamespace(jpeg=jpeg.tobytes()))
+            server = CalibrationHttpServer(
+                ("127.0.0.1", 0), object(), WEB_ROOT,
+                frame_ancestors="'self'", intrinsic_service=service,
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            base = "http://127.0.0.1:{}".format(server.server_address[1])
+            try:
+                with urllib.request.urlopen(base + "/api/v1/intrinsic/snapshot.jpg") as response:
+                    self.assertEqual(response.headers.get_content_type(), "image/jpeg")
+                    self.assertEqual(response.headers["Cache-Control"], "no-store")
+                    self.assertEqual(response.read(), jpeg.tobytes())
+                with self.assertRaises(urllib.error.HTTPError) as caught:
+                    urllib.request.urlopen(base + "/api/v1/intrinsic/image.jpg")
+                self.assertEqual(caught.exception.code, HTTPStatus.SERVICE_UNAVAILABLE)
+                service.attach_frame_capture(None)
+                with self.assertRaises(urllib.error.HTTPError) as caught:
+                    urllib.request.urlopen(base + "/api/v1/intrinsic/snapshot.jpg")
+                self.assertEqual(caught.exception.code, HTTPStatus.SERVICE_UNAVAILABLE)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(3)
+
     def test_algorithm_provenance_preserves_the_selected_feature_model(self):
         feature_model = "checkerboard_corners_v1"
         self.assertEqual(

@@ -859,6 +859,9 @@ class CalibrationRequestHandler(BaseHTTPRequestHandler):
             if path == "/api/v1/intrinsic/image.jpg":
                 self._send_bytes(HTTPStatus.OK, "image/jpeg", self._intrinsic().image_jpeg())
                 return
+            if path == "/api/v1/intrinsic/snapshot.jpg":
+                self._send_bytes(HTTPStatus.OK, "image/jpeg", self._intrinsic().snapshot_jpeg())
+                return
             if path == "/api/v1/intrinsic/targets":
                 self._send_json(HTTPStatus.OK, self._intrinsic().targets_document())
                 return
