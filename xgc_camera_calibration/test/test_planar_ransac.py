@@ -2,6 +2,8 @@
 
 import itertools
 import json
+from dataclasses import replace
+import uuid
 import random
 import tempfile
 import threading
@@ -140,6 +142,7 @@ class PlanarRansacTest(unittest.TestCase):
         class ProjectedFrameSource:
             # Only the frame-source boundary is a fixture. The real service,
             # OpenCV solver, JPEG encoder and filesystem persistence run below.
+            source_id = 'camera'
             image_topic = '/camera/image'
             intrinsic_file = ''
             pose_prefix = '/markers'
@@ -147,6 +150,12 @@ class PlanarRansacTest(unittest.TestCase):
             def freeze(self, parent_frame):
                 assert parent_frame == 'world'
                 return snapshot
+
+            def observe_marker(self, marker, width, height, parent_frame):
+                return {"marker": replace(markers[marker], observation_id=uuid.uuid4().hex,
+                         source_stamp_sec=123., received_at_sec=456., received_monotonic_sec=789.),
+                        "camera_matrix": intrinsic, "distortion": distortion,
+                        "camera_model": {}, "pose_coordinates": {}}
 
             def status(self):
                 return {'ready': True}
@@ -173,10 +182,20 @@ class PlanarRansacTest(unittest.TestCase):
                     return json.loads(response.read().decode('utf-8'))
 
             try:
-                frozen = post('/api/v1/freeze', {})
-                candidate = post('/api/v1/solve', {'generation': frozen['generation'], 'points': [
-                    {'marker': str(index), 'pixel': pixel.tolist()} for index, pixel in enumerate(pixels)
-                ]})
+                image = cv2.imencode('.png', snapshot.image)[1].tobytes()
+                for index, pixel in enumerate(pixels):
+                    pending = post('/api/v1/samples/begin', {
+                        'sampling_session_id': service.samples.session_id,
+                        'expected_revision': service.samples.revision, 'request_id': str(index),
+                        'marker': str(index), 'pixel': pixel.tolist(), 'display': {
+                            'id': str(index), 'source_id': 'camera', 'source_epoch': 'fixture',
+                            'width': 1280, 'height': 960, 'clock_domain': 'browser-performance', 'presented_at_ms': float(index)}})
+                    request = urllib.request.Request(base + '/api/v1/samples/' + pending['sample_id'] + '/image',
+                        data=image, headers={'Content-Type': 'image/png'}, method='POST')
+                    with urllib.request.urlopen(request, timeout=3) as response:
+                        self.assertEqual(response.status, 200)
+                candidate = post('/api/v1/solve', {'sampling_session_id': service.samples.session_id,
+                                                  'expected_revision': service.samples.revision})
                 self.assertFalse(candidate['saved'])
                 self.assertEqual(list(Path(root).rglob('*.yaml')), [])
                 self.assertEqual(set(candidate['inlier_indices']), set(range(1, 16)))

@@ -6,6 +6,8 @@ import sys
 import threading
 import time
 import math
+import uuid
+from dataclasses import replace
 from pathlib import Path
 
 import cv2
@@ -15,6 +17,7 @@ from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import CompressedImage, Image
 
 from xgc_camera_calibration.pose_freshness import pose_is_fresh
+from xgc_camera_calibration.extrinsic_samples import image_dimensions
 
 from xgc_camera_calibration.web_service import (
     ApiError,
@@ -59,6 +62,7 @@ class RosCalibrationSource:
         self.lock = threading.RLock()
         self.snapshot_client = snapshot_client
         self.snapshot_available = bool(snapshot_available)
+        self.source_size = None
         selected = optional_selected_intrinsic_path(
             calibration_root, calibration_mode, camera_name, intrinsic_file
         )
@@ -144,8 +148,10 @@ class RosCalibrationSource:
 
     def _refresh_snapshot_health(self, _event):
         try:
-            self.snapshot_client.health()
-            available = True
+            health = self.snapshot_client.health()
+            source = next(item for item in health["sources"] if isinstance(item, dict) and item.get("id") == self.snapshot_client.source_id)
+            size = (source.get("width"), source.get("height"))
+            available = all(type(value) is int and value > 0 for value in size)
         except MediaSnapshotError as error:
             available = False
             rospy.logwarn_throttle(
@@ -153,6 +159,8 @@ class RosCalibrationSource:
             )
         with self.lock:
             self.snapshot_available = available
+            if available:
+                self.source_size = size
 
     def _preview_callback(self, message):
         image_format = str(message.format).strip().lower()
@@ -174,6 +182,10 @@ class RosCalibrationSource:
         )
         with self.lock:
             self.preview_jpeg = payload
+            try:
+                self.source_size = image_dimensions(payload, "image/jpeg")
+            except ApiError:
+                self.source_size = None
             self.preview_stamp_sec = stamp_sec
 
     def _refresh_markers(self, _event):
@@ -213,10 +225,14 @@ class RosCalibrationSource:
                 name=name,
                 position=(float(position.x), float(position.y), float(position.z)),
                 frame_id=message.header.frame_id,
+                observation_id=uuid.uuid4().hex,
+                source_stamp_sec=float(message.header.stamp.to_sec()),
+                received_at_sec=time.time(),
+                received_monotonic_sec=time.monotonic(),
             )
             with self.lock:
                 self.marker_latest[name] = observation
-                self.marker_receipts[name] = (time.monotonic(), message.header.stamp.to_sec())
+                self.marker_receipts[name] = (observation.received_monotonic_sec, observation.source_stamp_sec)
 
         return callback
 
@@ -225,6 +241,10 @@ class RosCalibrationSource:
             return image_message_to_bgr(message)
         except (TypeError, ValueError, cv2.error) as error:
             raise ApiError(409, "Could not convert camera image: {}".format(error)) from error
+
+    @property
+    def source_id(self):
+        return self.snapshot_client.source_id if self.snapshot_client is not None else "ros:" + self.image_topic
 
     def preview_jpeg_bytes(self):
         with self.lock:
@@ -308,7 +328,31 @@ class RosCalibrationSource:
         frame_id,
         parent_frame,
     ):
-        image_size = (int(image.shape[1]), int(image.shape[0]))
+        context = self._observation_context(int(image.shape[1]), int(image.shape[0]), parent_frame)
+        return FrameSnapshot(image=image, stamp_sec=stamp_sec, frame_id=frame_id,
+                             camera_matrix=context["camera_matrix"], distortion=context["distortion"],
+                             markers=context["markers"], camera_model=context["camera_model"],
+                             pose_coordinates=context["pose_coordinates"])
+
+    def observe_marker(self, marker, width, height, parent_frame):
+        # Metadata and latest pose only: the browser already owns the clicked
+        # image. Never capture another frame to reinterpret its pixels.
+        with self.lock:
+            expected_size = self.source_size
+            available = self.snapshot_available if self.snapshot_client is not None else self.preview_jpeg is not None
+        if not available or expected_size is None:
+            raise ApiError(409, "Calibration source dimensions are unavailable")
+        if (width, height) != expected_size:
+            raise ApiError(409, "Displayed image does not match calibration source dimensions")
+        context = self._observation_context(width, height, parent_frame, marker)
+        observation = context.pop("markers").get(marker)
+        if observation is None:
+            raise ApiError(409, "Selected marker has no fresh pose observation")
+        context["marker"] = observation
+        return context
+
+    def _observation_context(self, width, height, parent_frame, selected_marker=None):
+        image_size = (width, height)
         if self.use_ideal_intrinsics:
             (
                 intrinsic_matrix,
@@ -336,7 +380,8 @@ class RosCalibrationSource:
         with self.lock:
             wall_now, ros_now = time.monotonic(), rospy.Time.now().to_sec()
             observations = {name: observation for name, observation in self.marker_latest.items()
-                if pose_is_fresh(self.marker_receipts.get(name), wall_now, ros_now, self.pose_max_age)}
+                if (selected_marker is None or name == selected_marker)
+                and pose_is_fresh(self.marker_receipts.get(name), wall_now, ros_now, self.pose_max_age)}
         provenance = {}
         if self.pose_coordinate_source != "unspecified":
             provenance = coordinate_provenance("experiment-world", parent_frame, self.pose_world_offset)
@@ -348,8 +393,8 @@ class RosCalibrationSource:
             if observation.frame_id and observation.frame_id != parent_frame:
                 wrong_frames.append(name)
                 continue
-            markers[name] = MarkerObservation(
-                name=observation.name,
+            markers[name] = replace(
+                observation,
                 position=(tuple(float(observation.position[i]) + self.pose_world_offset[i] for i in range(3))
                           if self.pose_coordinate_source == "raw-vrpn" else observation.position),
                 frame_id=observation.frame_id,
@@ -362,16 +407,9 @@ class RosCalibrationSource:
                     parent_frame, ", ".join(sorted(wrong_frames))
                 ),
             )
-        return FrameSnapshot(
-            image=image,
-            stamp_sec=stamp_sec,
-            frame_id=frame_id,
-            camera_matrix=intrinsic_matrix,
-            distortion=intrinsic_distortion,
-            markers=markers,
-            camera_model=dict(self.intrinsic_provenance),
-            pose_coordinates=provenance,
-        )
+        return {"camera_matrix": intrinsic_matrix, "distortion": intrinsic_distortion,
+                "markers": markers, "camera_model": dict(self.intrinsic_provenance),
+                "pose_coordinates": provenance}
 
 
 def split_list_parameter(value):

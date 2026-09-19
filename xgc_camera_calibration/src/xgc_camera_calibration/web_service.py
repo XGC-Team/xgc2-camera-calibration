@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import mimetypes
+import socket
 import threading
 import time
 from dataclasses import dataclass, field, replace
@@ -30,14 +31,7 @@ from xgc_camera_calibration.solver import (
 )
 
 
-class ApiError(RuntimeError):
-    """An expected request or calibration-input failure."""
-
-    def __init__(self, status: int, message: str, *, details: Optional[Dict[str, Any]] = None):
-        super().__init__(message)
-        self.status = int(status)
-        self.message = str(message)
-        self.details = dict(details or {})
+from xgc_camera_calibration.extrinsic_samples import ApiError, SampleCollection, IMAGE_BYTES, IMAGE_PATH
 
 
 @dataclass(frozen=True)
@@ -46,6 +40,10 @@ class MarkerObservation:
     position: Tuple[float, float, float]
     frame_id: str
     source_position: Optional[Tuple[float, float, float]] = None
+    observation_id: str = ""
+    source_stamp_sec: Optional[float] = None
+    received_at_sec: Optional[float] = None
+    received_monotonic_sec: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -210,10 +208,35 @@ class CalibrationService:
         self.result_restored = False
         self._pending_output_file: Optional[Tuple[str, Path]] = None
         self.recovery_error: Optional[str] = None
+        self.candidate_metadata = None
+        self.samples = SampleCollection(source, parent_frame, self.lock, self._samples_changed)
         try:
             self._restore_selected_result()
         except Exception as error:
             self.recovery_error = str(error)
+
+    def _samples_changed(self) -> None:
+        self.result = None
+        self.result_payload = None
+        self.candidate_id = None
+        self.saved_candidate_id = None
+        self.candidate_points = None
+        self.candidate_metadata = None
+        self.result_restored = False
+        self._pending_output_file = None
+        self.recovery_error = None
+        self.output_file = None
+
+    def begin_sample(self, request):
+        return self.samples.begin(request)
+
+    def commit_sample(self, identity, payload, mime):
+        self.samples.commit(identity, payload, mime)
+        return self.state()
+
+    def mutate_sample(self, action, request):
+        self.samples.mutate(action, request)
+        return self.state()
 
     def _restore_selected_result(self) -> None:
         restored = load_extrinsic_selection(
@@ -286,6 +309,7 @@ class CalibrationService:
             frozen = self.frozen
             result = self.result_payload
             payload: Dict[str, Any] = {
+                **self.samples.state(),
                 "mode": "frozen" if frozen is not None else "live",
                 "generation": self.generation,
                 "output_file": self.output_file,
@@ -296,7 +320,7 @@ class CalibrationService:
                 "child_frame": self.child_frame,
                 "result_restored": self.result_restored,
                 "recovery_error": self.recovery_error,
-                "source": source_state,
+                "source": {**source_state, "source_id": self.source.source_id},
                 "result": result,
             }
             if frozen is None:
@@ -358,15 +382,6 @@ class CalibrationService:
             self.generation += 1
             self.frozen = snapshot
             self.frozen_jpeg = encoded
-            self.result = None
-            self.result_payload = None
-            self.candidate_id = None
-            self.saved_candidate_id = None
-            self.candidate_points = None
-            self.result_restored = False
-            self._pending_output_file = None
-            self.recovery_error = None
-            self.output_file = None
         return self.state()
 
     def live(self) -> Dict[str, Any]:
@@ -391,65 +406,18 @@ class CalibrationService:
         if not isinstance(request, dict):
             raise ApiError(HTTPStatus.BAD_REQUEST, "Request body must be a JSON object")
         with self.lock:
-            snapshot = self.frozen
-            if snapshot is None:
-                raise ApiError(HTTPStatus.CONFLICT, "Freeze a camera frame first")
-            try:
-                generation = int(request.get("generation"))
-            except (TypeError, ValueError) as error:
-                raise ApiError(HTTPStatus.BAD_REQUEST, "generation must be an integer") from error
-            if generation != self.generation:
-                raise ApiError(
-                    HTTPStatus.CONFLICT,
-                    "Frozen frame changed; clear the browser selection and try again",
-                )
-            points = request.get("points")
-            if not isinstance(points, list) or len(points) < 4:
-                raise ApiError(
-                    HTTPStatus.BAD_REQUEST,
-                    "At least four marker-to-pixel correspondences are required",
-                )
-            if len(points) > len(snapshot.markers):
-                raise ApiError(HTTPStatus.BAD_REQUEST, "More points than available markers")
-
-            seen = set()
-            marker_names = []
-            world = []
-            pixels = []
-            for index, item in enumerate(points):
-                if not isinstance(item, dict):
-                    raise ApiError(
-                        HTTPStatus.BAD_REQUEST,
-                        "points[{}] must be an object".format(index),
-                    )
-                marker_name = item.get("marker")
-                if not isinstance(marker_name, str) or marker_name not in snapshot.markers:
-                    raise ApiError(
-                        HTTPStatus.BAD_REQUEST,
-                        "points[{}] references an unavailable marker".format(index),
-                    )
-                if marker_name in seen:
-                    raise ApiError(
-                        HTTPStatus.BAD_REQUEST,
-                        "Marker '{}' is selected more than once".format(marker_name),
-                    )
-                pixel = _finite_pixel(item.get("pixel"), "points[{}].pixel".format(index))
-                if not (0.0 <= pixel[0] < snapshot.width and 0.0 <= pixel[1] < snapshot.height):
-                    raise ApiError(
-                        HTTPStatus.BAD_REQUEST,
-                        "points[{}].pixel is outside the frozen image".format(index),
-                    )
-                seen.add(marker_name)
-                marker_names.append(marker_name)
-                world.append(snapshot.markers[marker_name].position)
-                pixels.append(pixel)
+            points, model, coordinates = self.samples.solve_inputs(request)
+            world = [point["world"] for point in points]
+            pixels = [point["pixel"] for point in points]
+            matrix = np.asarray(model["camera_matrix"], dtype=np.float64).reshape(3, 3)
+            distortion = np.asarray(model["distortion"], dtype=np.float64)
 
             try:
                 result = solve_extrinsic(
                     world,
                     pixels,
-                    snapshot.camera_matrix,
-                    snapshot.distortion,
+                    matrix,
+                    distortion,
                     ransac_reprojection_error_px=self.ransac_threshold_px,
                     maximum_accepted_error_px=self.maximum_inlier_error_px,
                 )
@@ -457,37 +425,22 @@ class CalibrationService:
                 raise ApiError(HTTPStatus.UNPROCESSABLE_ENTITY, str(error)) from error
 
             inliers = set(map(int, result.inlier_indices))
-            persisted_points = []
-            for index, (name, pixel, position) in enumerate(zip(marker_names, pixels, world)):
-                persisted_points.append(
-                    {
-                        "marker": name,
-                        "pixel": list(map(float, pixel)),
-                        "world": list(map(float, position)),
-                        **({"source_world": list(snapshot.markers[name].source_position)}
-                           if snapshot.markers[name].source_position is not None else {}),
-                        "inlier": index in inliers,
-                        "reprojection_error_px": float(result.reprojection_errors_px[index]),
-                    }
-                )
-            all_names = sorted(snapshot.markers)
-            all_world = np.asarray(
-                [snapshot.markers[name].position for name in all_names], dtype=np.float64
-            )
-            payload = _result_payload(
-                result,
-                all_names,
-                all_world,
-                np.asarray(snapshot.camera_matrix, dtype=np.float64),
-                np.asarray(snapshot.distortion, dtype=np.float64),
-            )
-            payload["points"] = persisted_points
-            payload["camera_model"] = dict(snapshot.camera_model)
-            payload["pose_coordinates"] = dict(snapshot.pose_coordinates)
+            persisted_points = [dict(point, inlier=index in inliers,
+                reprojection_error_px=float(result.reprojection_errors_px[index]))
+                for index, point in enumerate(points)]
+            payload = _result_payload(result, [point["sample_id"] for point in points],
+                                      np.asarray(world, dtype=np.float64), matrix, distortion)
+            by_id = {point["sample_id"]: point for point in points}
+            for projection in payload["projections"]:
+                identity = projection.pop("marker")
+                projection.update(sample_id=identity, marker=by_id[identity]["marker"])
+            payload.update(points=persisted_points, camera_model=model, pose_coordinates=coordinates,
+                           dataset_revision=self.samples.revision)
             candidate_document = {
-                "generation": self.generation,
-                "camera_model": snapshot.camera_model,
-                "pose_coordinates": snapshot.pose_coordinates,
+                "sampling_session_id": self.samples.session_id,
+                "dataset_revision": self.samples.revision,
+                "camera_model": model,
+                "pose_coordinates": coordinates,
                 "points": persisted_points,
                 "translation": payload["translation"],
                 "quaternion_xyzw": payload["quaternion_xyzw"],
@@ -508,6 +461,11 @@ class CalibrationService:
             self.candidate_id = candidate_id
             self.saved_candidate_id = None
             self.candidate_points = persisted_points
+            self.candidate_metadata = json.loads(json.dumps({
+                "camera_model": model, "pose_coordinates": coordinates,
+                "sampling_session_id": self.samples.session_id, "dataset_revision": self.samples.revision,
+                "image_topic": self.source.image_topic, "pose_prefix": self.source.pose_prefix,
+            }, allow_nan=False))
             if (
                 self._pending_output_file is not None
                 and self._pending_output_file[0] != candidate_id
@@ -554,12 +512,12 @@ class CalibrationService:
             if identity != self.candidate_id:
                 raise ApiError(
                     HTTPStatus.CONFLICT,
-                    "Extrinsic candidate changed; solve the frozen correspondences again",
+                    "Extrinsic candidate changed; solve the current samples again",
                     details={"expected_candidate_id": self.candidate_id},
                 )
-            snapshot = self.frozen
-            if snapshot is None:
-                raise ApiError(HTTPStatus.CONFLICT, "Frozen frame is unavailable")
+            metadata = self.candidate_metadata
+            if metadata is None or metadata["dataset_revision"] != self.samples.revision:
+                raise ApiError(HTTPStatus.CONFLICT, "Candidate samples are unavailable")
             try:
                 pending = self._pending_output_file
                 output_file = pending[1] if pending is not None and pending[0] == identity else None
@@ -574,14 +532,11 @@ class CalibrationService:
                         child_frame=self.child_frame,
                         points=self.candidate_points,
                         metadata={
-                            **({"pose_coordinates": dict(snapshot.pose_coordinates)} if snapshot.pose_coordinates else {}),
+                            **metadata,
                             "candidate_id": identity,
-                            "image_topic": self.source.image_topic,
-                            "intrinsic_file": snapshot.camera_model.get("intrinsic_file", ""),
-                            "camera_model": snapshot.camera_model,
-                            "pose_prefix": self.source.pose_prefix,
-                            "image_width": snapshot.width,
-                            "image_height": snapshot.height,
+                            "intrinsic_file": metadata["camera_model"].get("intrinsic_file", ""),
+                            "image_width": metadata["camera_model"]["image_width"],
+                            "image_height": metadata["camera_model"]["image_height"],
                             "web_calibrator": True,
                         },
                     )
@@ -831,6 +786,11 @@ class CalibrationRequestHandler(BaseHTTPRequestHandler):
         request_url = urlsplit(self.path)
         path = request_url.path
         if self.command in ("GET", "HEAD"):
+            image_match = IMAGE_PATH.fullmatch(path)
+            if image_match:
+                payload, mime = self._extrinsic().samples.image(image_match[1])
+                self._send_bytes(200, mime, payload)
+                return
             if path == "/healthz":
                 payload: Dict[str, Any] = {"status": "ok"}
                 if self.calibration_server.service is not None:
@@ -900,7 +860,49 @@ class CalibrationRequestHandler(BaseHTTPRequestHandler):
                 return
             raise ApiError(HTTPStatus.NOT_FOUND, "Route not found")
         if self.command == "POST":
+            image_match = IMAGE_PATH.fullmatch(path)
+            if image_match:
+                mime = self.headers.get("Content-Type", "").strip().lower()
+                if mime not in ("image/png", "image/jpeg"):
+                    raise ApiError(415, "Sample image must be PNG or JPEG")
+                try:
+                    length = int(self.headers.get("Content-Length", "-1"))
+                except ValueError as error:
+                    raise ApiError(400, "Invalid Content-Length") from error
+                if length < 0 or length > IMAGE_BYTES:
+                    self.close_connection = True
+                    raise ApiError(413, "Sample image exceeds the byte limit")
+                previous_timeout = self.connection.gettimeout()
+                deadline = time.monotonic() + 30.0
+                try:
+                    chunks, remaining = [], length
+                    while remaining:
+                        budget = deadline - time.monotonic()
+                        if budget <= 0:
+                            raise TimeoutError("sample upload deadline")
+                        self.connection.settimeout(budget)
+                        chunk = self.rfile.read1(min(65536, remaining))
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                        remaining -= len(chunk)
+                    payload = b"".join(chunks)
+                except (socket.timeout, TimeoutError) as error:
+                    self.close_connection = True
+                    raise ApiError(408, "Sample image upload timed out") from error
+                finally:
+                    self.connection.settimeout(previous_timeout)
+                if len(payload) != length:
+                    raise ApiError(400, "Sample image body is incomplete")
+                self._send_json(200, self._extrinsic().commit_sample(image_match[1], payload, mime))
+                return
             request = self._request_json()
+            if path == "/api/v1/samples/begin":
+                self._send_json(200, self._extrinsic().begin_sample(request))
+                return
+            if path in {"/api/v1/samples/" + action for action in ("cancel", "remove", "pixel", "clear")}:
+                self._send_json(200, self._extrinsic().mutate_sample(path.rsplit("/", 1)[1], request))
+                return
             if path == "/api/v1/freeze":
                 if request not in ({}, None):
                     raise ApiError(HTTPStatus.BAD_REQUEST, "Freeze request must be an empty object")

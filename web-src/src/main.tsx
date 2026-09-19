@@ -269,7 +269,7 @@ function ExtrinsicPage() {
               </div>
               <div className="calibration-viewer-meta">
                 <span id="frame-meta">No frame</span>
-                <span id="coordinate-hint">Freeze a camera frame before selecting points.</span>
+                <span id="coordinate-hint">Keep the camera fixed; hold the rigid body still at each click.</span>
               </div>
             </Panel>
           )}
@@ -277,9 +277,9 @@ function ExtrinsicPage() {
             <Panel bodyLayout="column" className="calibration-controls-panel" fill padding="none" title="Calibration steps">
               <ScrollRegion className="calibration-controls" fill>
                 <section className="calibration-control-section">
-                  <SectionHeader title="1. Capture" />
+                  <SectionHeader title="1. View camera" />
                   <div className="calibration-actions">
-                    <Button id="freeze-button" className="calibration-action" tone="primary" appearance="solid">Freeze frame</Button>
+                    <Button id="freeze-button" className="calibration-action" tone="primary" appearance="solid">Pause image</Button>
                     <Button id="live-button" className="calibration-action">Live</Button>
                   </div>
                 </section>
@@ -288,9 +288,9 @@ function ExtrinsicPage() {
                   <SectionHeader title="2. Match markers" />
                   <FormField
                     label="Marker assigned to next click"
-                    description="Select a marker, then click its center in the image. Each marker can be used once."
+                    description="Select a rigid body and click its coordinate origin. Move it between clicks; hold it still at each click. The same body can provide multiple samples."
                   >
-                    <Select id="marker-select" disabled><option>Freeze a frame first</option></Select>
+                    <Select id="marker-select" disabled><option>Select a rigid body</option></Select>
                   </FormField>
                   <div className="calibration-actions">
                     <Button id="remove-button" className="calibration-action" disabled>Remove last</Button>
@@ -298,8 +298,8 @@ function ExtrinsicPage() {
                   </div>
                   <DataTable className="calibration-table">
                     <table>
-                      <thead><tr><th>Marker</th><th>u</th><th>v</th><th>Error</th></tr></thead>
-                      <tbody id="points-body"><tr><td colSpan={4} className="empty">No correspondences</td></tr></tbody>
+                      <thead><tr><th>Marker</th><th>u</th><th>v</th><th>Error</th><th>Actions</th></tr></thead>
+                      <tbody id="points-body"><tr><td colSpan={5} className="empty">No correspondences</td></tr></tbody>
                     </table>
                   </DataTable>
                 </section>
@@ -310,7 +310,7 @@ function ExtrinsicPage() {
                     <Button id="solve-button" className="calibration-action" tone="primary" appearance="solid" disabled>Solve</Button>
                     <Button id="save-button" className="calibration-action" tone="primary" appearance="solid" disabled>Save result</Button>
                   </div>
-                  <LegacyCodeResult id="result-box" initial="Select at least four markers." />
+                  <LegacyCodeResult id="result-box" initial="Collect at least four independent correspondences." />
                 </section>
 
                 <details className="calibration-details">
