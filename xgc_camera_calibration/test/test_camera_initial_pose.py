@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 
 import math
+import importlib.util
+import json
+from unittest.mock import patch
 import tempfile
 import unittest
 from pathlib import Path
@@ -74,6 +77,34 @@ class CameraInitialPoseTest(unittest.TestCase):
             )
             self.assertFalse(any("e" in value.lower() for value in tiny))
             self.assertIn("roll:=-0.00000000000072", tiny)
+
+    def test_resolved_wrapper_passes_same_bytes_to_estimate_and_spawns_optical_pose_once(self):
+        from xgc_camera_calibration.extrinsic_resolver import resolve_selection, encode_frozen
+        script = Path(__file__).parents[1] / "scripts" / "gazebo_camera_from_extrinsic.py"
+        spec = importlib.util.spec_from_file_location("camera_wrapper", script)
+        wrapper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(wrapper)
+        roles = {"parentFrame": "world", "opticalFrames": {"sim": "sim_optical", "phy": "phy_optical"}}
+        with tempfile.TemporaryDirectory() as root:
+            choice = {"mode": "pose", "pose": {"convention": "world_T_camera_optical",
+                "translation": [1., 2., 3.], "quaternionXyzw": [0., 0., 0., 1.],
+                "coordinates": {"schemaVersion": 1, "kind": "experiment-world", "frame": "world", "savedWorldOffset": [4., 0., 0.]}}}
+            frozen = encode_frozen(resolve_selection(root, "usb_cam", choice,
+                {"frame": "world", "worldOffset": [10., 0., 0.]}, roles))
+            argv = ["--pose-source", "resolved", "--calibration-root", root, "--camera-name", "usb_cam",
+                "--parent-frame", "world", "--optical-frame", "sim_optical", "--selected-physical-optical-frame", "phy_optical",
+                "--optical-offset-x", ".067", "--optical-offset-y", "0", "--optical-offset-z", "0",
+                "--resolved-extrinsic-json", frozen, "--frame-roles-json", json.dumps(roles), "--",
+                "/opt/ros/noetic/bin/roslaunch", "gazebo_sim_camera", "static_camera.launch",
+                "x:=0", "y:=0", "z:=0", "roll:=0", "pitch:=0", "yaw:=0"]
+            with patch.object(wrapper.os, "execv") as execute:
+                wrapper.main(argv)
+            launch = execute.call_args[0][1]
+            values = dict(item.split(":=", 1) for item in launch if ":=" in item)
+            self.assertEqual(values["resolved_extrinsic_json"], frozen)
+            self.assertAlmostEqual(float(values["x"]), 7.)
+            self.assertAlmostEqual(float(values["y"]), 2.)
+            self.assertAlmostEqual(float(values["z"]), 2.933)
 
     def test_fails_closed_without_complete_launch_args(self):
         with self.assertRaisesRegex(CalibrationError, "exactly one yaw"):

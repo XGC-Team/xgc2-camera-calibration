@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import hashlib
 from pathlib import Path
 from typing import Dict, Iterable, List, Sequence, Tuple
 
@@ -15,6 +16,7 @@ from .transforms import (
     quaternion_to_rotation_matrix,
     rotation_matrix_to_rpy,
     split_parent_to_optical_pose,
+    _rpy_matrix, link_to_optical_rotation,
 )
 
 
@@ -146,3 +148,26 @@ def _require_world_optical_document(
         raise CalibrationError(
             "extrinsic optical frame does not match the simulation camera"
         )
+
+
+def legacy_selection_choice(root, camera_name, source, file_name, pose, target):
+    """Preserve an old authored selection at the one finite resolver boundary."""
+    from .extrinsic_selection import closed_object, finite_vector, validate_storage
+    from .solver import rotation_matrix_to_quaternion
+    validate_storage(root, camera_name)
+    if source == "file":
+        path = authored_gazebo_extrinsic_path(root, camera_name, file_name)
+        return {"mode": "version", "result": {"sourceMode": path.parent.parent.name,
+            "fileName": path.name, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}}
+    if source != "authored":
+        raise CalibrationError("legacy pose source must be authored or file")
+    names = ("x", "y", "z", "roll", "pitch", "yaw")
+    closed_object(pose, set(names), "legacy camera link pose")
+    values = finite_vector([pose[name] for name in names], 6, "legacy camera link pose")
+    rotation = _rpy_matrix(*values[3:])
+    translation = (rotation.dot((0.067, 0., 0.)) + values[:3]).tolist()
+    quaternion = rotation_matrix_to_quaternion(rotation.dot(link_to_optical_rotation())).tolist()
+    return {"mode": "pose", "pose": {"convention": "world_T_camera_optical",
+        "translation": translation, "quaternionXyzw": quaternion,
+        "coordinates": {"schemaVersion": 1, "kind": "experiment-world", "frame": "world",
+                        "savedWorldOffset": list(target["worldOffset"])}}}

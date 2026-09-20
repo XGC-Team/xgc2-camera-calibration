@@ -17,6 +17,8 @@ from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import CompressedImage, Image
 
 from xgc_camera_calibration.pose_freshness import pose_is_fresh
+from xgc_camera_calibration.extrinsic_application import application_arguments, parse_frame_roles
+from xgc_camera_calibration.extrinsic_resolver import decode_frozen
 from xgc_camera_calibration.extrinsic_samples import image_dimensions
 
 from xgc_camera_calibration.web_service import (
@@ -53,12 +55,14 @@ class RosCalibrationSource:
         camera_name,
         snapshot_client=None,
         snapshot_available=False,
+        frozen_extrinsic=None,
     ):
         self.pose_coordinate_source = str(rospy.get_param("~pose_coordinate_source", "unspecified"))
         if self.pose_coordinate_source not in ("unspecified", "raw-vrpn", "experiment-world"):
             raise ValueError("invalid pose coordinate source")
-        self.pose_world_offset = tuple(float(rospy.get_param("~pose_world_offset_" + axis, 0.0))
-                                       for axis in ("x", "y", "z"))
+        if frozen_extrinsic is None:
+            raise ValueError("calibration source requires its frozen camera context")
+        self.pose_world_offset = tuple(frozen_extrinsic["targetCoordinates"]["worldOffset"])
         self.lock = threading.RLock()
         self.snapshot_client = snapshot_client
         self.snapshot_available = bool(snapshot_available)
@@ -419,6 +423,7 @@ def split_list_parameter(value):
 
 
 def main():
+    args = application_arguments(rospy.myargv()[1:], with_state_parameter=True)
     rospy.init_node("xgc_camera_extrinsic_calibrator_web")
     try:
         media_edge_address = str(rospy.get_param("~media_edge_address", "")).strip()
@@ -451,6 +456,8 @@ def main():
             camera_name,
             snapshot_client=snapshot_client,
             snapshot_available=snapshot_available,
+            frozen_extrinsic=decode_frozen(args.resolved_extrinsic_json, camera_name,
+                                          parse_frame_roles(args.frame_roles_json)),
         )
         package_root = Path(rospkg.RosPack().get_path("xgc_camera_calibration"))
         web_root = Path(rospy.get_param("~web_root", str(package_root / "web" / "extrinsic")))
@@ -466,7 +473,15 @@ def main():
                 rospy.get_param("~maximum_inlier_error_px", 10.0)
             ),
             jpeg_quality=int(rospy.get_param("~jpeg_quality", 80)),
+            resolved_extrinsic_json=args.resolved_extrinsic_json,
+            frame_roles_json=args.frame_roles_json,
+            application_state_reader=lambda: rospy.get_param(args.application_state_param, None),
         )
+        frozen_offset = service.frozen_extrinsic["targetCoordinates"]["worldOffset"]
+        if source.pose_coordinate_source == "unspecified" or list(source.pose_world_offset) != frozen_offset:
+            raise ValueError("calibration sample coordinates must match the frozen camera context")
+        if not args.application_state_param.startswith("/"):
+            raise ValueError("application state parameter must be an absolute controlled name")
         bind_address = str(rospy.get_param("~bind_address", "127.0.0.1"))
         http_port = int(rospy.get_param("~http_port", 8765))
         if not 1 <= http_port <= 65535:

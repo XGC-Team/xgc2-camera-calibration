@@ -13,7 +13,7 @@ from dataclasses import dataclass, field, replace
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple, cast
 from urllib.parse import parse_qs, urlsplit
 
 import cv2
@@ -23,15 +23,16 @@ from xgc_camera_calibration.solver import (
     CalibrationError,
     ExtrinsicResult,
     extrinsic_calibration_directory,
-    load_extrinsic_selection,
     save_extrinsic,
     solve_extrinsic,
     versioned_extrinsic_path,
-    write_extrinsic_selection,
 )
 
 
 from xgc_camera_calibration.extrinsic_samples import ApiError, SampleCollection, IMAGE_BYTES, IMAGE_PATH
+from xgc_camera_calibration.extrinsic_application import SavedExtrinsicApplication, parse_frame_roles
+from xgc_camera_calibration.extrinsic_resolver import decode_frozen
+from xgc_camera_calibration.extrinsic_selection import SelectionConflict, read_version
 
 
 @dataclass(frozen=True)
@@ -179,12 +180,31 @@ class CalibrationService:
         ransac_threshold_px: float = 3.0,
         maximum_inlier_error_px: float = 10.0,
         jpeg_quality: int = 80,
+        resolved_extrinsic_json: Optional[str] = None,
+        frame_roles_json: Optional[str] = None,
+        application_state_reader: Optional[Callable] = None,
     ):
         if not parent_frame or not child_frame:
             raise ValueError("parent_frame and child_frame must not be empty")
         if not 1 <= int(jpeg_quality) <= 100:
             raise ValueError("jpeg_quality must be between 1 and 100")
         self.source = source
+        self.frozen_extrinsic = None
+        self.frame_roles = None
+        self.application = None
+        self._application_factory = None
+        if resolved_extrinsic_json is not None:
+            self.frame_roles = parse_frame_roles(frame_roles_json)
+            self.frozen_extrinsic = decode_frozen(resolved_extrinsic_json, camera_name, self.frame_roles)
+            if (parent_frame != self.frame_roles["parentFrame"]
+                    or child_frame != self.frame_roles["opticalFrames"].get(calibration_mode)):
+                raise ValueError("calibrator frames do not match the controlled camera roles")
+            if application_state_reader is None:
+                raise ValueError("the exact camera publisher state reader is required")
+            self._application_factory = lambda: SavedExtrinsicApplication(
+                calibration_root, camera_name, resolved_extrinsic_json, self.frame_roles,
+                application_state_reader)
+            self.application = self._application_factory()
         self.output_directory = extrinsic_calibration_directory(
             calibration_root, calibration_mode, camera_name
         )
@@ -226,6 +246,7 @@ class CalibrationService:
         self._pending_output_file = None
         self.recovery_error = None
         self.output_file = None
+        self.application = self._application_factory() if self._application_factory else None
 
     def begin_sample(self, request):
         return self.samples.begin(request)
@@ -239,17 +260,14 @@ class CalibrationService:
         return self.state()
 
     def _restore_selected_result(self) -> None:
-        restored = load_extrinsic_selection(
-            str(self.output_directory.parents[1]), self.calibration_mode, self.camera_name
-        )
-        if restored is None:
+        # Restore the exact frozen version only. A new global application or an
+        # old mode-specific pointer cannot retarget this running calibration UI.
+        if self.frozen_extrinsic is None or "result" not in self.frozen_extrinsic:
             return
-        output_file, document, selection = restored
-        if (
-            document.get("parent_frame") != self.parent_frame
-            or document.get("child_frame") != self.child_frame
-        ):
-            raise CalibrationError("selected extrinsic frame identity does not match")
+        ref = self.frozen_extrinsic["result"]
+        document = read_version(str(self.output_directory.parents[1]), self.camera_name,
+                                ref, self.frame_roles)
+        output_file = self.output_directory.parents[1] / ref["sourceMode"] / self.camera_name / ref["fileName"]
         metadata = document.get("metadata", {})
         if not isinstance(metadata, Mapping):
             raise CalibrationError("selected extrinsic metadata must be an object")
@@ -260,7 +278,9 @@ class CalibrationService:
         warnings = document.get("warnings", [])
         if not isinstance(inliers, list) or not isinstance(warnings, list):
             raise CalibrationError("selected extrinsic diagnostics are invalid")
-        candidate_id = str(selection["candidate_id"])
+        candidate_id = str(metadata.get("candidate_id", ""))
+        if not candidate_id:
+            raise CalibrationError("selected result has no calibration candidate identity")
         self.output_file = str(output_file)
         self.candidate_id = candidate_id
         self.saved_candidate_id = candidate_id
@@ -268,7 +288,7 @@ class CalibrationService:
         self.result_payload = {
             "candidate_id": candidate_id,
             "saved": True,
-            "translation": [float(value) for value in document["translation_array"]],
+            "translation": list(self.frozen_extrinsic["resolvedOpticalPose"]["translation"]),
             "quaternion_xyzw": [
                 float(value) for value in document["quaternion_xyzw_array"]
             ],
@@ -288,7 +308,7 @@ class CalibrationService:
             "selection_file": str(
                 self.output_directory.parents[1]
                 / "selections" / self.camera_name
-                / "{}-extrinsic.json".format(self.calibration_mode)
+                / "extrinsic.json"
             ),
         }
         if metadata.get("candidate_id") != candidate_id:
@@ -308,6 +328,11 @@ class CalibrationService:
         with self.lock:
             frozen = self.frozen
             result = self.result_payload
+            if result is not None and self.application is not None and self.application.request is not None:
+                try:
+                    result = {**result, "application": self.application.status()}
+                except (OSError, ValueError, CalibrationError) as error:
+                    result = {**result, "application": {"status": "unavailable", "error": str(error)}}
             payload: Dict[str, Any] = {
                 **self.samples.state(),
                 "mode": "frozen" if frozen is not None else "live",
@@ -480,31 +505,8 @@ class CalibrationService:
         with self.lock:
             if self.saved_candidate_id is not None:
                 if identity == self.saved_candidate_id and self.result_payload is not None:
-                    try:
-                        selected = load_extrinsic_selection(
-                            str(self.output_directory.parents[1]),
-                            self.calibration_mode,
-                            self.camera_name,
-                        )
-                    except Exception as error:
-                        raise ApiError(
-                            HTTPStatus.CONFLICT,
-                            "Shared extrinsic selection is no longer valid: {}".format(error),
-                        ) from error
-                    if selected is None:
-                        raise ApiError(
-                            HTTPStatus.CONFLICT,
-                            "Shared extrinsic selection is no longer available",
-                        )
-                    if (
-                        str(selected[2]["candidate_id"]) != identity
-                        or self.output_file is None
-                        or selected[0] != Path(self.output_file).resolve()
-                    ):
-                        raise ApiError(
-                            HTTPStatus.CONFLICT,
-                            "A newer shared extrinsic selection superseded this candidate",
-                        )
+                    if not self.result_restored:
+                        self._stage_saved_result(identity)
                     return dict(self.result_payload)
                 raise ApiError(HTTPStatus.CONFLICT, "A different extrinsic candidate is already saved")
             if self.result is None or self.result_payload is None or self.candidate_points is None:
@@ -518,6 +520,13 @@ class CalibrationService:
             metadata = self.candidate_metadata
             if metadata is None or metadata["dataset_revision"] != self.samples.revision:
                 raise ApiError(HTTPStatus.CONFLICT, "Candidate samples are unavailable")
+            if self.frozen_extrinsic is not None:
+                coordinates = metadata.get("pose_coordinates", {})
+                target = self.frozen_extrinsic["targetCoordinates"]
+                if (coordinates.get("kind") != "experiment-world"
+                        or coordinates.get("frame") != target["frame"]
+                        or list(coordinates.get("world_offset", [])) != target["worldOffset"]):
+                    raise ApiError(HTTPStatus.CONFLICT, "Sample coordinates do not match the frozen camera context")
             try:
                 pending = self._pending_output_file
                 output_file = pending[1] if pending is not None and pending[0] == identity else None
@@ -541,17 +550,10 @@ class CalibrationService:
                         },
                     )
                     self._pending_output_file = (identity, output_file)
-                selection_file = write_extrinsic_selection(
-                    str(self.output_directory.parents[1]),
-                    self.calibration_mode,
-                    self.camera_name,
-                    output_file,
-                    identity,
-                )
             except (OSError, ValueError, CalibrationError) as error:
                 raise ApiError(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
-                    "Could not save or select calibration result: {}".format(error),
+                    "Could not save calibration result: {}".format(error),
                 ) from error
             self.output_file = str(output_file)
             self.saved_candidate_id = identity
@@ -559,13 +561,31 @@ class CalibrationService:
                 **self.result_payload,
                 "saved": True,
                 "output_file": self.output_file,
-                "selection_file": str(selection_file),
+                "selection_file": str(self.output_directory.parents[1] / "selections" / self.camera_name / "extrinsic.json") if self.application else None,
                 "save_blocked": None,
             }
             self.result_restored = False
             self._pending_output_file = None
             self.recovery_error = None
+            self._stage_saved_result(identity)
             return dict(self.result_payload)
+
+    def _stage_saved_result(self, identity):
+        if self.application is None:
+            # Library-only capture sessions may save immutable results, but
+            # cannot claim that any producer has applied them.
+            self.result_payload["application"] = {"status": "unavailable"}
+            return
+        try:
+            self.result_payload["application"] = self.application.stage(
+                Path(self.output_file), self.calibration_mode, identity)
+        except SelectionConflict as error:
+            self.result_payload["application"] = {"status": "conflict"}
+            raise ApiError(HTTPStatus.CONFLICT, "Camera application was superseded") from error
+        except (OSError, ValueError, CalibrationError) as error:
+            self.result_payload["application"] = {"status": "unavailable"}
+            raise ApiError(HTTPStatus.SERVICE_UNAVAILABLE,
+                "Calibration is saved; application is unavailable: {}".format(error)) from error
 
 
 class CalibrationHttpServer(ThreadingHTTPServer):
@@ -614,7 +634,7 @@ class CalibrationRequestHandler(BaseHTTPRequestHandler):
 
     @property
     def calibration_server(self) -> CalibrationHttpServer:
-        return self.server  # type: ignore[return-value]
+        return cast(CalibrationHttpServer, self.server)
 
     def log_message(self, format_string: str, *args: Any) -> None:
         self.calibration_server.logger(format_string % args)

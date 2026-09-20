@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-
+"""Publish one frozen camera pose; acknowledge only this Run's exact saves."""
 import sys
 import math
 import time
@@ -8,11 +8,8 @@ import rospy
 import tf2_ros
 from geometry_msgs.msg import TransformStamped
 
-from xgc_camera_calibration.extrinsic_file_watcher import ExtrinsicSelectionWatcher
-from xgc_camera_calibration.extrinsic_coordinates import optical_translation_in_world
-from xgc_camera_calibration.solver import (
-    extrinsic_calibration_directory,
-    load_extrinsic,
+from xgc_camera_calibration.extrinsic_application import (
+    ExtrinsicApplication, application_arguments, parse_frame_roles,
 )
 from xgc_camera_calibration.transforms import split_parent_to_optical_pose
 
@@ -29,63 +26,6 @@ def make_transform(parent_frame, child_frame, translation, quaternion):
     message.transform.rotation.z = float(quaternion[2])
     message.transform.rotation.w = float(quaternion[3])
     return message
-
-
-def load_transform_chain(
-    extrinsic_file,
-    calibration_mode,
-    camera_name,
-    expected_parent_frame=None,
-    expected_optical_frame=None,
-    document=None,
-):
-    document = load_extrinsic(extrinsic_file) if document is None else dict(document)
-    if document["calibration_mode"] != calibration_mode:
-        raise ValueError("extrinsic calibration mode does not match the requested storage identity")
-    if document["camera_name"] != camera_name:
-        raise ValueError("extrinsic camera name does not match the requested storage identity")
-    if expected_parent_frame and document.get("parent_frame") != expected_parent_frame:
-        raise ValueError("extrinsic source parent frame does not match")
-    if expected_optical_frame and document.get("child_frame") != expected_optical_frame:
-        raise ValueError("extrinsic source optical frame does not match")
-    parent_frame = rospy.get_param("~parent_frame", document.get("parent_frame", "map"))
-    optical_frame = rospy.get_param(
-        "~optical_frame", document.get("child_frame", "usb_cam_optical_frame")
-    )
-    if expected_parent_frame and parent_frame != expected_parent_frame:
-        raise ValueError("extrinsic output parent frame cannot relabel the selected source frame")
-    if expected_optical_frame and optical_frame != expected_optical_frame:
-        raise ValueError("extrinsic output optical frame cannot relabel the selected source frame")
-    camera_link_frame = rospy.get_param("~camera_link_frame", "usb_cam_link")
-    offsets = tuple(
-        float(rospy.get_param("~{}_offset".format(axis), 0.0)) for axis in ("x", "y", "z")
-    )
-    offset_mode = str(rospy.get_param("~world_offset_mode", "stored"))
-    if offset_mode not in ("stored", "rebase"):
-        raise ValueError("world_offset_mode must be stored or rebase")
-    optical_translation = optical_translation_in_world(document, offsets if offset_mode == "rebase" else None)
-    chain = split_parent_to_optical_pose(
-        optical_translation,
-        document["quaternion_xyzw_array"],
-        tuple(
-            float(rospy.get_param("~link_to_optical_{}".format(axis), 0.0))
-            for axis in ("x", "y", "z")
-        ),
-    )
-    return (
-        make_transform(
-            parent_frame,
-            camera_link_frame,
-            chain["parent_t_link"],
-            chain["parent_q_link_xyzw"],
-        ),
-        make_transform(
-            camera_link_frame,
-            optical_frame,
-            chain["link_t_optical"],
-            chain["link_q_optical_xyzw"],
-        ),
-    )
 
 
 def default_transform_chain(
@@ -122,229 +62,84 @@ def default_transform_chain(
     )
 
 
-def wait_for_transform_chain(
-    extrinsic_directory,
-    calibration_mode,
-    camera_name,
-    watcher,
-    wait_for_file,
-    poll_interval,
-    expected_parent_frame=None,
-    expected_optical_frame=None,
-    default_transforms=None,
-):
-    announced_wait = False
-    while not rospy.is_shutdown():
-        try:
-            result_revision = watcher.next_revision()
-            if result_revision is not None:
-                return (
-                    load_transform_chain(
-                        result_revision.path, calibration_mode, camera_name,
-                        expected_parent_frame, expected_optical_frame,
-                        result_revision.document,
-                    ),
-                    result_revision.path,
-                )
-            if not wait_for_file:
-                if default_transforms is None:
-                    raise RuntimeError("calibration asset does not exist")
-                return default_transforms, None
-            if not announced_wait:
-                rospy.loginfo(
-                    "Waiting for a newly solved camera extrinsic under %s",
-                    extrinsic_directory,
-                )
-                announced_wait = True
-        except Exception as error:
-            if not wait_for_file:
-                raise
-            # A damaged/replaced selection must not terminate a running broadcaster.
-            rospy.set_param("~extrinsic_update_error", str(error))
-            rospy.logwarn_throttle(5.0, "Ignoring unavailable camera extrinsic: %s", error)
-        # Save is a wall-clock action, including while Gazebo /clock is paused.
-        time.sleep(poll_interval)
-    return None
+def frozen_transform_chain(frozen, parent_frame, camera_link_frame, optical_frame,
+                           link_offset):
+    pose = frozen["resolvedOpticalPose"]
+    return default_transform_chain(parent_frame, camera_link_frame, optical_frame,
+        pose["translation"], pose["quaternionXyzw"], link_to_optical_translation=link_offset)
 
 
-def log_transform_chain(extrinsic_file, transforms):
-    previous = rospy.get_param("~active_extrinsic_file", "")
-    rospy.set_param("~extrinsic_update_error", "")
-    rospy.set_param("~active_extrinsic_transition", {
-        "previous_file": previous, "file": str(extrinsic_file),
-        "applied_at_unix_sec": time.time(),
-    })
-    parent_to_link, link_to_optical = transforms
-    rospy.loginfo(
-        "Publishing camera extrinsic chain %s -> %s -> %s from %s",
-        parent_to_link.header.frame_id,
-        parent_to_link.child_frame_id,
-        link_to_optical.child_frame_id,
-        extrinsic_file,
-    )
+def publish_chain(transforms, broadcaster, optical_broadcaster=None):
+    stamp = rospy.Time.now()
+    for transform in transforms:
+        transform.header.stamp = stamp
+    if optical_broadcaster is None:
+        broadcaster.sendTransform(list(transforms))
+    else:
+        optical_broadcaster.sendTransform(transforms[1])
+        broadcaster.sendTransform(transforms[0])
 
 
 def main():
+    args = application_arguments(rospy.myargv()[1:])
     rospy.init_node("xgc_camera_extrinsic_tf")
     try:
-        calibration_root = str(rospy.get_param("~calibration_root")).strip()
-        calibration_mode = str(rospy.get_param("~calibration_mode")).strip()
+        root = str(rospy.get_param("~calibration_root")).strip()
+        mode = str(rospy.get_param("~calibration_mode")).strip()
         camera_name = str(rospy.get_param("~camera_name")).strip()
-        selection_source = str(
-            rospy.get_param("~selection_source", "authored")
-        ).strip()
-        if selection_source not in ("authored", "physical-selection"):
-            raise ValueError("selection_source must be authored or physical-selection")
-        selected_mode = "phy" if selection_source == "physical-selection" else calibration_mode
-        extrinsic_directory = extrinsic_calibration_directory(
-            calibration_root, selected_mode, camera_name
-        )
+        roles = parse_frame_roles(args.frame_roles_json)
+        parent = str(rospy.get_param("~parent_frame", "world"))
+        optical = str(rospy.get_param("~optical_frame", "usb_cam_optical_frame"))
+        link = str(rospy.get_param("~camera_link_frame", "usb_cam_link"))
+        if mode not in ("sim", "phy") or parent != roles["parentFrame"] or optical != roles["opticalFrames"][mode]:
+            raise ValueError("output frames do not match the controlled camera roles")
+        link_offset = tuple(float(rospy.get_param("~link_to_optical_" + axis, 0.0)) for axis in ("x", "y", "z"))
+        if not all(math.isfinite(value) for value in link_offset):
+            raise ValueError("camera link offset must be finite")
+        application = ExtrinsicApplication(root, camera_name, args.resolved_extrinsic_json, roles,
+            lambda state: rospy.set_param("~extrinsic_application_state", state))
+        frozen = application.frozen
+        # Only explicit uncalibrated auto uses the declared raw-origin identity.
+        # The target offset comes from the frozen resolver, not mutable ROS params.
+        if frozen["status"] == "uncalibrated":
+            transforms = default_transform_chain(parent, link, optical,
+                parent_offsets=frozen["targetCoordinates"]["worldOffset"],
+                link_to_optical_translation=link_offset)
+            rospy.logwarn("Publishing default camera extrinsic; no applied calibration exists")
+        else:
+            transforms = frozen_transform_chain(frozen, parent, link, optical, link_offset)
+        static = bool(rospy.get_param("~static", True))
+        rate = float(rospy.get_param("~file_poll_rate" if static else "~publish_rate", 5.0 if static else 10.0))
+        if not math.isfinite(rate) or rate <= 0:
+            raise ValueError("camera publication rate must be finite and positive")
+        broadcaster = tf2_ros.StaticTransformBroadcaster() if static else tf2_ros.TransformBroadcaster()
+        optical_broadcaster = None if static else tf2_ros.StaticTransformBroadcaster()
+        publish_chain(transforms, broadcaster, optical_broadcaster)
+        application.initial_published()
     except Exception as error:
-        rospy.logfatal("Invalid camera extrinsic storage identity: %s", error)
+        rospy.logfatal("Could not start frozen camera extrinsic publisher: %s", error)
         return 2
-    wait_for_file = bool(rospy.get_param("~wait_for_file", False))
-    require_file_update = bool(rospy.get_param("~require_file_update", False))
-    watch_file = bool(rospy.get_param("~watch_file", False))
-    if selection_source == "physical-selection" and (require_file_update or watch_file):
-        rospy.logfatal(
-            "physical-selection is frozen for one Run and requires "
-            "require_file_update=false, watch_file=false"
-        )
-        return 2
-    expected_parent_frame = str(rospy.get_param(
-        "~physical_source_parent_frame" if selection_source == "physical-selection"
-        else "~runtime_source_parent_frame",
-        "map",
-    )).strip()
-    expected_optical_frame = str(rospy.get_param(
-        "~physical_source_optical_frame" if selection_source == "physical-selection"
-        else "~runtime_source_optical_frame",
-        "usb_cam_optical_frame",
-    )).strip()
-    if require_file_update and not wait_for_file:
-        rospy.logfatal("~require_file_update requires ~wait_for_file=true")
-        return 2
-    file_poll_rate = float(rospy.get_param("~file_poll_rate", 5.0))
-    if not math.isfinite(file_poll_rate) or file_poll_rate <= 0.0:
-        rospy.logfatal("~file_poll_rate must be positive")
-        return 2
-    default_transforms = default_transform_chain(
-        str(rospy.get_param("~parent_frame", "world")).strip() or "world",
-        str(rospy.get_param("~camera_link_frame", "usb_cam_link")).strip()
-        or "usb_cam_link",
-        str(rospy.get_param("~optical_frame", "usb_cam_optical_frame")).strip()
-        or "usb_cam_optical_frame",
-        parent_offsets=tuple(
-            float(rospy.get_param("~{}_offset".format(axis), 0.0))
-            for axis in ("x", "y", "z")
-        ),
-        link_to_optical_translation=tuple(
-            float(rospy.get_param("~link_to_optical_{}".format(axis), 0.0))
-            for axis in ("x", "y", "z")
-        ),
-    )
-    watcher = ExtrinsicSelectionWatcher(
-        calibration_root,
-        selected_mode,
-        camera_name,
-        require_update=require_file_update,
-    )
-    poll_interval = 1.0 / file_poll_rate
+
+    def apply(resolved):
+        nonlocal transforms
+        candidate = frozen_transform_chain(resolved, parent, link, optical, link_offset)
+        publish_chain(candidate, broadcaster, optical_broadcaster)
+        transforms = candidate
+
     try:
-        loaded = wait_for_transform_chain(
-            extrinsic_directory,
-            selected_mode,
-            camera_name,
-            watcher,
-            wait_for_file,
-            poll_interval,
-            expected_parent_frame,
-            expected_optical_frame,
-            default_transforms=None if wait_for_file else default_transforms,
-        )
-    except Exception as error:
-        rospy.logfatal("Could not load camera extrinsic under %s: %s", extrinsic_directory, error)
-        return 1
-    if loaded is None:
-        return 0
-    transforms, extrinsic_file = loaded
-
-    static = bool(rospy.get_param("~static", True))
-    if not extrinsic_file:
-        rospy.logwarn(
-            "Publishing default camera extrinsic %s -> %s -> %s until a timestamped YAML is saved under %s",
-            transforms[0].header.frame_id,
-            transforms[0].child_frame_id,
-            transforms[1].child_frame_id,
-            extrinsic_directory,
-        )
-        rospy.set_param("~active_extrinsic_file", "")
-    if static:
-        broadcaster = tf2_ros.StaticTransformBroadcaster()
         while not rospy.is_shutdown():
-            parent_to_link, link_to_optical = transforms
-            stamp = rospy.Time.now()
-            parent_to_link.header.stamp = stamp
-            link_to_optical.header.stamp = stamp
-            broadcaster.sendTransform([parent_to_link, link_to_optical])
-            if extrinsic_file:
-                log_transform_chain(extrinsic_file, transforms)
-                rospy.set_param("~active_extrinsic_file", str(extrinsic_file))
-            if not watch_file:
-                rospy.spin()
-                return 0
-            loaded = wait_for_transform_chain(
-                extrinsic_directory,
-                selected_mode,
-                camera_name,
-                watcher,
-                True,
-                poll_interval,
-                expected_parent_frame,
-                expected_optical_frame,
-            )
-            if loaded is not None:
-                transforms, extrinsic_file = loaded
-        return 0
-
-    broadcaster = tf2_ros.TransformBroadcaster()
-    optical_broadcaster = tf2_ros.StaticTransformBroadcaster()
-    parent_to_link, link_to_optical = transforms
-    link_to_optical.header.stamp = rospy.Time.now()
-    optical_broadcaster.sendTransform(link_to_optical)
-    publish_rate = float(rospy.get_param("~publish_rate", 10.0))
-    if not math.isfinite(publish_rate) or publish_rate <= 0.0:
-        rospy.logfatal("~publish_rate must be positive and finite")
-        return 2
-    pending_transition = bool(extrinsic_file)
-    next_file_poll = time.monotonic()
-    while not rospy.is_shutdown():
-        if watch_file and time.monotonic() >= next_file_poll:
-            next_file_poll = time.monotonic() + (1.0 / file_poll_rate)
             try:
-                result_revision = watcher.next_revision()
-                if result_revision is not None:
-                    candidate_file = result_revision.path
-                    transforms = load_transform_chain(
-                        candidate_file, selected_mode, camera_name,
-                        expected_parent_frame, expected_optical_frame,
-                        result_revision.document,
-                    )
-                    extrinsic_file = candidate_file
-                    parent_to_link, link_to_optical = transforms
-                    link_to_optical.header.stamp = rospy.Time.now()
-                    optical_broadcaster.sendTransform(link_to_optical)
-                    pending_transition = True
+                application.tick(apply)
+                rospy.set_param("~extrinsic_update_error", "")
             except Exception as error:
                 rospy.set_param("~extrinsic_update_error", str(error))
-                rospy.logwarn_throttle(5.0, "Ignoring unavailable camera extrinsic: %s", error)
-        parent_to_link.header.stamp = rospy.Time.now()
-        broadcaster.sendTransform(parent_to_link)
-        if pending_transition:
-            log_transform_chain(extrinsic_file, transforms)
-            rospy.set_param("~active_extrinsic_file", str(extrinsic_file))
-            pending_transition = False
-        time.sleep(1.0 / publish_rate)
+                rospy.logwarn_throttle(5.0, "Camera application is not confirmed: %s", error)
+            if not static:
+                publish_chain(transforms, broadcaster, optical_broadcaster)
+            time.sleep(1.0 / rate)
+    finally:
+        application.ready = False
+        application.project(application.state())
     return 0
 
 

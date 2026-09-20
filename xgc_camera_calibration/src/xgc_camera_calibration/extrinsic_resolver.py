@@ -152,6 +152,9 @@ def main(argv=None):
     parser.add_argument("--target-offset-json", required=True)
     parser.add_argument("--frame-roles-json", required=True)
     parser.add_argument("--resolution-id")
+    parser.add_argument("--legacy-pose-source", choices=("authored", "file"))
+    parser.add_argument("--legacy-file", default="")
+    parser.add_argument("--legacy-link-pose-json", default="")
     args = parser.parse_args(argv)
     try:
         if len(args.selection_json.encode("utf-8")) > MAX_CHOICE_BYTES:
@@ -159,8 +162,18 @@ def main(argv=None):
         if len(args.target_offset_json.encode("utf-8")) > 1024 or len(args.frame_roles_json.encode("utf-8")) > 1024:
             raise CalibrationError("resolver context exceeds its byte limit")
         offset = closed_object(strict_json(args.target_offset_json), {"x", "y", "z"}, "target offset")
-        value = resolve_selection(args.root, args.camera, strict_json(args.selection_json),
-                                  {"frame": "world", "worldOffset": [offset[key] for key in ("x", "y", "z")]},
+        target = validate_target({"frame": "world", "worldOffset": [offset[key] for key in ("x", "y", "z")]})
+        if args.selection_json:
+            choice = strict_json(args.selection_json)
+        else:
+            from .camera_initial_pose import legacy_selection_choice
+            if len(args.legacy_link_pose_json.encode("utf-8")) > 1024:
+                raise CalibrationError("legacy camera pose exceeds its byte limit")
+            choice = legacy_selection_choice(args.root, args.camera, args.legacy_pose_source,
+                args.legacy_file,
+                strict_json(args.legacy_link_pose_json) if args.legacy_pose_source == "authored" else None,
+                target)
+        value = resolve_selection(args.root, args.camera, choice, target,
                                   strict_json(args.frame_roles_json), args.resolution_id)
         payload = encode_frozen(value)
     except (CalibrationError, OSError, ValueError, TypeError, OverflowError, RecursionError) as error:

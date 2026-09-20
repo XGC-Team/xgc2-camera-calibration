@@ -3,7 +3,6 @@
 import hashlib
 from dataclasses import replace
 import json
-import shutil
 import tempfile
 import threading
 import unittest
@@ -17,6 +16,8 @@ import cv2
 import numpy as np
 
 from xgc_camera_calibration.solver import load_extrinsic
+from xgc_camera_calibration.extrinsic_application import ExtrinsicApplication
+from xgc_camera_calibration.extrinsic_resolver import resolve_selection, encode_frozen
 from xgc_camera_calibration.extrinsic_coordinates import coordinate_provenance, optical_translation_in_world
 from xgc_camera_calibration.web_service import (
     ApiError,
@@ -54,7 +55,7 @@ class FakeSource:
         }
 
     def freeze(self, parent_frame):
-        if parent_frame != "map":
+        if parent_frame != "world":
             raise AssertionError("unexpected freeze arguments")
         return self.snapshot
 
@@ -145,7 +146,7 @@ class WebCalibrationServiceTest(unittest.TestCase):
             "marker_{:02d}".format(index + 1): MarkerObservation(
                 name="marker_{:02d}".format(index + 1),
                 position=tuple(map(float, position)),
-                frame_id="map",
+                frame_id="world",
             )
             for index, position in enumerate(self.world)
         }
@@ -156,19 +157,37 @@ class WebCalibrationServiceTest(unittest.TestCase):
             camera_matrix=self.intrinsic,
             distortion=self.distortion,
             markers=markers,
+            pose_coordinates=coordinate_provenance("experiment-world", "world", (0, 0, 0)),
         )
         self.temporary = tempfile.TemporaryDirectory()
         self.calibration_root = Path(self.temporary.name) / "calibrations"
+        self.calibration_root.mkdir()
         self.output_directory = self.calibration_root / "sim" / "usb_cam"
         self.service = CalibrationService(
             FakeSource(self.snapshot),
             calibration_root=str(self.calibration_root),
             calibration_mode="sim",
             camera_name="usb_cam",
-            parent_frame="map",
+            parent_frame="world",
             child_frame="camera_optical_frame",
             maximum_inlier_error_px=1.0,
+            **self.application_kwargs(),
         )
+
+    def application_kwargs(self, saved=None, offset=(0, 0, 0)):
+        roles = {"parentFrame": "world", "opticalFrames": {"sim": "camera_optical_frame", "phy": "camera_optical_frame"}}
+        choice = {"mode": "auto"}
+        if saved:
+            path = Path(saved["output_file"])
+            choice = {"mode": "version", "result": {"sourceMode": path.parent.parent.name,
+                "fileName": path.name, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}}
+        frozen = encode_frozen(resolve_selection(str(self.calibration_root), "usb_cam", choice,
+            {"frame": "world", "worldOffset": list(map(float, offset))}, roles))
+        owner = ExtrinsicApplication(str(self.calibration_root), "usb_cam", frozen, roles, lambda state: None)
+        owner.initial_published()
+        self.owner = owner
+        return {"resolved_extrinsic_json": frozen, "frame_roles_json": json.dumps(roles),
+                "application_state_reader": owner.state}
 
     def tearDown(self):
         self.temporary.cleanup()
@@ -231,7 +250,7 @@ class WebCalibrationServiceTest(unittest.TestCase):
                 pose_coordinate_source="raw-vrpn", pose_world_offset=(10., -5., 2.),
                 marker_receipts={name:(100.,12.34) for name in self.snapshot.markers}, pose_max_age=2.)
             source._observation_context = lambda width, height, parent: namespace["_observation_context"](source, width, height, parent)
-            result = namespace["_frame_snapshot"](source, self.snapshot.image, 12.34, "optical", "map")
+            result = namespace["_frame_snapshot"](source, self.snapshot.image, 12.34, "optical", "world")
             np.testing.assert_array_equal(result.camera_matrix, expected_k)
             np.testing.assert_array_equal(result.distortion, expected_d)
             self.assertEqual(result.camera_model, model)
@@ -244,12 +263,15 @@ class WebCalibrationServiceTest(unittest.TestCase):
 
     def test_shifted_world_pose_is_saved_and_simulation_uses_it_directly(self):
         offset = np.asarray([-8., 3., 1.])
-        provenance = coordinate_provenance("experiment-world", "map", offset)
+        provenance = coordinate_provenance("experiment-world", "world", offset)
         provenance["input_kind"] = "raw-vrpn"
         markers = {name: replace(marker, position=tuple(np.asarray(marker.position)+offset),
                                  source_position=marker.position)
                    for name, marker in self.snapshot.markers.items()}
-        self.service.source.snapshot = replace(self.snapshot, markers=markers, pose_coordinates=provenance)
+        self.service = CalibrationService(FakeSource(replace(self.snapshot, markers=markers, pose_coordinates=provenance)),
+            calibration_root=str(self.calibration_root), calibration_mode="sim", camera_name="usb_cam",
+            parent_frame="world", child_frame="camera_optical_frame", maximum_inlier_error_px=1.0,
+            **self.application_kwargs(offset=offset))
         self.service.freeze()
         request = self.point_request()
         provenance["world_offset"][0] = 999.
@@ -298,7 +320,8 @@ class WebCalibrationServiceTest(unittest.TestCase):
                 self.assertNotIn("stamp_sec", expected)
                 self.assertEqual(saved["points"][0]["pose_observation"]["source_stamp_sec"], self.snapshot.stamp_sec)
                 restored = CalibrationService(self.service.source, calibration_root=str(self.calibration_root),
-                    calibration_mode="sim", camera_name="usb_cam", parent_frame="map", child_frame="camera_optical_frame")
+                    calibration_mode="sim", camera_name="usb_cam", parent_frame="world", child_frame="camera_optical_frame",
+                    **self.application_kwargs(saved))
                 self.assertEqual(restored.state()["result"]["camera_model"], expected)
 
     def test_freeze_solve_and_save_round_trip(self):
@@ -333,18 +356,17 @@ class WebCalibrationServiceTest(unittest.TestCase):
         self.assertEqual(self.service.save(result["candidate_id"]), saved)
 
     def test_arbitrary_bodies_recalibrate_and_publish_selection_without_restart(self):
-        from xgc_camera_calibration.extrinsic_file_watcher import ExtrinsicSelectionWatcher
         names = ["calibration_stand", "ceiling_fixture", "desk_reference",
                  "reference_bar", "tripod", "wall_target"]
         snapshot = replace(self.snapshot, markers={
-            name: MarkerObservation(name=name, position=tuple(position), frame_id="map")
+            name: MarkerObservation(name=name, position=tuple(position), frame_id="world")
             for name, position in zip(names, self.world)
         })
         source = FakeSource(snapshot)
         service = CalibrationService(source, calibration_root=str(self.calibration_root),
-            calibration_mode="phy", camera_name="usb_cam", parent_frame="map",
-            child_frame="camera_optical_frame", maximum_inlier_error_px=1.0)
-        watcher = ExtrinsicSelectionWatcher(str(self.calibration_root), "phy", "usb_cam")
+            calibration_mode="phy", camera_name="usb_cam", parent_frame="world",
+            child_frame="camera_optical_frame", maximum_inlier_error_px=1.0,
+            **self.application_kwargs())
         paths = []
         revisions = []
         for translation in (self.tvec, self.tvec + np.array([0.2, 0.05, 0.1])):
@@ -355,13 +377,16 @@ class WebCalibrationServiceTest(unittest.TestCase):
             pixels, _ = cv2.projectPoints(self.world, self.rvec, translation,
                                           self.intrinsic, self.distortion)
             candidate = service.solve(self.point_request(service, names, pixels.reshape(-1, 2)))
-            self.assertIsNone(watcher.next_revision(), "Solve must not activate a candidate")
+            before = self.owner.store.read()["applied"]
             saved = service.save(candidate["candidate_id"])
-            revision = watcher.next_revision()
-            self.assertEqual(str(revision.path), saved["output_file"])
-            self.assertIsNone(watcher.next_revision())
-            paths.append(revision.path)
-            revisions.append(load_extrinsic(revision.path))
+            self.assertEqual(self.owner.store.read()["applied"], before)
+            self.assertEqual(saved["application"]["status"], "pending")
+            published = []
+            self.owner.tick(published.append)
+            self.assertEqual(len(published), 1)
+            self.assertEqual(service.state()["result"]["application"]["status"], "applied")
+            paths.append(Path(saved["output_file"]))
+            revisions.append(load_extrinsic(saved["output_file"]))
         self.assertNotEqual(paths[0], paths[1])
         self.assertTrue(all(path.is_file() for path in paths))
         self.assertNotEqual(revisions[0]["translation"], revisions[1]["translation"])
@@ -376,10 +401,14 @@ class WebCalibrationServiceTest(unittest.TestCase):
             calibration_root=str(self.calibration_root),
             calibration_mode="sim",
             camera_name="usb_cam",
-            parent_frame="map",
+            parent_frame="world",
             child_frame="camera_optical_frame",
             maximum_inlier_error_px=1.0,
+            **self.application_kwargs(saved),
         )
+        before = self.owner.store.read()
+        restored.save(candidate["candidate_id"])
+        self.assertEqual(self.owner.store.read(), before, "restoring saved history must not promote")
         state = restored.state()
         self.assertEqual(state["mode"], "live")
         self.assertTrue(state["result_restored"])
@@ -393,36 +422,32 @@ class WebCalibrationServiceTest(unittest.TestCase):
         self.assertEqual(restored.state()["result"]["candidate_id"], candidate["candidate_id"])
         self.assertEqual(restored.state()["samples"], [])
 
-    def test_corrupt_selection_is_visible_but_does_not_block_fresh_save(self):
+    def test_legacy_mode_selection_is_ignored_and_never_repaired(self):
         pointer = self.calibration_root / "selections" / "usb_cam" / "sim-extrinsic.json"
         pointer.parent.mkdir(parents=True)
         pointer.write_text('{"schema":"broken"}\n', encoding="utf-8")
         service = CalibrationService(
             FakeSource(self.snapshot), calibration_root=str(self.calibration_root),
-            calibration_mode="sim", camera_name="usb_cam", parent_frame="map",
+            calibration_mode="sim", camera_name="usb_cam", parent_frame="world",
             child_frame="camera_optical_frame", maximum_inlier_error_px=1.0,
+            **self.application_kwargs(),
         )
         self.assertFalse(service.state()["result_restored"])
-        self.assertIn("invalid shape", service.state()["recovery_error"])
+        self.assertIsNone(service.state()["recovery_error"])
         service.freeze()
         request = self.point_request(service)
         candidate = service.solve(request)
         saved = service.save(candidate["candidate_id"])
         self.assertTrue(saved["saved"])
         self.assertIsNone(service.state()["recovery_error"])
+        self.assertEqual(pointer.read_text(), '{"schema":"broken"}\n')
 
     def test_saved_retry_rejects_a_superseding_shared_selection(self):
         self.service.freeze()
         candidate = self.service.solve(self.point_request())
         self.service.save(candidate["candidate_id"])
-        original = Path(self.service.output_file)
-        replacement = original.with_name("extrinsics-20990101T000000.000000Z.yaml")
-        shutil.copyfile(original, replacement)
-        from xgc_camera_calibration.solver import write_extrinsic_selection
-        write_extrinsic_selection(
-            str(self.calibration_root), "sim", "usb_cam", replacement,
-            candidate["candidate_id"],
-        )
+        original = dict(self.service.application.request)
+        self.owner.store.stage({**original, "applicationId": "newer-application"}, 1)
         with self.assertRaisesRegex(ApiError, "superseded"):
             self.service.save(candidate["candidate_id"])
 
@@ -445,27 +470,23 @@ class WebCalibrationServiceTest(unittest.TestCase):
         self.assertTrue(saved["saved"])
         self.assertEqual(len(list(self.output_directory.glob("extrinsics-*.yaml"))), 1)
 
-    def test_pointer_failure_retries_the_same_immutable_output(self):
+    def test_application_failure_retries_the_same_immutable_output(self):
         self.service.freeze()
         candidate = self.service.solve(self.point_request())
-        from xgc_camera_calibration import web_service as module
-
-        real_write = module.write_extrinsic_selection
-        attempts = 0
-
-        def flaky_write(*args, **kwargs):
-            nonlocal attempts
-            attempts += 1
-            if attempts == 1:
-                raise OSError("pointer unavailable")
-            return real_write(*args, **kwargs)
-
-        with patch.object(module, "write_extrinsic_selection", side_effect=flaky_write):
-            with self.assertRaisesRegex(ApiError, "Could not save or select"):
+        original_stage = self.service.application.store.stage
+        attempts = []
+        def flaky_stage(request, revision):
+            attempts.append((dict(request), revision))
+            if len(attempts) == 1:
+                raise OSError("selection unavailable")
+            return original_stage(request, revision)
+        with patch.object(self.service.application.store, "stage", side_effect=flaky_stage):
+            with self.assertRaisesRegex(ApiError, "application is unavailable"):
                 self.service.save(candidate["candidate_id"])
             outputs = list(self.output_directory.glob("extrinsics-*.yaml"))
             self.assertEqual(len(outputs), 1)
             saved = self.service.save(candidate["candidate_id"])
+        self.assertEqual(attempts[0], attempts[1])
         self.assertEqual(Path(saved["output_file"]), outputs[0])
         self.assertEqual(len(list(self.output_directory.glob("extrinsics-*.yaml"))), 1)
 
@@ -495,12 +516,11 @@ class WebCalibrationServiceTest(unittest.TestCase):
         self.assertEqual(context.exception.status, 400)
 
     def test_one_body_at_independent_positions_solves_without_freeze(self):
-        from xgc_camera_calibration.web_service import CalibrationError
         original = self.service.source.snapshot
         identities = []
         for index, (world, pixel) in enumerate(zip(self.world, self.pixels)):
             self.service.source.snapshot = replace(original, stamp_sec=10. + index,
-                markers={"one-body": MarkerObservation("one-body", tuple(world), "map")})
+                markers={"one-body": MarkerObservation("one-body", tuple(world), "world")})
             identities.append(self.admit("one-body", pixel))
         self.assertEqual(self.service.state()["mode"], "live")
         samples = self.service.state()["samples"]
@@ -525,7 +545,7 @@ class WebCalibrationServiceTest(unittest.TestCase):
         image_a = np.full_like(before.image, 25)
         encoded_a = cv2.imencode(".png", image_a)[1].tobytes()
         self.service.source.snapshot = replace(before, stamp_sec=99., image=np.full_like(before.image, 200),
-            markers={"marker_01": MarkerObservation("marker_01", (50., 60., 70.), "map")})
+            markers={"marker_01": MarkerObservation("marker_01", (50., 60., 70.), "world")})
         self.service.commit_sample(pending["sample_id"], encoded_a, "image/png")
         sample = self.service.state()["samples"][0]
         self.assertEqual(sample["world"], list(before.markers["marker_01"].position))
@@ -637,7 +657,6 @@ class WebCalibrationServiceTest(unittest.TestCase):
         self.assertIsNone(self.service.result_payload)
 
     def test_image_headers_limit_decode_allocation_and_preserve_native_jpeg(self):
-        from xgc_camera_calibration.extrinsic_samples import IMAGE_BYTES
         import struct
         _, pending = self.begin("marker_01", self.pixels[0])
         huge = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR" + struct.pack(">II",8192,8192) + b"0" * 16
@@ -670,17 +689,17 @@ class WebCalibrationServiceTest(unittest.TestCase):
         callback=namespace["_marker_callback"](source,"one")
         def message(position):
             return SimpleNamespace(pose=SimpleNamespace(position=SimpleNamespace(x=position[0],y=position[1],z=position[2])),
-                header=SimpleNamespace(frame_id="map",stamp=SimpleNamespace(to_sec=lambda:12.34)))
+                header=SimpleNamespace(frame_id="world",stamp=SimpleNamespace(to_sec=lambda:12.34)))
         callback(message((1.,2.,3.)))
-        first=namespace["observe_marker"](source,"one",640,480,"map")["marker"]
+        first=namespace["observe_marker"](source,"one",640,480,"world")["marker"]
         callback(message((4.,5.,6.)))
-        second=namespace["observe_marker"](source,"one",640,480,"map")["marker"]
+        second=namespace["observe_marker"](source,"one",640,480,"world")["marker"]
         self.assertEqual(first.position,(11.,-3.,5.));self.assertEqual(first.source_position,(1.,2.,3.))
         self.assertEqual(second.position,(14.,0.,8.));self.assertNotEqual(first.observation_id,second.observation_id)
         self.assertEqual((first.source_stamp_sec,first.received_at_sec,first.received_monotonic_sec),(12.34,123456.,100.))
         clock.monotonic=lambda:104.
         with self.assertRaisesRegex(ApiError,"fresh"):
-            namespace["observe_marker"](source,"one",640,480,"map")
+            namespace["observe_marker"](source,"one",640,480,"world")
 
     def test_http_native_4k_image_commit_review_and_tamper_rejection(self):
         # Real service transport, real codec decode and native >2MiB image; no ROS.
@@ -723,7 +742,6 @@ class WebCalibrationServiceTest(unittest.TestCase):
             server.shutdown();server.server_close();thread.join(3)
 
     def test_upload_has_an_absolute_deadline_and_sample_actions_validate_identity(self):
-        from types import SimpleNamespace
         from unittest.mock import Mock
         from xgc_camera_calibration.web_service import CalibrationRequestHandler
         handler = object.__new__(CalibrationRequestHandler)

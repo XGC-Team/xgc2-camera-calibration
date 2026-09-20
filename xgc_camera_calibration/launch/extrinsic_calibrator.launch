@@ -7,9 +7,13 @@
   <arg name="snapshot_timeout" default="5.0" />
   <arg name="pose_prefix" default="/vrpn_client_node" />
   <arg name="calibration_root" />
+  <arg name="resolved_extrinsic_json" />
+  <arg name="frame_roles_json" />
+  <arg name="application_state_param" />
+  <arg name="pose_coordinate_source" />
   <arg name="calibration_mode" />
   <arg name="camera_name" />
-  <arg name="parent_frame" default="map" />
+  <arg name="parent_frame" default="world" />
   <arg name="child_frame" default="usb_cam_optical_frame" />
   <arg name="ransac_threshold_px" default="3.0" />
   <arg name="maximum_inlier_error_px" default="10.0" />
@@ -23,7 +27,8 @@
   <node pkg="xgc_camera_calibration"
         type="extrinsic_calibrator_web.py"
         name="xgc_camera_extrinsic_calibrator_web"
-        output="screen">
+        output="screen"
+        args="--resolved-extrinsic-json '$(arg resolved_extrinsic_json)' --frame-roles-json '$(arg frame_roles_json)' --application-state-param '$(arg application_state_param)'">
     <param name="image_topic" value="$(arg image_topic)" />
     <param name="preview_image_topic" value="$(arg preview_image_topic)" />
     <param name="intrinsic_file" value="$(arg intrinsic_file)" />
@@ -31,6 +36,7 @@
     <param name="media_source_id" value="$(arg media_source_id)" />
     <param name="snapshot_timeout" value="$(arg snapshot_timeout)" />
     <param name="pose_prefix" value="$(arg pose_prefix)" />
+    <param name="pose_coordinate_source" value="$(arg pose_coordinate_source)" />
     <param name="calibration_root" value="$(arg calibration_root)" />
     <param name="calibration_mode" value="$(arg calibration_mode)" />
     <param name="camera_name" value="$(arg camera_name)" />

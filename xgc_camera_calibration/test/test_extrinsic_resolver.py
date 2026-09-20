@@ -165,6 +165,36 @@ class FrozenResolverTest(SelectionFixture):
             with self.assertRaisesRegex(CalibrationError, "stdout budget"):
                 encode_frozen(result)
 
+    def test_cli_legacy_authored_preserves_camera_link_pose_without_ros_environment(self):
+        env = dict(os.environ)
+        env.pop("PYTHONPATH", None)
+        pose = {"x": -4., "y": 1., "z": 1.5, "roll": .2, "pitch": .3, "yaw": -.4}
+        command = [sys.executable, str(SCRIPT), "--root", str(self.root), "--camera", "usb_cam",
+            "--selection-json", "", "--frame-roles-json", json.dumps(ROLES),
+            "--target-offset-json", '{"x":10,"y":20,"z":30}', "--legacy-pose-source", "authored",
+            "--legacy-link-pose-json", json.dumps(pose)]
+        process = subprocess.run(command, capture_output=True, text=True, env=env, timeout=10)
+        self.assertEqual(process.returncode, 0, process.stderr)
+        frozen = decode_frozen(process.stdout, "usb_cam", ROLES)
+        from xgc_camera_calibration.camera_initial_pose import gazebo_camera_link_pose_from_optical
+        value = frozen["resolvedOpticalPose"]
+        link = gazebo_camera_link_pose_from_optical(value["translation"], value["quaternionXyzw"], (.067, 0., 0.))
+        for name in pose: self.assertAlmostEqual(link[name], pose[name])
+        self.assertEqual(frozen["sourceCoordinates"]["worldOffset"], [10., 20., 30.])
+        for original, resolved in zip(frozen["originalOpticalPose"]["translation"], frozen["resolvedOpticalPose"]["translation"]):
+            self.assertAlmostEqual(original, resolved)
+        self.assertEqual(self.store.read()["revision"], 0)
+
+    def test_cli_legacy_file_freezes_exact_version_and_rebases_once(self):
+        process = subprocess.run([sys.executable, str(SCRIPT), "--root", str(self.root),
+            "--camera", "usb_cam", "--selection-json", "", "--frame-roles-json", json.dumps(ROLES),
+            "--target-offset-json", '{"x":10,"y":5,"z":6}', "--legacy-pose-source", "file",
+            "--legacy-file", str(self.path)], capture_output=True, text=True, timeout=10)
+        self.assertEqual(process.returncode, 0, process.stderr)
+        frozen = decode_frozen(process.stdout, "usb_cam", ROLES)
+        self.assertEqual(frozen["result"], self.result)
+        self.assertEqual(frozen["resolvedOpticalPose"]["translation"], [7., 2., 3.])
+
     def test_installed_cli_stdout_is_only_compact_frozen_json_and_errors_are_stderr(self):
         env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
         env["PYTHONPATH"] = str(SCRIPT.parents[1] / "src")

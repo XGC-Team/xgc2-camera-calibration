@@ -1,13 +1,10 @@
 <launch>
   <arg name="calibration_root" />
+  <arg name="resolved_extrinsic_json" />
+  <arg name="frame_roles_json" />
   <arg name="calibration_mode" />
   <arg name="camera_name" />
-  <arg name="selection_source" default="authored" />
-  <arg name="runtime_source_parent_frame" default="map" />
-  <arg name="runtime_source_optical_frame" default="usb_cam_optical_frame" />
-  <arg name="physical_source_parent_frame" default="world" />
-  <arg name="physical_source_optical_frame" default="usb_cam_optical_frame" />
-  <arg name="parent_frame" default="map" />
+  <arg name="parent_frame" default="world" />
   <arg name="camera_link_frame" default="usb_cam_link" />
   <arg name="optical_frame" default="usb_cam_optical_frame" />
   <arg name="link_to_optical_x" default="0.0" />
@@ -15,23 +12,16 @@
   <arg name="link_to_optical_z" default="0.0" />
   <arg name="static" default="true" />
   <arg name="publish_rate" default="10.0" />
-  <arg name="wait_for_file" default="false" />
-  <arg name="require_file_update" default="false" />
-  <arg name="watch_file" default="false" />
   <arg name="file_poll_rate" default="5.0" />
 
   <node pkg="xgc_camera_calibration"
         type="extrinsic_tf_publisher.py"
         name="xgc_camera_extrinsic_tf"
-        output="screen">
+        output="screen"
+        args="--resolved-extrinsic-json '$(arg resolved_extrinsic_json)' --frame-roles-json '$(arg frame_roles_json)'">
     <param name="calibration_root" value="$(arg calibration_root)" />
     <param name="calibration_mode" value="$(arg calibration_mode)" />
     <param name="camera_name" value="$(arg camera_name)" />
-    <param name="selection_source" value="$(arg selection_source)" />
-    <param name="runtime_source_parent_frame" value="$(arg runtime_source_parent_frame)" />
-    <param name="runtime_source_optical_frame" value="$(arg runtime_source_optical_frame)" />
-    <param name="physical_source_parent_frame" value="$(arg physical_source_parent_frame)" />
-    <param name="physical_source_optical_frame" value="$(arg physical_source_optical_frame)" />
     <param name="parent_frame" value="$(arg parent_frame)" />
     <param name="camera_link_frame" value="$(arg camera_link_frame)" />
     <param name="optical_frame" value="$(arg optical_frame)" />
@@ -40,9 +30,6 @@
     <param name="link_to_optical_z" value="$(arg link_to_optical_z)" />
     <param name="static" value="$(arg static)" />
     <param name="publish_rate" value="$(arg publish_rate)" />
-    <param name="wait_for_file" value="$(arg wait_for_file)" />
-    <param name="require_file_update" value="$(arg require_file_update)" />
-    <param name="watch_file" value="$(arg watch_file)" />
     <param name="file_poll_rate" value="$(arg file_poll_rate)" />
   </node>
 </launch>

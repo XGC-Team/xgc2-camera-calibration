@@ -1,7 +1,7 @@
 schema: xgc2.product.v1
 id: xgc2-camera-calibration-ros1
 name: XGC2 ROS1 Camera Calibration
-version: 0.3.0-39
+version: 0.3.0-40
 kind: ros1-apt
 summary: Independent intrinsic and fixed-world-camera extrinsic calibration tools
   for ROS Noetic.
@@ -39,13 +39,14 @@ usage:
     sudo apt install ros-noetic-xgc2-camera-calibration
 
     '
-  smoke_test: 'roslaunch --files xgc_camera_calibration intrinsic_calibrator.launch
-
-    roslaunch --files xgc_camera_calibration extrinsic_calibrator.launch
-
-    roslaunch --files xgc_camera_calibration extrinsic_tf.launch
-
-    '
+  smoke_test: |
+    XGC_CAMERA_SMOKE_ROOT="$(mktemp -d)"
+    trap 'rm -rf "$XGC_CAMERA_SMOKE_ROOT"' EXIT
+    XGC_CAMERA_ROLES='{"parentFrame":"world","opticalFrames":{"sim":"xgc_world_camera_optical_frame","phy":"usb_cam_optical_frame"}}'
+    XGC_CAMERA_FROZEN="$(/opt/ros/noetic/lib/xgc_camera_calibration/resolve_extrinsic.py --root "$XGC_CAMERA_SMOKE_ROOT" --camera package_smoke --selection-json '{"mode":"auto"}' --target-offset-json '{"x":0,"y":0,"z":0}' --frame-roles-json "$XGC_CAMERA_ROLES")"
+    roslaunch --files xgc_camera_calibration intrinsic_calibrator.launch calibration_root:="$XGC_CAMERA_SMOKE_ROOT" calibration_mode:=sim camera_name:=package_smoke
+    roslaunch --files xgc_camera_calibration extrinsic_calibrator.launch calibration_root:="$XGC_CAMERA_SMOKE_ROOT" calibration_mode:=sim camera_name:=package_smoke intrinsic_file:="$XGC_CAMERA_SMOKE_ROOT/sim/package_smoke/intrinsics-20260101T000000.000000Z.yaml" resolved_extrinsic_json:="$XGC_CAMERA_FROZEN" frame_roles_json:="$XGC_CAMERA_ROLES" application_state_param:=/xgc_camera_extrinsic_tf/extrinsic_application_state pose_coordinate_source:=experiment-world child_frame:=xgc_world_camera_optical_frame
+    roslaunch --files xgc_camera_calibration extrinsic_tf.launch calibration_root:="$XGC_CAMERA_SMOKE_ROOT" calibration_mode:=sim camera_name:=package_smoke resolved_extrinsic_json:="$XGC_CAMERA_FROZEN" frame_roles_json:="$XGC_CAMERA_ROLES" optical_frame:=xgc_world_camera_optical_frame
   notes: 'Intrinsic calibration is camera-agnostic and can be used for fixed, onboard,
 
     or vehicle-mounted cameras. Fixed-camera extrinsic calibration consumes an
@@ -66,4 +67,4 @@ release:
   workflow: release.yml
   ci_workflow: ci.yml
   apt_versions:
-    focal: 0.3.0-39
+    focal: 0.3.0-40
