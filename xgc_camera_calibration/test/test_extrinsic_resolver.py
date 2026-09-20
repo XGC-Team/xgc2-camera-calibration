@@ -13,6 +13,8 @@ import yaml
 
 from xgc_camera_calibration.extrinsic_resolver import decode_frozen, encode_frozen, resolve_selection
 from xgc_camera_calibration.extrinsic_selection import CalibrationError, SelectionStore
+# catkin/nose loads this file by path, without adding its sibling test directory.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_extrinsic_selection import ROLES, TARGET, SelectionFixture
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "resolve_extrinsic.py"
