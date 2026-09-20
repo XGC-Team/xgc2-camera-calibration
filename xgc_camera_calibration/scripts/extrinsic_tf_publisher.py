@@ -12,6 +12,7 @@ from xgc_camera_calibration.extrinsic_application import (
     ExtrinsicApplication, application_arguments, parse_frame_roles,
 )
 from xgc_camera_calibration.transforms import split_parent_to_optical_pose
+from xgc_camera_calibration.record_facts import AppliedTransformFacts, transform_values
 
 
 def make_transform(parent_frame, child_frame, translation, quaternion):
@@ -78,6 +79,7 @@ def publish_chain(transforms, broadcaster, optical_broadcaster=None):
     else:
         optical_broadcaster.sendTransform(transforms[1])
         broadcaster.sendTransform(transforms[0])
+    return stamp
 
 
 def main():
@@ -114,17 +116,36 @@ def main():
             raise ValueError("camera publication rate must be finite and positive")
         broadcaster = tf2_ros.StaticTransformBroadcaster() if static else tf2_ros.TransformBroadcaster()
         optical_broadcaster = None if static else tf2_ros.StaticTransformBroadcaster()
-        publish_chain(transforms, broadcaster, optical_broadcaster)
+        # The same producer epoch binds the publication evidence and selection
+        # handshake. This publisher is a transport projection, not a new owner.
+        fact_topic = [None]
+        def emit_fact(text):
+            from std_msgs.msg import String
+            if fact_topic[0] is None:
+                fact_topic[0] = rospy.Publisher(AppliedTransformFacts.TOPIC, String, queue_size=64, latch=True)
+            fact_topic[0].publish(String(data=text))
+        facts = AppliedTransformFacts({"id": camera_name + ":" + parent + ":" + optical,
+            "instanceId": application.producer["instanceEpoch"], "kind": "camera-extrinsic",
+            "resolutionId": application.producer["resolutionId"]},
+            emit_fact,
+            lambda message: rospy.logwarn_throttle(5.0, message))
+        active_resolved = frozen
+        stamp = publish_chain(transforms, broadcaster, optical_broadcaster)
+        facts.applied(transform_values(transforms), active_resolved, stamp.to_nsec())
         application.initial_published()
     except Exception as error:
         rospy.logfatal("Could not start frozen camera extrinsic publisher: %s", error)
         return 2
 
     def apply(resolved):
-        nonlocal transforms
+        nonlocal transforms, active_resolved
         candidate = frozen_transform_chain(resolved, parent, link, optical, link_offset)
-        publish_chain(candidate, broadcaster, optical_broadcaster)
+        stamp = publish_chain(candidate, broadcaster, optical_broadcaster)
         transforms = candidate
+        active_resolved = resolved
+        # Publish success is an actual fact even if the subsequent selection
+        # confirmation CAS fails. Do not rewrite it as the requested/old pose.
+        facts.applied(transform_values(candidate), resolved, stamp.to_nsec())
 
     try:
         while not rospy.is_shutdown():
@@ -135,9 +156,12 @@ def main():
                 rospy.set_param("~extrinsic_update_error", str(error))
                 rospy.logwarn_throttle(5.0, "Camera application is not confirmed: %s", error)
             if not static:
-                publish_chain(transforms, broadcaster, optical_broadcaster)
+                stamp = publish_chain(transforms, broadcaster, optical_broadcaster)
+                facts.applied(transform_values(transforms), active_resolved, stamp.to_nsec())
+            facts.flush()
             time.sleep(1.0 / rate)
     finally:
+        facts.stop(rospy.Time.now().to_nsec())
         application.ready = False
         application.project(application.state())
     return 0
