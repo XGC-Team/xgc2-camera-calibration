@@ -10,6 +10,7 @@ catkin_install_python(PROGRAMS
   scripts/intrinsic_calibrator_web.py
   scripts/extrinsic_tf_publisher.py
   scripts/gazebo_camera_from_extrinsic.py
+  scripts/resolve_extrinsic.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 install(PROGRAMS scripts/resolve_intrinsic.sh
@@ -36,4 +37,6 @@ if(CATKIN_ENABLE_TESTING)
   catkin_add_nosetests(test/test_extrinsic_file_watcher.py)
   catkin_add_nosetests(test/test_extrinsic_tf_publisher.py)
   catkin_add_nosetests(test/test_extrinsic_coordinates.py)
+  catkin_add_nosetests(test/test_extrinsic_selection.py)
+  catkin_add_nosetests(test/test_extrinsic_resolver.py)
 endif()
