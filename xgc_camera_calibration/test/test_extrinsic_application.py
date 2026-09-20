@@ -1,7 +1,11 @@
 """Real file owner + serial publisher handshake, without ROS transport mocks."""
 import copy
+from pathlib import Path
+import sys
 from unittest.mock import Mock, patch
 
+# catkin/nose loads this test by path without adding its sibling directory.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_extrinsic_selection import SelectionFixture, ROLES, TARGET
 from xgc_camera_calibration.extrinsic_application import ExtrinsicApplication, SavedExtrinsicApplication
 from xgc_camera_calibration.extrinsic_resolver import encode_frozen, resolve_selection
