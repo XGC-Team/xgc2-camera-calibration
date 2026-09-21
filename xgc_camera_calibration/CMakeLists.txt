@@ -14,6 +14,7 @@ catkin_install_python(PROGRAMS
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 install(PROGRAMS scripts/resolve_intrinsic.sh
+  scripts/validate-scene-replay-asset.sh
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 install(DIRECTORY launch
