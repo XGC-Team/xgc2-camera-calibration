@@ -110,4 +110,5 @@ if [[ -n "$scene_file" ]]; then
 fi
 
 media_file="$(jq -er '.media.file' <<<"$manifest")"
-printf '%s/%s\n' "$asset_dir" "$media_file"
+# No trailing newline: the workflow binds this stdout tail directly as a file path.
+printf '%s/%s' "$asset_dir" "$media_file"
