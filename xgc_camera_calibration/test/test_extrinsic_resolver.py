@@ -93,7 +93,7 @@ class FrozenResolverTest(SelectionFixture):
                 self.resolve({"mode": "version", "result": self.result}, {"frame": "world", "worldOffset": offset})
 
     def test_legacy_has_unknown_provenance_and_cannot_be_rebased(self):
-        legacy, path = self.version(name="extrinsics-20260920T010203.000002Z.yaml", provenance=False)
+        legacy, path = self.version(name="extrinsics-2026-09-20_01-02-03.yaml", provenance=False)
         original = path.read_bytes()
         value = self.resolve({"mode": "version", "result": legacy}, {"frame": "world", "worldOffset": [0, 0, 0]})
         self.assertIsNone(value["sourceCoordinates"])

@@ -151,7 +151,7 @@ class ExtrinsicSolverTest(unittest.TestCase):
     def test_persists_versioned_result_atomically(self):
         result = solve_extrinsic(self.world, self.pixels, self.intrinsic)
         with tempfile.TemporaryDirectory() as directory:
-            output = Path(directory) / "nested" / "extrinsics-20260830T010000.000000Z.yaml"
+            output = Path(directory) / "nested" / "extrinsics-2026-08-30_01-00-00.yaml"
             save_extrinsic(
                 output,
                 result,
@@ -180,7 +180,7 @@ class ExtrinsicSolverTest(unittest.TestCase):
             sim_directory = root / "sim" / "usb_cam"
             for directory in (selected_directory, other_directory, sim_directory):
                 directory.mkdir(parents=True, exist_ok=True)
-            filename = "intrinsics-20260830T010203.000000Z.yaml"
+            filename = "intrinsics-2026-08-30_01-02-03.yaml"
             selected_file = selected_directory / filename
             selected_file.write_text("schema: xgc2.camera.intrinsic.v1\n", encoding="utf-8")
             other_file = other_directory / filename
@@ -188,7 +188,7 @@ class ExtrinsicSolverTest(unittest.TestCase):
             sim_file = sim_directory / filename
             sim_file.write_text("schema: xgc2.camera.intrinsic.v1\n", encoding="utf-8")
             outside_symlink = (
-                selected_directory / "intrinsics-20260830T020304.000000Z.yaml"
+                selected_directory / "intrinsics-2026-08-30_02-03-04.yaml"
             )
             outside_symlink.symlink_to(other_file)
 
@@ -273,7 +273,7 @@ class ExtrinsicSolverTest(unittest.TestCase):
         result = solve_extrinsic(self.world, self.pixels, self.intrinsic)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "camera"
-            output = root / "phy" / "usb_cam" / "extrinsics-20260830T010000.000000Z.yaml"
+            output = root / "phy" / "usb_cam" / "extrinsics-2026-08-30_01-00-00.yaml"
             candidate_id = "extrinsic-candidate-selection"
             save_extrinsic(
                 output, result, calibration_mode="phy", camera_name="usb_cam",
@@ -306,7 +306,7 @@ class ExtrinsicSolverTest(unittest.TestCase):
         result = solve_extrinsic(self.world, self.pixels, self.intrinsic)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "camera"
-            physical = root / "phy" / "usb_cam" / "extrinsics-20260830T010000.000000Z.yaml"
+            physical = root / "phy" / "usb_cam" / "extrinsics-2026-08-30_01-00-00.yaml"
             simulation = root / "sim" / "usb_cam" / physical.name
             for output, mode in ((physical, "phy"), (simulation, "sim")):
                 save_extrinsic(
@@ -317,7 +317,7 @@ class ExtrinsicSolverTest(unittest.TestCase):
             alias = physical.parent / "extrinsics.yaml"
             alias.symlink_to(physical)
             timestamp_alias = (
-                physical.parent / "extrinsics-20260830T030000.000000Z.yaml"
+                physical.parent / "extrinsics-2026-08-30_03-00-00.yaml"
             )
             timestamp_alias.symlink_to(physical)
             for invalid in (alias, timestamp_alias, simulation):

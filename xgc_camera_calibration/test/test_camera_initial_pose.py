@@ -30,7 +30,7 @@ class CameraInitialPoseTest(unittest.TestCase):
     def test_resolves_explicit_physical_file_pose_before_roslaunch(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "camera"
-            output = root / "phy" / "usb_cam" / "extrinsics-20260830T010000.000000Z.yaml"
+            output = root / "phy" / "usb_cam" / "extrinsics-2026-08-30_01-00-00.yaml"
             result = ExtrinsicResult(
                 translation=np.asarray((1.0, 2.0, 3.0)),
                 quaternion_xyzw=np.asarray((0.0, 0.0, 0.0, 1.0)),
@@ -116,7 +116,7 @@ class CameraInitialPoseTest(unittest.TestCase):
     def test_resolves_simulation_partition_file_without_a_selection_pointer(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "camera"
-            output = root / "sim" / "usb_cam" / "extrinsics-20260831T010000.000000Z.yaml"
+            output = root / "sim" / "usb_cam" / "extrinsics-2026-08-31_01-00-00.yaml"
             result = ExtrinsicResult(
                 translation=np.asarray((1.0, 2.0, 3.0)),
                 quaternion_xyzw=np.asarray((0.0, 0.0, 0.0, 1.0)),
@@ -143,7 +143,7 @@ class CameraInitialPoseTest(unittest.TestCase):
                 )
             latest = root / "sim" / "usb_cam" / "extrinsics.yaml"
             latest.write_text("schema: xgc2.camera.extrinsic.v1\n")
-            with self.assertRaisesRegex(CalibrationError, "concrete extrinsics-UTC.yaml"):
+            with self.assertRaisesRegex(CalibrationError, "concrete versioned extrinsics file"):
                 resolve_gazebo_camera_pose_from_file(
                     str(root), "usb_cam", "world",
                     ("xgc_world_camera_optical_frame",), (0.067, 0.0, 0.0), str(latest),

@@ -2,19 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import math
 import mimetypes
-import socket
 import threading
-import time
-from dataclasses import dataclass, field, replace
+import uuid
+from dataclasses import asdict, dataclass, field, replace
 from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from aiohttp import web
+from xgc2_xrpc import AppRouter, Endpoint, Fault, Host, Limits, RawStreamResponse, Response, Runtime, ServiceRef, iter_body
 from pathlib import Path
-from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple, cast
-from urllib.parse import parse_qs, urlsplit
+from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -588,23 +588,26 @@ class CalibrationService:
                 "Calibration is saved; application is unavailable: {}".format(error)) from error
 
 
-class CalibrationHttpServer(ThreadingHTTPServer):
-    daemon_threads = True
-    allow_reuse_address = True
+_RESPONSE_STARTED = web.RequestKey("calibration.response_started", bool)
 
-    def __init__(
-        self,
-        address: Tuple[str, int],
-        service: Optional[CalibrationService],
-        web_root: Path,
-        *,
-        frame_ancestors: str,
-        allowed_origins: Sequence[str] = (),
-        logger: Optional[Callable[[str], None]] = None,
-        intrinsic_service: Optional[Any] = None,
-    ):
-        # The extrinsic and intrinsic calibrators are separate apps that share
-        # this transport; each runs with only its own service present.
+
+class CalibrationHttpServer:
+    """Public aiohttp adapter owned by one explicit XRPC runtime.
+
+    ROS, locks, codecs, solver and persistence run in the runtime's fixed
+    blocking pool. Disconnecting a caller never releases a still-running job.
+    """
+
+    max_request_bytes = 128 * 1024
+    static_files = {
+        "/": "index.html", "/index.html": "index.html",
+        "/app.js": "app.js", "/styles.css": "styles.css",
+    }
+
+    def __init__(self, address, service, web_root, *, frame_ancestors,
+                 allowed_origins=(), logger=None, intrinsic_service=None,
+                 runtime=None, limits=None, upload_timeout=30.0, rpc_socket=None, target_id=None,
+                 validation_workers=2, preferences=None):
         if service is None and intrinsic_service is None:
             raise ValueError("at least one of service / intrinsic_service is required")
         root = Path(web_root).resolve()
@@ -613,462 +616,447 @@ class CalibrationHttpServer(ThreadingHTTPServer):
                 raise FileNotFoundError("Web asset is missing: {}".format(root / required))
         if "\r" in frame_ancestors or "\n" in frame_ancestors:
             raise ValueError("frame_ancestors must not contain newlines")
-        self.service = service
-        self.intrinsic_service = intrinsic_service
+        self.service, self.intrinsic_service = service, intrinsic_service
+        self.preferences = preferences
         self.web_root = root
         self.frame_ancestors = frame_ancestors.strip() or "'self'"
-        self.allowed_origins = set(allowed_origins)
+        self.allowed_origins = frozenset(allowed_origins)
         self.logger = logger or (lambda _message: None)
-        super().__init__(address, CalibrationRequestHandler)
+        self.upload_timeout = float(upload_timeout)
+        if not math.isfinite(self.upload_timeout) or self.upload_timeout <= 0:
+            raise ValueError("positive finite upload timeout required")
+        self.limits = limits or Limits(connections=16, in_flight=8,
+            body_bytes=IMAGE_BYTES, response_bytes=1 << 30, call_timeout=3600.0)
+        private_reference = None
+        if rpc_socket is not None:
+            private_reference = ServiceRef(target_id, "xgc2.calibration.v1.Calibration", "1",
+                uuid.uuid4().hex, "http.v1", Endpoint("unix", str(rpc_socket))).validate()
+        self.runtime = runtime or Runtime(blocking_workers=4, max_calls=8,
+                                          max_connections=16)
+        self._owns_runtime = runtime is None
+        self._closed = False
+        self._stopping = False
+        self.router = AppRouter(client_max_size=self.limits.body_bytes)
+        self.router.add_route("*", "/{path:.*}", self._handle)
+        self.host = Host.from_app(self.router.app, address=address,
+                                  runtime=self.runtime, limits=self.limits)
+        self.private_host = None
+        self.service_ref = None
+        if rpc_socket is not None:
+            self.service_ref = private_reference
+            routes = self._private_routes()
+            self.private_host = Host(str(rpc_socket), routes, runtime=self.runtime,
+                instance_id=self.service_ref.instance_id, discovery_routes=("/v1/describe",),
+                limits=Limits(connections=8, in_flight=4, body_bytes=128 * 1024,
+                              response_bytes=8 << 20, call_timeout=30.0))
+        if intrinsic_service is not None and hasattr(intrinsic_service, "attach_work_runtime"):
+            intrinsic_service.attach_work_runtime(self.runtime, self.host, validation_workers=validation_workers)
 
+    def _private_routes(self):
+        """One thin native facade for actual Core consumers of this domain.
 
-class CalibrationRequestHandler(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
-    max_request_bytes = 128 * 1024
-    static_files = {
-        "/": "index.html",
-        "/index.html": "index.html",
-        "/app.js": "app.js",
-        "/styles.css": "styles.css",
-    }
+        The public browser edge is independent. The private host enforces
+        official request identity, deadlines and instance fencing; domain
+        objects keep their existing plain data and never receive a ServiceRef.
+        """
+        routes = {}
+        def adapt(function, decoder=lambda value: (), status=200):
+            def call(context, value):
+                if self._stopping:
+                    raise Fault("unavailable", "Calibration application is draining", 503)
+                try:
+                    return Response.json(function(*decoder(value)), status=status, max_bytes=8 << 20)
+                except ApiError as error:
+                    code = {400: "invalid_argument", 404: "not_found", 409: "conflict",
+                            429: "resource_exhausted", 501: "unsupported", 503: "unavailable"}.get(error.status, "internal")
+                    raise Fault(code, error.message, error.status) from error
+            return call
+        def empty(value):
+            if value not in ({}, None):
+                raise ApiError(400, "State/action request must be an empty object")
+            return ()
+        def candidate(value):
+            if not isinstance(value, dict) or set(value) != {"candidate_id"} or not isinstance(value["candidate_id"], str) or not value["candidate_id"].strip():
+                raise ApiError(400, "Save requires only a non-empty candidate_id")
+            return (value["candidate_id"].strip(),)
+        if self.service is not None:
+            routes[("GET", "/api/v1/state")] = adapt(self.service.state, empty)
+            routes[("POST", "/api/v1/solve")] = adapt(self.service.solve, lambda value: (value,))
+            routes[("POST", "/api/v1/save")] = adapt(self.service.save, candidate)
+        if self.intrinsic_service is not None:
+            routes[("GET", "/api/v1/intrinsic/state")] = adapt(self.intrinsic_service.state, empty)
+            for path, method, status in (("candidate", "start_candidate", 202), ("save", "save", 200)):
+                if hasattr(self.intrinsic_service, method):
+                    routes[("POST", "/api/v1/intrinsic/" + path)] = adapt(
+                        getattr(self.intrinsic_service, method), candidate if path == "save" else empty, status)
+        def describe(context, value):
+            if self._stopping:
+                raise Fault("unavailable", "Calibration application is draining", 503)
+            empty(value)
+            return {"service_ref": asdict(self.service_ref),
+                "capabilities": {"intrinsic": self.intrinsic_service is not None, "extrinsic": self.service is not None},
+                "routes": [{"method": method, "path": path} for method, path in sorted(routes)]}
+        routes[("GET", "/v1/describe")] = describe
+        return routes
 
     @property
-    def calibration_server(self) -> CalibrationHttpServer:
-        return cast(CalibrationHttpServer, self.server)
+    def server_address(self):
+        return self.host.bound_address
 
-    def log_message(self, format_string: str, *args: Any) -> None:
-        self.calibration_server.logger(format_string % args)
+    def start(self):
+        try:
+            self.host.start()
+            if self.private_host is not None:
+                self.private_host.start()
+        except BaseException:
+            self.host.close()
+            if self.private_host is not None:
+                self.private_host.close()
+            if self._owns_runtime:
+                self.runtime.close()
+            raise
+        return self
 
-    def _origin(self) -> Optional[str]:
-        origin = self.headers.get("Origin", "")
-        allowed = self.calibration_server.allowed_origins
-        if not origin or not allowed:
-            return None
-        if "*" in allowed or origin in allowed:
-            return origin
-        return None
-
-    def _common_headers(self, content_type: str, length: int) -> None:
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(length))
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("Referrer-Policy", "no-referrer")
-        self.send_header(
-            "Content-Security-Policy",
-            "default-src 'self'; base-uri 'none'; object-src 'none'; "
-            "script-src 'self'; style-src 'self'; img-src 'self' blob: data:; "
-            "connect-src 'self'; frame-ancestors {}".format(
-                self.calibration_server.frame_ancestors
-            ),
-        )
-        origin = self._origin()
-        if origin:
-            self.send_header("Access-Control-Allow-Origin", origin)
-            self.send_header("Vary", "Origin")
-
-    def _send_bytes(self, status: int, content_type: str, payload: bytes) -> None:
-        self.send_response(int(status))
-        self._common_headers(content_type, len(payload))
-        self.end_headers()
-        if self.command != "HEAD":
-            self.wfile.write(payload)
-
-    def _send_file(
-        self,
-        status: int,
-        content_type: str,
-        path: Path,
-        download_name: str,
-    ) -> None:
-        if Path(download_name).name != download_name or not download_name:
-            raise ApiError(HTTPStatus.INTERNAL_SERVER_ERROR, "Download filename is invalid")
-        size = path.stat().st_size
-        self.send_response(int(status))
-        self._common_headers(content_type, size)
-        self.send_header(
-            "Content-Disposition", 'attachment; filename="{}"'.format(download_name)
-        )
-        self.end_headers()
-        if self.command == "HEAD":
+    def close(self):
+        if self._closed:
             return
-        with path.open("rb") as stream:
-            while True:
-                chunk = stream.read(1024 * 1024)
-                if not chunk:
-                    break
-                self.wfile.write(chunk)
+        self._stopping = True
+        # Host retains its resources if domain work has not really quiesced.
+        self.host.close()
+        if self.private_host is not None:
+            self.private_host.close()
+        if self._owns_runtime:
+            self.runtime.close()
+        self._closed = True
 
-    def _send_json(self, status: int, payload: Dict[str, Any]) -> None:
-        encoded = json.dumps(payload, separators=(",", ":"), allow_nan=False).encode("utf-8")
-        self._send_bytes(status, "application/json; charset=utf-8", encoded)
+    async def _domain(self, function, *args):
+        return await self.runtime.blocking(self.host, function, *args)
 
-    def _send_intrinsic_state_events(self) -> None:
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("X-Content-Type-Options", "nosniff")
-        origin = self._origin()
-        if origin:
-            self.send_header("Access-Control-Allow-Origin", origin)
-            self.send_header("Vary", "Origin")
-        self.end_headers()
-        previous = b""
-        event_id = 0
+    async def _preference_domain(self, function, *args):
+        from xgc_camera_calibration.preferences import PreferenceError
+        try:
+            return await self._domain(function, *args)
+        except PreferenceError as error:
+            raise ApiError(error.status, str(error), details={"code": error.code,
+                "outcome": error.outcome, "request_id": error.request_id}) from error
+
+    def _headers(self, request):
+        result = {
+            "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
+            "Referrer-Policy": "no-referrer",
+            "Content-Security-Policy":
+                "default-src 'self'; base-uri 'none'; object-src 'none'; "
+                "script-src 'self'; style-src 'self'; img-src 'self' blob: data:; "
+                "connect-src 'self'; frame-ancestors {}".format(self.frame_ancestors),
+        }
+        origin = request.headers.get("Origin", "")
+        if origin and ("*" in self.allowed_origins or origin in self.allowed_origins):
+            result.update({"Access-Control-Allow-Origin": origin, "Vary": "Origin"})
+        return result
+
+    def _bytes(self, request, payload, mime, status=200):
+        return web.Response(body=payload, status=int(status),
+                            headers={**self._headers(request), "Content-Type": mime})
+
+    def _json(self, request, payload, status=200):
+        return self._bytes(request,
+            json.dumps(payload, separators=(",", ":"), allow_nan=False).encode("utf-8"),
+            "application/json; charset=utf-8", status)
+
+    async def _read_body(self, request, maximum, timeout):
+        length = request.content_length
+        if length is None or length < 0 or length > maximum:
+            raise ApiError(413, "Request body exceeds the byte limit or has no length")
+        body = bytearray()
+        try:
+            async with asyncio.timeout(timeout):
+                async for chunk in iter_body(request, max_bytes=maximum):
+                    body.extend(chunk)
+        except web.HTTPRequestEntityTooLarge as error:
+            raise ApiError(413, "Request body exceeds the byte limit") from error
+        except TimeoutError as error:
+            raise ApiError(408, "Request body upload timed out") from error
+        if len(body) != length:
+            raise ApiError(400, "Request body is incomplete")
+        return bytes(body)
+
+    async def _request_json(self, request):
+        if request.content_type != "application/json":
+            raise ApiError(415, "Content-Type must be application/json")
+        raw = await self._read_body(request, self.max_request_bytes, self.upload_timeout)
+        try:
+            def fields(items):
+                value = {}
+                for key, item in items:
+                    if key in value:
+                        raise ValueError("duplicate field")
+                    value[key] = item
+                return value
+            def invalid_constant(_):
+                raise ValueError("nonfinite value")
+            return json.loads(raw, object_pairs_hook=fields, parse_constant=invalid_constant)
+        except (UnicodeDecodeError, ValueError, RecursionError) as error:
+            raise ApiError(400, "Request body is not valid JSON") from error
+
+    def _intrinsic(self):
+        if self.intrinsic_service is None:
+            raise ApiError(404, "Intrinsic calibration is not enabled")
+        return self.intrinsic_service
+
+    def _extrinsic(self):
+        if self.service is None:
+            raise ApiError(404, "Extrinsic calibration is not enabled")
+        return self.service
+
+    async def _events(self, request):
+        intrinsic = self.intrinsic_service
+        response = RawStreamResponse(max_bytes=self.limits.response_bytes, headers={**self._headers(request),
+                                               "Content-Type": "text/event-stream"})
+        await response.prepare(request)
+        request[_RESPONSE_STARTED] = True
+        if request.method == "HEAD":
+            await response.write_eof()
+            return response
+        previous, event_id = b"", 0
         while True:
-            payload = json.dumps(
-                self._intrinsic().state(), separators=(",", ":"), allow_nan=False
-            ).encode("utf-8")
+            state = await self._domain(intrinsic.state) if intrinsic is not None else {}
+            if self.preferences is not None:
+                state["preferences"] = await self._domain(self.preferences.event_state)
+            else:
+                state["preferences"] = {"available": False, "snapshot": None,
+                    "error": {"code": "unavailable", "message": "Preference storage was not granted"}}
+            payload = json.dumps(state, separators=(",", ":"), allow_nan=False).encode()
             if payload != previous:
                 event_id += 1
-                self.wfile.write(
-                    "id: {}\nevent: state\ndata: ".format(event_id).encode("ascii")
-                    + payload
-                    + b"\n\n"
-                )
-                self.wfile.flush()
+                await response.write("id: {}\nevent: state\ndata: ".format(event_id).encode()
+                                     + payload + b"\n\n")
                 previous = payload
-            time.sleep(0.1)
+            await asyncio.sleep(0.1)
 
-    def _send_error(self, error: ApiError) -> None:
-        payload: Dict[str, Any] = {"error": error.message}
-        if error.details:
-            payload["details"] = error.details
-        self._send_json(error.status, payload)
-
-    def _request_json(self) -> Any:
-        content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
-        if content_type != "application/json":
-            raise ApiError(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, "Content-Type must be application/json")
+    async def _file(self, request, path, filename):
+        if Path(filename).name != filename or not filename:
+            raise ApiError(500, "Download filename is invalid")
+        # One open file, one bounded chunk and native async backpressure.
+        io_task = asyncio.create_task(self._domain(path.open, "rb"))
+        stream = None
         try:
-            length = int(self.headers.get("Content-Length", "0"))
-        except ValueError as error:
-            raise ApiError(HTTPStatus.BAD_REQUEST, "Invalid Content-Length") from error
-        if length < 0 or length > self.max_request_bytes:
-            raise ApiError(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "Request body is too large")
-        try:
-            return json.loads(self.rfile.read(length).decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise ApiError(HTTPStatus.BAD_REQUEST, "Request body is not valid JSON") from error
-
-    def _intrinsic(self) -> Any:
-        service = self.calibration_server.intrinsic_service
-        if service is None:
-            raise ApiError(HTTPStatus.NOT_FOUND, "Intrinsic calibration is not enabled")
-        return service
-
-    def _extrinsic(self) -> Any:
-        service = self.calibration_server.service
-        if service is None:
-            raise ApiError(HTTPStatus.NOT_FOUND, "Extrinsic calibration is not enabled")
-        return service
-
-    def _intrinsic_ref(self, path: str) -> bytes:
-        token = path[len("/api/v1/intrinsic/ref/"):].split(".", 1)[0]
-        try:
-            index = int(token)
-        except ValueError as error:
-            raise ApiError(HTTPStatus.BAD_REQUEST, "Reference index must be an integer") from error
-        jpeg = self._intrinsic().ref(index)
-        if jpeg is None:
-            raise ApiError(HTTPStatus.NOT_FOUND, "No reference image for that target")
-        return jpeg
-
-    def _intrinsic_validation_image(self, path: str, query: str) -> bytes:
-        prefix = "/api/v1/intrinsic/validation/image/"
-        token = path[len(prefix):]
-        if not token.endswith(".jpg"):
-            raise ApiError(HTTPStatus.NOT_FOUND, "Intrinsic validation image must be JPEG")
-        parameters = parse_qs(query, keep_blank_values=True)
-        generation_values = parameters.get("generation")
-        generation = None
-        if generation_values is not None:
-            if len(generation_values) != 1:
-                raise ApiError(
-                    HTTPStatus.BAD_REQUEST,
-                    "Intrinsic validation generation must appear once",
-                )
+            stream = await asyncio.shield(io_task)
+            io_task = asyncio.create_task(self._domain(lambda: path.stat().st_size))
+            size = await asyncio.shield(io_task)
+            if size > self.limits.response_bytes:
+                raise ApiError(413, "Evidence download exceeds the response byte limit")
+            response = RawStreamResponse(max_bytes=self.limits.response_bytes, headers={**self._headers(request),
+                "Content-Type": "application/zip", "Content-Length": str(size),
+                "Content-Disposition": 'attachment; filename="{}"'.format(filename)})
+            await response.prepare(request)
+            request[_RESPONSE_STARTED] = True
+            if request.method != "HEAD":
+                while True:
+                    io_task = asyncio.create_task(self._domain(stream.read, 1024 * 1024))
+                    chunk = await asyncio.shield(io_task)
+                    if not chunk:
+                        break
+                    await response.write(chunk)
+            await response.write_eof()
+            return response
+        finally:
+            # Await a real read/open before closing its descriptor. A cancelled
+            # HTTP task must not close a file still used by the blocking worker.
             try:
-                generation = int(generation_values[0])
-            except ValueError as error:
-                raise ApiError(
-                    HTTPStatus.BAD_REQUEST,
-                    "Intrinsic validation generation must be a positive integer",
-                ) from error
-            if generation <= 0:
-                raise ApiError(
-                    HTTPStatus.BAD_REQUEST,
-                    "Intrinsic validation generation must be a positive integer",
-                )
-        return self._intrinsic().validation_image(token[:-4], generation)
+                result = await asyncio.shield(io_task)
+                if stream is None:
+                    stream = result
+            finally:
+                if stream is not None:
+                    stream.close()  # read-only descriptor; no flush or disk work
 
-    def _dispatch(self) -> None:
-        request_url = urlsplit(self.path)
-        path = request_url.path
-        if self.command in ("GET", "HEAD"):
+    async def _dispatch(self, request):
+        path = request.path
+        if request.method == "OPTIONS":
+            headers = self._headers(request)
+            if "Access-Control-Allow-Origin" in headers:
+                headers.update({"Access-Control-Allow-Methods": "GET, HEAD, POST, PUT, OPTIONS",
+                                "Access-Control-Allow-Headers": "Content-Type"})
+            return web.Response(status=204, headers=headers)
+        if path == "/api/v1/preferences":
+            if self.preferences is None:
+                raise ApiError(503, "Preference storage was not granted")
+            if request.method in ("GET", "HEAD"):
+                if set(request.query) - {"request_id"} or len(request.query.getall("request_id", [])) > 1:
+                    raise ApiError(400, "Unknown preference query")
+                identity = request.query.get("request_id")
+                value = (await self._preference_domain(self.preferences.resolve, identity) if identity is not None
+                         else await self._preference_domain(self.preferences.get))
+                return self._json(request, value)
+            if request.method == "PUT":
+                if request.query:
+                    raise ApiError(400, "Preference writes do not accept query arguments")
+                return self._json(request, await self._preference_domain(self.preferences.put, await self._request_json(request)))
+            raise ApiError(405, "Preference method not allowed")
+        if request.method in ("GET", "HEAD"):
             image_match = IMAGE_PATH.fullmatch(path)
             if image_match:
-                payload, mime = self._extrinsic().samples.image(image_match[1])
-                self._send_bytes(200, mime, payload)
-                return
+                payload, mime = await self._domain(self._extrinsic().samples.image, image_match[1])
+                return self._bytes(request, payload, mime)
             if path == "/healthz":
-                payload: Dict[str, Any] = {"status": "ok"}
-                if self.calibration_server.service is not None:
-                    state = self.calibration_server.service.state()
-                    payload["image_ready"] = bool(state["source"].get("image_ready"))
-                    payload["intrinsic_ready"] = bool(state["source"].get("intrinsic_ready"))
-                    payload["marker_count"] = int(state["source"].get("marker_count", 0))
-                if self.calibration_server.intrinsic_service is not None:
-                    intrinsic_state = self.calibration_server.intrinsic_service.state()
-                    payload.setdefault("image_ready", bool(intrinsic_state.get("image_ready")))
-                    payload["camera_control"] = bool(intrinsic_state.get("camera_control"))
-                self._send_json(HTTPStatus.OK, payload)
-                return
+                payload = {"status": "ok"}
+                if self.service is not None:
+                    state = await self._domain(self.service.state)
+                    payload.update(image_ready=bool(state["source"].get("image_ready")),
+                        intrinsic_ready=bool(state["source"].get("intrinsic_ready")),
+                        marker_count=int(state["source"].get("marker_count", 0)))
+                if self.intrinsic_service is not None:
+                    state = await self._domain(self.intrinsic_service.state)
+                    payload.setdefault("image_ready", bool(state.get("image_ready")))
+                    payload["camera_control"] = bool(state.get("camera_control"))
+                return self._json(request, payload)
             if path == "/api/v1/state":
-                self._send_json(HTTPStatus.OK, self._extrinsic().state())
-                return
+                return self._json(request, await self._domain(self._extrinsic().state))
             if path == "/api/v1/image.jpg":
-                self._send_bytes(HTTPStatus.OK, "image/jpeg", self._extrinsic().image_jpeg())
-                return
-            if path == "/api/v1/intrinsic/state":
-                self._send_json(HTTPStatus.OK, self._intrinsic().state())
-                return
-            if path == "/api/v1/intrinsic/events":
-                self._send_intrinsic_state_events()
-                return
-            if path == "/api/v1/intrinsic/image.jpg":
-                self._send_bytes(HTTPStatus.OK, "image/jpeg", self._intrinsic().image_jpeg())
-                return
-            if path == "/api/v1/intrinsic/snapshot.jpg":
-                self._send_bytes(HTTPStatus.OK, "image/jpeg", self._intrinsic().snapshot_jpeg())
-                return
-            if path == "/api/v1/intrinsic/targets":
-                self._send_json(HTTPStatus.OK, self._intrinsic().targets_document())
-                return
-            if path == "/api/v1/intrinsic/calibrations":
-                self._send_json(HTTPStatus.OK, self._intrinsic().calibration_history())
-                return
+                return self._bytes(request, await self._domain(self._extrinsic().image_jpeg), "image/jpeg")
+            if path in ("/api/v1/intrinsic/events", "/api/v1/events"):
+                return await self._events(request)
+            reads = {
+                "/api/v1/intrinsic/state": ("state", "json"),
+                "/api/v1/intrinsic/image.jpg": ("image_jpeg", "image/jpeg"),
+                "/api/v1/intrinsic/snapshot.jpg": ("snapshot_jpeg", "image/jpeg"),
+                "/api/v1/intrinsic/targets": ("targets_document", "json"),
+                "/api/v1/intrinsic/calibrations": ("calibration_history", "json"),
+            }
+            if path in reads:
+                method, mime = reads[path]
+                payload = await self._domain(getattr(self._intrinsic(), method))
+                return self._json(request, payload) if mime == "json" else self._bytes(request, payload, mime)
             if path == "/api/v1/intrinsic/evidence.zip":
-                filename, evidence_path = self._intrinsic().evidence_bundle()
-                self._send_file(
-                    HTTPStatus.OK,
-                    "application/zip",
-                    evidence_path,
-                    filename,
-                )
-                return
+                filename, evidence_path = await self._domain(self._intrinsic().evidence_bundle)
+                return await self._file(request, evidence_path, filename)
             if path.startswith("/api/v1/intrinsic/validation/image/"):
-                self._send_bytes(
-                    HTTPStatus.OK,
-                    "image/jpeg",
-                    self._intrinsic_validation_image(path, request_url.query),
-                )
-                return
+                token = path[len("/api/v1/intrinsic/validation/image/"):]
+                if not token.endswith(".jpg"):
+                    raise ApiError(404, "Intrinsic validation image must be JPEG")
+                values = request.query.getall("generation", [])
+                generation = None
+                if values:
+                    try:
+                        if len(values) != 1:
+                            raise ValueError()
+                        generation = int(values[0])
+                        if generation <= 0:
+                            raise ValueError()
+                    except ValueError as error:
+                        raise ApiError(400, "Intrinsic validation generation must be a positive integer") from error
+                payload = await self._domain(self._intrinsic().validation_image, token[:-4], generation)
+                return self._bytes(request, payload, "image/jpeg")
             if path.startswith("/api/v1/intrinsic/ref/"):
-                self._send_bytes(HTTPStatus.OK, "image/jpeg", self._intrinsic_ref(path))
-                return
+                try:
+                    index = int(path[len("/api/v1/intrinsic/ref/"):].split(".", 1)[0])
+                except ValueError as error:
+                    raise ApiError(400, "Reference index must be an integer") from error
+                payload = await self._domain(self._intrinsic().ref, index)
+                if payload is None:
+                    raise ApiError(404, "No reference image for that target")
+                return self._bytes(request, payload, "image/jpeg")
             asset = self.static_files.get(path)
             if asset:
-                payload = (self.calibration_server.web_root / asset).read_bytes()
-                content_type = mimetypes.guess_type(asset)[0] or "application/octet-stream"
-                if content_type.startswith("text/") or content_type in (
-                    "application/javascript",
-                    "application/json",
-                ):
-                    content_type += "; charset=utf-8"
-                self._send_bytes(HTTPStatus.OK, content_type, payload)
-                return
-            raise ApiError(HTTPStatus.NOT_FOUND, "Route not found")
-        if self.command == "POST":
-            image_match = IMAGE_PATH.fullmatch(path)
-            if image_match:
-                mime = self.headers.get("Content-Type", "").strip().lower()
-                if mime not in ("image/png", "image/jpeg"):
-                    raise ApiError(415, "Sample image must be PNG or JPEG")
-                try:
-                    length = int(self.headers.get("Content-Length", "-1"))
-                except ValueError as error:
-                    raise ApiError(400, "Invalid Content-Length") from error
-                if length < 0 or length > IMAGE_BYTES:
-                    self.close_connection = True
-                    raise ApiError(413, "Sample image exceeds the byte limit")
-                previous_timeout = self.connection.gettimeout()
-                deadline = time.monotonic() + 30.0
-                try:
-                    chunks, remaining = [], length
-                    while remaining:
-                        budget = deadline - time.monotonic()
-                        if budget <= 0:
-                            raise TimeoutError("sample upload deadline")
-                        self.connection.settimeout(budget)
-                        chunk = self.rfile.read1(min(65536, remaining))
-                        if not chunk:
-                            break
-                        chunks.append(chunk)
-                        remaining -= len(chunk)
-                    payload = b"".join(chunks)
-                except (socket.timeout, TimeoutError) as error:
-                    self.close_connection = True
-                    raise ApiError(408, "Sample image upload timed out") from error
-                finally:
-                    self.connection.settimeout(previous_timeout)
-                if len(payload) != length:
-                    raise ApiError(400, "Sample image body is incomplete")
-                self._send_json(200, self._extrinsic().commit_sample(image_match[1], payload, mime))
-                return
-            request = self._request_json()
-            if path == "/api/v1/samples/begin":
-                self._send_json(200, self._extrinsic().begin_sample(request))
-                return
-            if path in {"/api/v1/samples/" + action for action in ("cancel", "remove", "pixel", "clear")}:
-                self._send_json(200, self._extrinsic().mutate_sample(path.rsplit("/", 1)[1], request))
-                return
-            if path == "/api/v1/freeze":
-                if request not in ({}, None):
-                    raise ApiError(HTTPStatus.BAD_REQUEST, "Freeze request must be an empty object")
-                self._send_json(HTTPStatus.OK, self._extrinsic().freeze())
-                return
-            if path == "/api/v1/live":
-                if request not in ({}, None):
-                    raise ApiError(HTTPStatus.BAD_REQUEST, "Live request must be an empty object")
-                self._send_json(HTTPStatus.OK, self._extrinsic().live())
-                return
-            if path == "/api/v1/solve":
-                self._send_json(HTTPStatus.OK, self._extrinsic().solve(request))
-                return
-            if path == "/api/v1/save":
-                if not isinstance(request, dict) or set(request) != {"candidate_id"}:
-                    raise ApiError(
-                        HTTPStatus.BAD_REQUEST,
-                        "Extrinsic save requires only candidate_id",
-                    )
-                candidate_id = request.get("candidate_id")
-                if not isinstance(candidate_id, str) or not candidate_id.strip():
-                    raise ApiError(
-                        HTTPStatus.BAD_REQUEST,
-                        "Extrinsic save candidate_id must be a non-empty string",
-                    )
-                self._send_json(
-                    HTTPStatus.OK,
-                    self._extrinsic().save(candidate_id.strip()),
-                )
-                return
-            if path == "/api/v1/intrinsic/candidate":
-                if request not in ({}, None):
-                    raise ApiError(
-                        HTTPStatus.BAD_REQUEST,
-                        "Intrinsic candidate request must be an empty object",
-                    )
-                payload = self._intrinsic().start_candidate()
-                self._send_json(HTTPStatus.ACCEPTED if payload.get("accepted") else HTTPStatus.OK, payload)
-                return
-            if path == "/api/v1/intrinsic/save":
-                if not isinstance(request, dict) or set(request) != {"candidate_id"}:
-                    raise ApiError(
-                        HTTPStatus.BAD_REQUEST,
-                        "Intrinsic save requires only candidate_id",
-                    )
-                candidate_id = request.get("candidate_id")
-                if not isinstance(candidate_id, str) or not candidate_id.strip():
-                    raise ApiError(
-                        HTTPStatus.BAD_REQUEST,
-                        "Intrinsic save candidate_id must be a non-empty string",
-                    )
-                self._send_json(
-                    HTTPStatus.OK,
-                    self._intrinsic().save(candidate_id.strip()),
-                )
-                return
-            if path == "/api/v1/intrinsic/continue":
-                if request not in ({}, None):
-                    raise ApiError(
-                        HTTPStatus.BAD_REQUEST,
-                        "Intrinsic continue request must be an empty object",
-                    )
-                self._send_json(HTTPStatus.OK, self._intrinsic().continue_collection())
-                return
-            if path == "/api/v1/intrinsic/reset":
-                if request not in ({}, None):
-                    raise ApiError(HTTPStatus.BAD_REQUEST, "Reset request must be an empty object")
-                self._send_json(HTTPStatus.OK, self._intrinsic().reset())
-                return
-            if path == "/api/v1/intrinsic/capture":
-                if request not in ({}, None):
-                    raise ApiError(HTTPStatus.BAD_REQUEST, "Capture request must be an empty object")
-                self._send_json(HTTPStatus.OK, self._intrinsic().capture())
-                return
-            if path == "/api/v1/intrinsic/validation":
-                if not isinstance(request, dict) or set(request) != {"reference", "comparison"}:
-                    raise ApiError(
-                        HTTPStatus.BAD_REQUEST,
-                        "Intrinsic validation requires reference and comparison objects",
-                    )
-                result = self._intrinsic().validate_intrinsic(
-                    request["reference"], request["comparison"]
-                )
-                self._send_json(HTTPStatus.OK, result)
-                return
+                payload = await self._domain((self.web_root / asset).read_bytes)
+                mime = mimetypes.guess_type(asset)[0] or "application/octet-stream"
+                if mime.startswith("text/") or mime in ("application/javascript", "application/json"):
+                    mime += "; charset=utf-8"
+                return self._bytes(request, payload, mime)
+            raise ApiError(404, "Route not found")
+        if request.method != "POST":
+            raise ApiError(405, "Method not allowed")
+        image_match = IMAGE_PATH.fullmatch(path)
+        if image_match:
+            mime = request.headers.get("Content-Type", "").strip().lower()
+            if mime not in ("image/png", "image/jpeg"):
+                raise ApiError(415, "Sample image must be PNG or JPEG")
+            payload = await self._read_body(request, IMAGE_BYTES, self.upload_timeout)
+            return self._json(request, await self._domain(self._extrinsic().commit_sample,
+                                                        image_match[1], payload, mime))
+        value = await self._request_json(request)
+        if path == "/api/v1/samples/begin":
+            return self._json(request, await self._domain(self._extrinsic().begin_sample, value))
+        if path in {"/api/v1/samples/" + action for action in ("cancel", "remove", "pixel", "clear")}:
+            return self._json(request, await self._domain(self._extrinsic().mutate_sample,
+                                                        path.rsplit("/", 1)[1], value))
+        if path == "/api/v1/solve":
+            return self._json(request, await self._domain(self._extrinsic().solve, value))
+        if path in ("/api/v1/save", "/api/v1/intrinsic/save", "/api/v1/intrinsic/apply-metadata"):
+            if not isinstance(value, dict) or set(value) != {"candidate_id"}:
+                raise ApiError(400, "Save/apply requires only candidate_id")
+            identity = value["candidate_id"]
+            if not isinstance(identity, str) or not identity.strip():
+                raise ApiError(400, "Save/apply candidate_id must be a non-empty string")
+            service = self._extrinsic() if path == "/api/v1/save" else self._intrinsic()
+            action = service.apply_metadata if path.endswith("apply-metadata") else service.save
+            return self._json(request, await self._domain(action, identity.strip()))
+        if path == "/api/v1/intrinsic/goto":
+            index = value.get("index") if isinstance(value, dict) else None
+            if not isinstance(index, int) or isinstance(index, bool):
+                raise ApiError(400, "goto requires an integer 'index'")
+            return self._json(request, await self._domain(self._intrinsic().goto, index))
+        if path == "/api/v1/intrinsic/validation":
+            if not isinstance(value, dict) or set(value) != {"reference", "comparison"}:
+                raise ApiError(400, "Intrinsic validation requires reference and comparison objects")
+            return self._json(request, await self._domain(self._intrinsic().validate_intrinsic,
+                                                        value["reference"], value["comparison"]))
+        empty_actions = {
+            "/api/v1/freeze": ("extrinsic", "freeze", 200),
+            "/api/v1/live": ("extrinsic", "live", 200),
+            "/api/v1/intrinsic/candidate": ("intrinsic", "start_candidate", 202),
+            "/api/v1/intrinsic/continue": ("intrinsic", "continue_collection", 200),
+            "/api/v1/intrinsic/reset": ("intrinsic", "reset", 200),
+            "/api/v1/intrinsic/capture": ("intrinsic", "capture", 200),
+            "/api/v1/intrinsic/auto_capture/stop": ("intrinsic", "stop_auto_capture", 200),
+            "/api/v1/intrinsic/reset_pose": ("intrinsic", "reset_pose", 200),
+            "/api/v1/intrinsic/auto_run": ("intrinsic", "auto_run", 202),
+        }
+        if path in empty_actions or path == "/api/v1/intrinsic/auto_capture/start":
+            if value not in ({}, None):
+                raise ApiError(400, "Action request must be an empty object")
             if path == "/api/v1/intrinsic/auto_capture/start":
-                if request not in ({}, None):
-                    raise ApiError(HTTPStatus.BAD_REQUEST, "auto_capture start request must be an empty object")
-                intrinsic = self._intrinsic()
-                with intrinsic.lock:
-                    interval = intrinsic._resume_auto_capture_interval_locked()
-                self._send_json(HTTPStatus.OK, intrinsic.start_auto_capture(interval=interval))
-                return
-            if path == "/api/v1/intrinsic/auto_capture/stop":
-                if request not in ({}, None):
-                    raise ApiError(HTTPStatus.BAD_REQUEST, "auto_capture stop request must be an empty object")
-                self._send_json(HTTPStatus.OK, self._intrinsic().stop_auto_capture())
-                return
-            if path == "/api/v1/intrinsic/goto":
-                index = request.get("index") if isinstance(request, dict) else None
-                if not isinstance(index, int) or isinstance(index, bool):
-                    raise ApiError(HTTPStatus.BAD_REQUEST, "goto requires an integer 'index'")
-                self._send_json(HTTPStatus.OK, self._intrinsic().goto(index))
-                return
-            if path == "/api/v1/intrinsic/reset_pose":
-                if request not in ({}, None):
-                    raise ApiError(HTTPStatus.BAD_REQUEST, "reset_pose request must be an empty object")
-                self._send_json(HTTPStatus.OK, self._intrinsic().reset_pose())
-                return
-            if path == "/api/v1/intrinsic/auto_run":
-                if request not in ({}, None):
-                    raise ApiError(HTTPStatus.BAD_REQUEST, "auto_run request must be an empty object")
-                self._send_json(HTTPStatus.ACCEPTED, self._intrinsic().auto_run())
-                return
-            raise ApiError(HTTPStatus.NOT_FOUND, "Route not found")
-        raise ApiError(HTTPStatus.METHOD_NOT_ALLOWED, "Method not allowed")
+                service = self._intrinsic()
+                def start_capture():
+                    with service.lock:
+                        interval = service._resume_auto_capture_interval_locked()
+                    return service.start_auto_capture(interval=interval)
+                return self._json(request, await self._domain(start_capture))
+            kind, method, status = empty_actions[path]
+            service = self._extrinsic() if kind == "extrinsic" else self._intrinsic()
+            payload = await self._domain(getattr(service, method))
+            if method == "start_candidate" and not payload.get("accepted"):
+                status = 200
+            return self._json(request, payload, status)
+        raise ApiError(404, "Route not found")
 
-    def do_GET(self) -> None:
-        self._handle()
-
-    def do_HEAD(self) -> None:
-        self._handle()
-
-    def do_POST(self) -> None:
-        self._handle()
-
-    def do_OPTIONS(self) -> None:
-        origin = self._origin()
-        self.send_response(HTTPStatus.NO_CONTENT)
-        self.send_header("Content-Length", "0")
-        if origin:
-            self.send_header("Access-Control-Allow-Origin", origin)
-            self.send_header("Vary", "Origin")
-            self.send_header("Access-Control-Allow-Methods", "GET, HEAD, POST, OPTIONS")
-            self.send_header("Access-Control-Allow-Headers", "Content-Type")
-        self.end_headers()
-
-    def _handle(self) -> None:
+    async def _handle(self, request):
         try:
-            self._dispatch()
-        except ApiError as error:
-            self._send_error(error)
+            return await self._dispatch(request)
+        except (ApiError, Fault) as error:
+            if request.get(_RESPONSE_STARTED):
+                if request.transport:
+                    request.transport.close()
+                raise
+            payload = {"error": error.message if isinstance(error, ApiError) else str(error)}
+            if isinstance(error, ApiError) and error.details:
+                payload["details"] = error.details
+            response = self._json(request, payload, error.status)
+            if request.can_read_body:
+                response.force_close()
+            return response
+        except TimeoutError:
+            if request.transport:
+                request.transport.close()
+            raise
         except (BrokenPipeError, ConnectionResetError):
-            return
-        except Exception as error:  # pragma: no cover - defensive transport boundary
-            self.calibration_server.logger("Unhandled HTTP request failure: {}".format(error))
-            self._send_error(
-                ApiError(HTTPStatus.INTERNAL_SERVER_ERROR, "Internal server error")
-            )
+            raise
+        except Exception:
+            if request.get(_RESPONSE_STARTED):
+                if request.transport:
+                    request.transport.close()
+                raise
+            self.logger("Unhandled calibration HTTP request failure")
+            response = self._json(request, {"error": "Internal server error"}, 500)
+            response.force_close()
+            return response

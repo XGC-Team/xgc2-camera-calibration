@@ -23,6 +23,9 @@ install(DIRECTORY launch
 install(DIRECTORY web
   DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}
 )
+install(FILES ../contracts/storage-manifest.json
+  DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}/contracts
+)
 
 if(CATKIN_ENABLE_TESTING)
   catkin_add_nosetests(test/test_solver.py)
@@ -35,6 +38,8 @@ if(CATKIN_ENABLE_TESTING)
   catkin_add_nosetests(test/test_intrinsic_service.py)
   catkin_add_nosetests(test/test_media_snapshot.py)
   catkin_add_nosetests(test/test_web_service.py)
+  catkin_add_nosetests(test/test_native_web_transport.py)
+  catkin_add_nosetests(test/test_preferences.py)
   catkin_add_nosetests(test/test_extrinsic_file_watcher.py)
   catkin_add_nosetests(test/test_extrinsic_tf_publisher.py)
   catkin_add_nosetests(test/test_record_facts.py)

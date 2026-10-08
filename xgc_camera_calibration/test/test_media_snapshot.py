@@ -1,277 +1,139 @@
-#!/usr/bin/env python3
-
+"""Instance-fenced native multipart capture; no legacy browser snapshot routes."""
 import json
-import threading
+import tempfile
 import unittest
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from dataclasses import asdict
+from pathlib import Path
 
 import cv2
 import numpy as np
-
-from xgc_camera_calibration.media_snapshot import (
-    MediaSnapshotClient,
-    MediaSnapshotError,
-)
+from xgc2_xrpc import Host, Limits, Response, Runtime, multipart
+from xgc_camera_calibration.media_snapshot import MediaSnapshotClient, MediaSnapshotError
 
 
 class FakeMediaEdge:
     def __init__(self):
-        self.requests = []
-        self.deleted = []
+        self.requests, self.deleted = [], []
         self.sources = [{"id": "usb_cam"}]
-        self.corrupt_raw_headers = False
-        self.jpeg = b"\xff\xd8xgc2-snapshot\xff\xd9"
-        self.raw = bytes([10, 20, 30]) * (16 * 16)
-        self.metadata = {
-            "snapshotId": "snapshot-1",
-            "sourceId": "usb_cam",
-            "frameId": "usb_cam_optical_frame",
-            "timestampNanoseconds": 123456789,
-            "width": 16,
-            "height": 16,
-            "pixelFormat": "rgb8",
-            "cameraMatrix": [
-                100.0, 0.0, 8.0,
-                0.0, 101.0, 8.0,
-                0.0, 0.0, 1.0,
-            ],
-            "distortion": [0.1, -0.2, 0.01, -0.01, 0.0],
-            "renderPose": {
-                "position": {"x": 1.2, "y": -0.3, "z": 2.1},
-                "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
-            },
-        }
-        self.server = None
-        self.thread = None
+        self.image = np.full((216, 384, 3), (10, 20, 30), dtype=np.uint8)
+        self.jpeg = cv2.imencode(".jpg", self.image)[1].tobytes()
+        self.raw = cv2.cvtColor(self.image, cv2.COLOR_BGR2RGB).tobytes()
+        self.metadata = {"sourceId": "usb_cam", "frameId": "usb_cam_optical_frame",
+            "timestampNanoseconds": 123456789, "timestampClockDomain": "simulation",
+            "frameSequence": 1, "width": 384, "height": 216, "pixelFormat": "rgb8",
+            "cameraMatrix": [100., 0., 192., 0., 101., 108., 0., 0., 1.],
+            "distortion": [0.1, -0.2, 0.01, -0.01, 0.], "calibrationState": "available",
+            "poseFrameId": "world", "renderPose": {"position": {"x": 1.2, "y": -.3, "z": 2.1},
+            "orientation": {"x": 0., "y": 0., "z": 0., "w": 1.}}}
+        self.announced_rgb_delta = 0
+        self.custom_capture = None
 
     def __enter__(self):
-        edge = self
-
-        class Handler(BaseHTTPRequestHandler):
-            def do_GET(self):
-                edge._record(self)
-                if self.path == "/healthz":
-                    self._json({"sources": edge.sources})
-                    return
-                if self.path == "/api/v1/snapshots/snapshot-1/jpeg":
-                    self._reply(200, edge.jpeg, "image/jpeg")
-                    return
-                if self.path == "/api/v1/snapshots/snapshot-1/raw":
-                    width = "17" if edge.corrupt_raw_headers else "16"
-                    self._reply(
-                        200,
-                        edge.raw,
-                        "application/x-xgc-rgb8",
-                        {
-                            "X-Xgc-Snapshot-Id": "snapshot-1",
-                            "X-Xgc-Frame-Id": "usb_cam_optical_frame",
-                            "X-Xgc-Width": width,
-                            "X-Xgc-Height": "16",
-                        },
-                    )
-                    return
-                self._json({"error": "not found"}, status=404)
-
-            def do_POST(self):
-                body = edge._record(self)
-                if (
-                    self.path == "/api/v1/sources/usb_cam/snapshots"
-                    and body in (
-                        b"{}",
-                        b'{"includeRgb":false,"requestKeyframe":false,"requireFresh":true}',
-                    )
-                ):
-                    self._json(edge.metadata)
-                    return
-                self._json({"error": "invalid capture request"}, status=400)
-
-            def do_DELETE(self):
-                edge._record(self)
-                if self.path == "/api/v1/snapshots/snapshot-1":
-                    edge.deleted.append("snapshot-1")
-                    self._reply(204, b"", "application/octet-stream")
-                    return
-                self._json({"error": "not found"}, status=404)
-
-            def _json(self, payload, status=200):
-                self._reply(
-                    status,
-                    json.dumps(payload).encode("utf-8"),
-                    "application/json",
-                )
-
-            def _reply(self, status, payload, content_type, headers=None):
-                self.send_response(status)
-                self.send_header("Content-Type", content_type)
-                self.send_header("Content-Length", str(len(payload)))
-                for name, value in (headers or {}).items():
-                    self.send_header(name, value)
-                self.end_headers()
-                if payload:
-                    self.wfile.write(payload)
-
-            def log_message(self, _format, *_args):
-                return
-
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self.thread = threading.Thread(
-            target=self.server.serve_forever,
-            name="fake-media-edge",
-            daemon=True,
-        )
-        self.thread.start()
+        self.directory = tempfile.TemporaryDirectory()
+        self.path = str(Path(self.directory.name) / "edge.sock")
+        self.runtime = Runtime()
+        ref = {"target_id": "test-target", "service": "media-edge", "api_version": "v1",
+               "instance_id": "edge-1", "profile": "http.v1",
+               "endpoint": {"kind": "unix", "address": self.path}}
+        def capture(context, value):
+            self.requests.append((context.request_id, value))
+            if self.custom_capture:
+                return self.custom_capture(value)
+            raw = self.raw if value["includeRgb"] else b""
+            metadata = {**self.metadata, "snapshotId": value["snapshotId"],
+                "jpegBytes": len(self.jpeg), "rgbBytes": len(raw) + self.announced_rgb_delta}
+            return multipart(metadata, self.jpeg, raw)
+        def release(context, value):
+            self.deleted.append(context.request_id)
+            return Response(b"", 204)
+        # Runtime Host resolves explicit routes; capture identities are known
+        # only after admission, so extend the release route in this fixture.
+        def capture_with_release(context, value):
+            self.host.routes[("DELETE", "/v1/media/snapshots/" + value["snapshotId"])] = release
+            return capture(context, value)
+        routes = {("GET", "/v1/describe"): lambda c, r: {"service_ref": ref, "sources": self.sources},
+                  ("GET", "/v1/health"): lambda c, r: {"sources": self.sources},
+                  ("POST", "/v1/media/sources/usb_cam/capture"): capture_with_release}
+        self.host = Host(self.path, routes, runtime=self.runtime, instance_id="edge-1",
+                         discovery_routes=("/v1/describe",), limits=Limits(response_bytes=40 << 20)).start()
+        self.client = MediaSnapshotClient(self.path, "usb_cam", local_target="test-target")
         return self
 
-    def __exit__(self, _exception_type, _exception, _traceback):
-        self.server.shutdown()
-        self.server.server_close()
-        self.thread.join(timeout=5.0)
-
-    @property
-    def address(self):
-        return "http://127.0.0.1:{}".format(self.server.server_address[1])
-
-    def _record(self, handler):
-        length = int(handler.headers.get("Content-Length", "0"))
-        body = handler.rfile.read(length) if length else b""
-        self.requests.append((handler.command, handler.path, body))
-        return body
+    def __exit__(self, *args):
+        self.client.close()
+        self.host.close()
+        self.runtime.close()
+        self.directory.cleanup()
 
 
 class MediaSnapshotClientTest(unittest.TestCase):
-    def test_health_and_capture_consume_one_immutable_snapshot(self):
+    def test_health_and_capture_consume_one_immutable_native_frame(self):
         with FakeMediaEdge() as edge:
-            client = MediaSnapshotClient(edge.address + "/", "usb_cam", 1.0)
+            self.assertEqual(edge.client.health()["sources"], edge.sources)
+            snapshot = edge.client.capture()
+            np.testing.assert_array_equal(snapshot.bgr, edge.image)
+            self.assertEqual(snapshot.jpeg, edge.jpeg)
+            self.assertEqual(snapshot.render_position, (1.2, -.3, 2.1))
+            self.assertEqual(snapshot.pose_frame_id, "world")
+            self.assertEqual(snapshot.timestamp_clock_domain, "simulation")
+            self.assertEqual(snapshot.frame_sequence, 1)
+            self.assertEqual(len(edge.requests), 1)
+            self.assertEqual(len(edge.deleted), 1)
+            self.assertTrue(edge.requests[0][1]["requireFresh"])
 
-            health = client.health()
-            snapshot = client.capture()
-
-        self.assertEqual(health["sources"], [{"id": "usb_cam"}])
-        self.assertEqual(snapshot.id, "snapshot-1")
-        self.assertEqual(snapshot.source_id, "usb_cam")
-        self.assertEqual(snapshot.frame_id, "usb_cam_optical_frame")
-        self.assertEqual(snapshot.timestamp_nanoseconds, 123456789)
-        self.assertEqual((snapshot.width, snapshot.height), (16, 16))
-        self.assertEqual(snapshot.jpeg, edge.jpeg)
-        self.assertEqual(snapshot.bgr.shape, (16, 16, 3))
-        self.assertEqual(snapshot.bgr[0, 0].tolist(), [30, 20, 10])
-        self.assertEqual(snapshot.render_position, (1.2, -0.3, 2.1))
-        self.assertEqual(snapshot.render_orientation, (0.0, 0.0, 0.0, 1.0))
-        np.testing.assert_allclose(
-            snapshot.camera_matrix,
-            np.asarray(edge.metadata["cameraMatrix"]).reshape(3, 3),
-        )
-        np.testing.assert_allclose(
-            snapshot.distortion,
-            np.asarray(edge.metadata["distortion"]),
-        )
-        self.assertEqual(edge.deleted, ["snapshot-1"])
-        self.assertEqual(
-            [(method, path) for method, path, _body in edge.requests],
-            [
-                ("GET", "/healthz"),
-                ("POST", "/api/v1/sources/usb_cam/snapshots"),
-                ("GET", "/api/v1/snapshots/snapshot-1/jpeg"),
-                ("GET", "/api/v1/snapshots/snapshot-1/raw"),
-                ("DELETE", "/api/v1/snapshots/snapshot-1"),
-            ],
-        )
-
-    def test_detection_capture_requests_fresh_jpeg_only_and_decodes_near_vga_area(self):
+    def test_detection_capture_is_same_frame_jpeg_only_and_preserves_source_plane(self):
         with FakeMediaEdge() as edge:
-            image = np.zeros((1080, 1920, 3), dtype=np.uint8)
-            image[:, :, 1] = 180
-            ok, encoded = cv2.imencode(".jpg", image)
-            self.assertTrue(ok)
-            edge.jpeg = encoded.tobytes()
-            edge.metadata["width"] = 1920
-            edge.metadata["height"] = 1080
-            client = MediaSnapshotClient(edge.address, "usb_cam", 1.0)
+            snapshot = edge.client.capture_detection(maximum_pixels=4096)
+            self.assertEqual((snapshot.width, snapshot.height), (384, 216))
+            self.assertLessEqual(snapshot.bgr.shape[0] * snapshot.bgr.shape[1], 4096)
+            self.assertFalse(edge.requests[0][1]["includeRgb"])
+            self.assertEqual(snapshot.jpeg, edge.jpeg)
+            np.testing.assert_array_equal(snapshot.camera_matrix.reshape(-1), edge.metadata["cameraMatrix"])
 
-            snapshot = client.capture_detection()
+    def test_size_mismatch_or_invalid_frame_releases_exact_snapshot(self):
+        for corrupt in ("length", "pixel", "clock", "sequence", "pose"):
+            with self.subTest(corrupt=corrupt), FakeMediaEdge() as edge:
+                if corrupt == "length": edge.announced_rgb_delta = 1
+                if corrupt == "pixel": edge.metadata["pixelFormat"] = "bgr8"
+                if corrupt == "clock": edge.metadata["timestampClockDomain"] = "invented"
+                if corrupt == "sequence": edge.metadata["frameSequence"] = 0
+                if corrupt == "pose": edge.metadata.pop("poseFrameId")
+                with self.assertRaises(MediaSnapshotError): edge.client.capture()
+                self.assertEqual(len(edge.deleted), 1)
 
-        self.assertEqual((snapshot.width, snapshot.height), (1920, 1080))
-        self.assertEqual(snapshot.bgr.shape[:2], (415, 739))
-        self.assertLessEqual(snapshot.bgr.shape[0] * snapshot.bgr.shape[1], 640 * 480)
-        self.assertIn(
-            (
-                "POST",
-                "/api/v1/sources/usb_cam/snapshots",
-                b'{"includeRgb":false,"requestKeyframe":false,"requireFresh":true}',
-            ),
-            edge.requests,
-        )
-        self.assertNotIn(
-            ("GET", "/api/v1/snapshots/snapshot-1/raw"),
-            [(method, path) for method, path, _body in edge.requests],
-        )
-        self.assertEqual(edge.deleted, ["snapshot-1"])
-
-    def test_capture_deletes_snapshot_after_raw_metadata_validation_fails(self):
+    def test_simulation_zero_time_and_unavailable_calibration_are_preserved(self):
         with FakeMediaEdge() as edge:
-            edge.corrupt_raw_headers = True
-            client = MediaSnapshotClient(edge.address, "usb_cam", 1.0)
+            edge.metadata.update(timestampNanoseconds=0, calibrationState="unavailable",
+                                 cameraMatrix=[], distortion=[])
+            snapshot = edge.client.capture()
+            self.assertEqual(snapshot.timestamp_nanoseconds, 0)
+            self.assertIsNone(snapshot.camera_matrix)
+            self.assertIsNone(snapshot.distortion)
 
-            with self.assertRaisesRegex(MediaSnapshotError, "metadata does not match"):
-                client.capture()
-
-        self.assertEqual(edge.deleted, ["snapshot-1"])
-        self.assertEqual(edge.requests[-1][:2], ("DELETE", "/api/v1/snapshots/snapshot-1"))
-
-    def test_capture_accepts_simulation_epoch_timestamp_zero(self):
+    def test_bound_instance_conflict_is_not_rediscovered_or_replayed(self):
         with FakeMediaEdge() as edge:
-            edge.metadata["timestampNanoseconds"] = 0
-            client = MediaSnapshotClient(edge.address, "usb_cam", 1.0)
+            edge.host.instance_id = "edge-2"
+            with self.assertRaises(MediaSnapshotError): edge.client.capture()
+            self.assertEqual(edge.requests, [])
+            self.assertEqual(edge.client.last_cleanup_error, "TransportError")
 
-            snapshot = client.capture()
-
-        self.assertEqual(snapshot.timestamp_nanoseconds, 0)
-        self.assertEqual(edge.deleted, ["snapshot-1"])
-
-    def test_capture_rejects_a_non_rgb_snapshot_contract(self):
+    def test_health_requires_configured_source_and_bootstrap_rejects_http(self):
         with FakeMediaEdge() as edge:
-            edge.metadata["pixelFormat"] = "bgr8"
-            client = MediaSnapshotClient(edge.address, "usb_cam", 1.0)
+            edge.sources.clear()
+            with self.assertRaises(MediaSnapshotError): edge.client.health()
+        for address in ("http://localhost:18090", "relative.sock"):
+            with self.assertRaises(ValueError): MediaSnapshotClient(address, "usb_cam")
+        with self.assertRaises(ValueError): MediaSnapshotClient("/private/edge.sock", "bad source")
+        with self.assertRaises(ValueError): MediaSnapshotClient("/private/edge.sock", "usb_cam", float("inf"))
 
-            with self.assertRaisesRegex(MediaSnapshotError, "pixel format"):
-                client.capture()
-
-        self.assertEqual(edge.deleted, ["snapshot-1"])
-
-    def test_health_requires_the_configured_source(self):
+    def test_extra_or_encoded_mime_parts_are_rejected(self):
         with FakeMediaEdge() as edge:
-            edge.sources = [{"id": "rear"}]
-            client = MediaSnapshotClient(edge.address, "usb_cam", 1.0)
-
-            with self.assertRaisesRegex(MediaSnapshotError, "source is unavailable"):
-                client.health()
-
-    def test_rejects_remote_addresses_unstable_ids_and_invalid_timeouts(self):
-        invalid_addresses = [
-            "https://127.0.0.1:18090",
-            "http://192.0.2.20:18090",
-            "http://operator:secret@127.0.0.1:18090",
-            "http://127.0.0.1:18090/api",
-            "http://127.0.0.1:18090?source=usb_cam",
-            "http://127.0.0.1:18090#source",
-        ]
-        for address in invalid_addresses:
-            with self.subTest(address=address):
-                with self.assertRaises(ValueError):
-                    MediaSnapshotClient(address, "usb_cam")
-        for source_id in ("", ".hidden", "../camera", "front/camera"):
-            with self.subTest(source_id=source_id):
-                with self.assertRaisesRegex(ValueError, "stable identifier"):
-                    MediaSnapshotClient("http://127.0.0.1:18090", source_id)
-        for timeout in (0, -1, float("nan"), float("inf")):
-            with self.subTest(timeout=timeout):
-                with self.assertRaisesRegex(ValueError, "timeout must be positive"):
-                    MediaSnapshotClient(
-                        "http://127.0.0.1:18090",
-                        "usb_cam",
-                        timeout,
-                    )
+            def malformed(value):
+                body = b'--b\r\nContent-Type: application/json\r\nContent-Disposition: inline; name="metadata"\r\nContent-Transfer-Encoding: base64\r\n\r\ne30=\r\n--b--\r\n'
+                return Response(body, content_type="multipart/mixed; boundary=b")
+            edge.custom_capture = malformed
+            with self.assertRaises(MediaSnapshotError): edge.client.capture()
+            self.assertEqual(len(edge.deleted), 1)
 
 
-if __name__ == "__main__":
-    unittest.main()
+if __name__ == "__main__": unittest.main()

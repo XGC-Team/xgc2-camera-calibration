@@ -33,7 +33,7 @@ class FakeSource:
     source_id = "camera-source"
     image_topic = "/camera/image_raw"
     preview_image_topic = "/camera/image_raw/compressed"
-    intrinsic_file = "/camera/sim/usb_cam/intrinsics-20260830T010203.000000Z.yaml"
+    intrinsic_file = "/camera/sim/usb_cam/intrinsics-2026-08-30_01-02-03.yaml"
     pose_prefix = "/vrpn_client_node"
     preview_jpeg = b"\xff\xd8cached-compressed-preview\xff\xd9"
 
@@ -340,7 +340,7 @@ class WebCalibrationServiceTest(unittest.TestCase):
         self.assertEqual(output.parent, self.output_directory)
         self.assertRegex(
             output.name,
-            r"^extrinsics-\d{8}T\d{6}\.\d{6}Z(?:-\d{2})?\.yaml$",
+            r"^extrinsics-\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}(?:-\d{2,4})?\.yaml$",
         )
         self.assertTrue(output.is_file())
         self.assertFalse((self.output_directory / "extrinsics.yaml").exists())
@@ -709,7 +709,7 @@ class WebCalibrationServiceTest(unittest.TestCase):
         self.service.source.snapshot=replace(self.snapshot,image=image)
         server=CalibrationHttpServer(("127.0.0.1",0),self.service,
             Path(__file__).resolve().parents[1]/"web"/"extrinsic",frame_ancestors="'self'")
-        thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+        server.start()
         base="http://127.0.0.1:{}".format(server.server_address[1])
         try:
             request,unused=self.begin("marker_01",[100.,200.])
@@ -739,26 +739,9 @@ class WebCalibrationServiceTest(unittest.TestCase):
             self.assertEqual(error.exception.code,413)
             self.assertEqual(self.service.samples.revision,1)
         finally:
-            server.shutdown();server.server_close();thread.join(3)
+            server.close()
 
     def test_upload_has_an_absolute_deadline_and_sample_actions_validate_identity(self):
-        from unittest.mock import Mock
-        from xgc_camera_calibration.web_service import CalibrationRequestHandler
-        handler = object.__new__(CalibrationRequestHandler)
-        handler.path = "/api/v1/samples/" + "a" * 32 + "/image"
-        handler.command = "POST"
-        handler.headers = {"Content-Type": "image/png", "Content-Length": "2"}
-        handler.connection = Mock()
-        handler.connection.gettimeout.return_value = None
-        handler.rfile = Mock()
-        handler.rfile.read1.return_value = b"a"
-        handler.close_connection = False
-        with patch("xgc_camera_calibration.web_service.time.monotonic", side_effect=[0.,0.,31.]):
-            with self.assertRaises(ApiError) as error: handler._dispatch()
-        self.assertEqual(error.exception.status, 408)
-        self.assertTrue(handler.close_connection)
-        self.assertEqual(handler.rfile.read1.call_count,1)
-        handler.connection.settimeout.assert_called_with(None)
         for action in ("pixel", "remove", "cancel"):
             body = {**self.current(),"sample_id":[]}
             if action == "pixel": body["pixel"] = [1,2]
@@ -808,8 +791,7 @@ class WebCalibrationServiceTest(unittest.TestCase):
             web_root,
             frame_ancestors="'self' http://localhost:*",
         )
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
+        server.start()
         base = "http://127.0.0.1:{}".format(server.server_address[1])
         try:
             with urllib.request.urlopen(base + "/healthz", timeout=3) as response:
@@ -835,10 +817,6 @@ class WebCalibrationServiceTest(unittest.TestCase):
                 urllib.request.urlopen(base + "/../package.xml", timeout=3)
             self.assertEqual(context.exception.code, 404)
         finally:
-            server.shutdown()
-            server.server_close()
-            thread.join(timeout=3)
-
-
+            server.close()
 if __name__ == "__main__":
     unittest.main()

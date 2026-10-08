@@ -73,7 +73,7 @@ body,
   padding: var(--space-md) var(--space-lg);
   color: var(--color-text-muted);
   font-size: var(--font-sm);
-  line-height: 1.45;
+  line-height: var(--type-body-line-height);
 }
 
 .calibration-side {
@@ -136,7 +136,7 @@ body,
   min-height: 1.4em;
   margin-top: var(--space-layout-compact);
   color: var(--color-text);
-  font: var(--font-sm)/1.4 var(--font-mono);
+  font: var(--font-sm)/var(--type-body-line-height) var(--font-mono);
 }
 
 #detection-sample {

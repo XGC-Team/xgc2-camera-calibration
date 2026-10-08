@@ -20,8 +20,8 @@ class ExtrinsicSelectionWatcherTest(unittest.TestCase):
     def test_selection_watcher_follows_pointer_not_directory_mtime(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "camera"
-            selected = root / "phy" / "usb_cam" / "extrinsics-20260830T010000.000000Z.yaml"
-            newer = root / "phy" / "usb_cam" / "extrinsics-20260830T020000.000000Z.yaml"
+            selected = root / "phy" / "usb_cam" / "extrinsics-2026-08-30_01-00-00.yaml"
+            newer = root / "phy" / "usb_cam" / "extrinsics-2026-08-30_02-00-00.yaml"
             for path, candidate in ((selected, "candidate-selected"), (newer, "candidate-newer")):
                 save_extrinsic(
                     path,
@@ -52,7 +52,7 @@ class ExtrinsicSelectionWatcherTest(unittest.TestCase):
     def test_selection_watcher_can_require_pointer_update(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "camera"
-            result = root / "phy" / "usb_cam" / "extrinsics-20260830T010000.000000Z.yaml"
+            result = root / "phy" / "usb_cam" / "extrinsics-2026-08-30_01-00-00.yaml"
             save_extrinsic(
                 result,
                 ExtrinsicResult(

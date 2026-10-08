@@ -117,6 +117,7 @@ wait_http() {
   done
   return 1
 }
+python3 -c 'import sys; assert sys.version_info >= (3,10), "native calibration requires Python >=3.10"; import xgc2_xrpc, aiohttp, httpx'
 roscore -p 11359 >"${RUNTIME}/roscore.log" 2>&1 &
 ROSCORE_PID="$!"
 for _ in $(seq 1 50); do
@@ -125,29 +126,37 @@ for _ in $(seq 1 50); do
 done
 rosparam list >/dev/null
 
-python3 -c '
-import json
-from http.server import BaseHTTPRequestHandler, HTTPServer
-
-class Handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path != "/healthz":
-            self.send_error(404)
-            return
-        payload = json.dumps({"sources": [{"id": "usb_cam"}]}).encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(payload)))
-        self.end_headers()
-        self.wfile.write(payload)
-
-    def log_message(self, _format, *_args):
-        pass
-
-HTTPServer(("127.0.0.1", 18790), Handler).serve_forever()
-' >"${RUNTIME}/media-edge.log" 2>&1 &
+# This fixture exercises the installed native discovery/health binding only;
+# it never fabricates a camera frame or a successful calibration.
+MEDIA_EDGE_RPC_SOCKET="${RUNTIME}/media-edge.sock"
+python3 - "${MEDIA_EDGE_RPC_SOCKET}" <<'PYMEDIA' >"${RUNTIME}/media-edge.log" 2>&1 &
+import signal, socket, sys, threading
+from xgc2_xrpc import Fault, Host, Runtime
+path = sys.argv[1]
+ref = {"target_id": socket.gethostname(), "service": "media-edge", "api_version": "v1",
+       "instance_id": "package-smoke", "profile": "http.v1",
+       "endpoint": {"kind": "unix", "address": path}}
+runtime = Runtime()
+routes = {("GET", "/v1/describe"): lambda c, r: {"service_ref": ref, "sources": [{"id": "usb_cam"}]},
+          ("GET", "/v1/health"): lambda c, r: {"sources": [{"id": "usb_cam"}]}}
+host = Host(path, routes, runtime=runtime, instance_id="package-smoke",
+            discovery_routes=("/v1/describe",)).start()
+stop = threading.Event()
+for signum in (signal.SIGTERM, signal.SIGINT):
+    signal.signal(signum, lambda *_: stop.set())
+try:
+    stop.wait()
+finally:
+    host.close()
+    runtime.close()
+PYMEDIA
 MEDIA_EDGE_PID="$!"
-wait_http 18790 "${MEDIA_EDGE_PID}"
+for _ in $(seq 1 50); do
+  if [ -S "${MEDIA_EDGE_RPC_SOCKET}" ]; then break; fi
+  if ! kill -0 "${MEDIA_EDGE_PID}" 2>/dev/null; then exit 1; fi
+  sleep 0.1
+done
+[ -S "${MEDIA_EDGE_RPC_SOCKET}" ]
 
 "${PREFIX}/lib/xgc_camera_calibration/extrinsic_tf_publisher.py" \
   --resolved-extrinsic-json "${RESOLVED_EXTRINSIC_JSON}" --frame-roles-json "${FRAME_ROLES_JSON}" \
@@ -176,14 +185,15 @@ PYREADY
   _image_topic:=/not_installed_by_this_product/image_raw \
   _intrinsic_file:="${INTRINSIC_FILE}" \
   _calibration_root:="${CALIBRATION_ROOT}" _calibration_mode:=sim \
-  _camera_name:="${CAMERA_NAME}" _http_port:=18765 \
+  _camera_name:="${CAMERA_NAME}" _rpc_socket:="${RUNTIME}/extrinsic.sock" _target_id:="$(hostname)" _http_port:=18765 \
   _parent_frame:=world _child_frame:=xgc_world_camera_optical_frame _pose_coordinate_source:=experiment-world \
   >"${RUNTIME}/extrinsic.log" 2>&1 &
 EXTRINSIC_PID="$!"
 "${PREFIX}/lib/xgc_camera_calibration/intrinsic_calibrator_web.py" \
   __name:=xgc_camera_intrinsic_calibrator_web \
-  _media_edge_address:=http://127.0.0.1:18790 \
+  _media_edge_rpc_socket:="${MEDIA_EDGE_RPC_SOCKET}" \
   _media_source_id:=usb_cam _snapshot_timeout:=1 \
+  _rpc_socket:="${RUNTIME}/intrinsic.sock" _target_id:="$(hostname)" \
   _http_port:=18766 _calibration_root:="${RUNTIME}/calibrations" \
   _calibration_mode:=sim _camera_name:=usb_cam \
   >"${RUNTIME}/intrinsic.log" 2>&1 &

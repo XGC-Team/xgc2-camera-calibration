@@ -25,11 +25,11 @@ import {
 } from '@xgc2/ui-react'
 import '@xgc2/ui-react/styles.css'
 import './styles.css'
+import { ManagedSkinStore } from './managed-skin-store'
 
 type StatusTone = 'neutral' | 'info' | 'success' | 'warning' | 'danger'
 
-const SKIN_STORAGE_KEY = 'xgc2-camera-calibration.skin'
-initializeSkin({ defaultSkin: 'dark', storageKey: SKIN_STORAGE_KEY })
+const skinStore = new ManagedSkinStore()
 
 function useLegacyMutation(ref: RefObject<HTMLElement | null>, sync: () => void) {
   useEffect(() => {
@@ -146,14 +146,22 @@ function LegacyCoverage() {
 }
 
 function ThemeControl() {
-  const [skin, setSkin] = useSkin({ defaultSkin: 'dark', storageKey: SKIN_STORAGE_KEY })
+  const [skin, setSkin] = useSkin({ store: skinStore })
+  const [issue, setIssue] = useState(skinStore.getIssue())
+  useEffect(() => skinStore.subscribe(() => setIssue(skinStore.getIssue())), [])
   return (
-    <SegmentedControl
-      ariaLabel="Appearance"
-      value={skin}
-      options={[{ label: 'Light', value: 'light' }, { label: 'Dark', value: 'dark' }]}
-      onValueChange={(value) => setSkin(value === 'light' ? 'light' : 'dark')}
-    />
+    <>
+      <SegmentedControl
+        ariaLabel="Appearance"
+        value={skin}
+        options={[{ label: 'Light', value: 'light' }, { label: 'Dark', value: 'dark' }]}
+        onValueChange={async (value) => {
+          try { await setSkin(value === 'light' ? 'light' : 'dark') }
+          catch { setIssue(skinStore.getIssue()) }
+        }}
+      />
+      {issue ? <StatusText status="Appearance unavailable" tone="danger">{issue}</StatusText> : null}
+    </>
   )
 }
 
@@ -203,10 +211,12 @@ function IntrinsicPage() {
                 <div className="calibration-actions">
                   <Button id="btn-candidate" className="calibration-action" disabled>Analyze candidate</Button>
                   <Button id="btn-save" className="calibration-action" tone="primary" appearance="solid" disabled>Save</Button>
+                  <Button id="btn-apply-metadata" className="calibration-action" disabled>Apply CameraInfo estimates</Button>
                   <Button id="btn-continue" className="calibration-action" disabled>Continue collecting</Button>
                   <Button id="btn-reset" className="calibration-action">Reset</Button>
                 </div>
                 <LegacyStatus id="status" initial="" hideValues={['']} />
+                <p id="metadata-application" className="calibration-hint">Source-owned CameraInfo metadata application is unavailable.</p>
                 <LegacyCodeResult id="result" initiallyHidden />
               </Panel>
 
@@ -333,6 +343,21 @@ function ExtrinsicPage() {
 
 const root = document.getElementById('app')
 if (!root) throw new Error('Camera calibration root is unavailable')
-flushSync(() => createRoot(root).render(__CALIBRATION_PAGE__ === 'intrinsic' ? <IntrinsicPage /> : <ExtrinsicPage />))
-if (__CALIBRATION_PAGE__ === 'intrinsic') void import('./intrinsic-legacy')
-else void import('./extrinsic-legacy')
+const application = createRoot(root)
+async function startApplication() {
+  try {
+    await skinStore.restore()
+    initializeSkin({ store: skinStore })
+    skinStore.connectEvents()
+    flushSync(() => application.render(__CALIBRATION_PAGE__ === 'intrinsic' ? <IntrinsicPage /> : <ExtrinsicPage />))
+    if (__CALIBRATION_PAGE__ === 'intrinsic') await import('./intrinsic-legacy')
+    else await import('./extrinsic-legacy')
+  } catch (error) {
+    application.render(<Panel title="Appearance preferences unavailable">
+      <Notice role="alert" tone="danger">{(error as Error).message}</Notice>
+      <Button onClick={() => { void startApplication() }}>Retry</Button>
+    </Panel>)
+  }
+}
+window.addEventListener('pagehide', () => skinStore.close())
+void startApplication()

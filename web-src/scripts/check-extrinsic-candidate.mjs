@@ -25,7 +25,9 @@ try {
    const request=route.request(),path=new URL(request.url()).pathname.slice(1);
    requests.push([request.method(),path]);
    if(request.method()==='GET') {
-    if(path==='api/v1/state')await route.fulfill({json:state});
+    if(path==='api/v1/preferences')await route.fulfill({json:{skin:'dark',version:'0',token:{database_id:'fixture-db',schema:'camera-calibration.preferences.v1',revision:'0'}}});
+    else if(path==='api/v1/events')await route.fulfill({contentType:'text/event-stream',body:'event: state\ndata: '+JSON.stringify({preferences:{available:true,snapshot:{skin:'dark',version:'0',token:{database_id:'fixture-db',schema:'camera-calibration.preferences.v1',revision:'0'}}}})+'\n\n'});
+    else if(path==='api/v1/state')await route.fulfill({json:state});
     else if(path==='api/v1/image.jpg'){imageReads++;if(imageReads===2){heldImage=route;resolveHeld();}else await route.fulfill({contentType:'image/png',body:imageReads===1?red:blue});}
     else if(images.has(path))await route.fulfill({contentType:'image/png',body:images.get(path)});
     else await route.fulfill({contentType:'text/html',body:fixture.html});

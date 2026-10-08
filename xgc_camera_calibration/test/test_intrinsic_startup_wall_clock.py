@@ -37,7 +37,9 @@ class FakeWallClock:
 class IntrinsicStartupWallClockTest(unittest.TestCase):
     def setUp(self):
         self.clock = FakeWallClock()
-        self.params = {"~camera_control": True, "~camera_control_timeout": 0.25}
+        self.params = {"~camera_control": True, "~camera_control_timeout": 0.25,
+                       "~simulation_endpoint": "/granted/world.sock"}
+        self.runtime = object()
         self.ros = types.ModuleType("rospy")
         self.ros.get_param = lambda name, default=None: self.params.get(name, default)
         self.ros.is_shutdown = Mock(return_value=False)
@@ -81,57 +83,38 @@ class IntrinsicStartupWallClockTest(unittest.TestCase):
 
     def test_disabled_control_does_not_construct_adapter(self):
         self.params["~camera_control"] = False
-        self.assertIsNone(self.entrypoint.maybe_camera_control((2.0, 0.0, 2.2)))
+        self.assertIsNone(self.entrypoint.maybe_camera_control((2.0, 0.0, 2.2), runtime=self.runtime))
         self.control_factory.assert_not_called()
 
     def test_available_model_attaches_immediately(self):
         self.control.available.return_value = True
-        self.assertIs(self.entrypoint.maybe_camera_control((2.0, 0.0, 2.2)), self.control)
+        self.assertIs(self.entrypoint.maybe_camera_control((2.0, 0.0, 2.2), runtime=self.runtime), self.control)
         self.assertEqual(self.clock.sleeps, [])
 
-    def test_frozen_sim_time_expires_on_wall_clock(self):
-        self.assertIsNone(self.entrypoint.maybe_camera_control((2.0, 0.0, 2.2)))
-        self.assertAlmostEqual(self.clock.now, 100.25)
+    def test_native_constructor_receives_endpoint_runtime_and_bounded_timeout(self):
+        self.entrypoint.maybe_camera_control((2.0, 0.0, 2.2), runtime=self.runtime)
+        self.control_factory.assert_called_once_with(
+            "gazebo_static_camera", (2.0, 0.0, 2.2), connection_timeout=0.25,
+            endpoint="/granted/world.sock", runtime=self.runtime,
+        )
         self.ros.Time.now.assert_not_called()
         self.ros.Rate.assert_not_called()
-        self.ros.logwarn.assert_called_once()
-
-    def test_model_arriving_during_poll_attaches(self):
-        self.control.available.side_effect = [False, True]
-        self.assertIs(self.entrypoint.maybe_camera_control((2.0, 0.0, 2.2)), self.control)
-        self.assertEqual(self.clock.sleeps, [0.1])
-
-    def test_constructor_receives_configured_timeout(self):
-        self.control.available.return_value = True
-        self.entrypoint.maybe_camera_control((2.0, 0.0, 2.2))
-        self.control_factory.assert_called_once_with(
-            "gazebo_static_camera", (2.0, 0.0, 2.2), connection_timeout=0.25
-        )
-
-    def test_constructor_consumes_same_timeout_budget(self):
-        def construct(*args, **kwargs):
-            self.clock.now += 0.25
-            return self.control
-        self.control_factory.side_effect = construct
-        self.assertIsNone(self.entrypoint.maybe_camera_control((2.0, 0.0, 2.2)))
+        self.control.available.assert_not_called()
         self.assertEqual(self.clock.sleeps, [])
 
-    def test_adapter_error_falls_back(self):
-        self.control_factory.side_effect = RuntimeError("Gazebo unavailable")
-        self.assertIsNone(self.entrypoint.maybe_camera_control((2.0, 0.0, 2.2)))
+    def test_native_unavailable_world_leaves_optional_camera_agnostic(self):
+        self.control_factory.side_effect = RuntimeError("native entity unavailable")
+        self.assertIsNone(self.entrypoint.maybe_camera_control(
+            (2.0, 0.0, 2.2), runtime=self.runtime))
         self.ros.logwarn.assert_called_once()
-
-    def test_shutdown_stops_polling(self):
-        self.clock.on_sleep = lambda: setattr(self.ros.is_shutdown, "return_value", True)
-        self.assertIsNone(self.entrypoint.maybe_camera_control((2.0, 0.0, 2.2)))
-        self.assertEqual(self.clock.sleeps, [0.1])
+        self.assertEqual(self.clock.sleeps, [])
 
     def test_invalid_timeout_fails_before_constructing_adapter(self):
         for value in (0.0, -1.0, math.nan, math.inf, -math.inf):
             with self.subTest(timeout=value):
                 self.params["~camera_control_timeout"] = value
                 with self.assertRaisesRegex(ValueError, "finite and positive"):
-                    self.entrypoint.maybe_camera_control((2.0, 0.0, 2.2))
+                    self.entrypoint.maybe_camera_control((2.0, 0.0, 2.2), runtime=self.runtime)
         self.control_factory.assert_not_called()
 
 

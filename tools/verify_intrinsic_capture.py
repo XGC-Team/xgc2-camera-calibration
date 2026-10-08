@@ -9,7 +9,6 @@ import hashlib
 import json
 from pathlib import Path
 import sys
-import threading
 import time
 import urllib.request
 
@@ -66,10 +65,8 @@ def main():
             normalized[kind + '_bytes'] = len(data)
         service._evidence_samples.append(normalized)
     service._save_checkpoint_locked()
-    server = CalibrationHttpServer(('127.0.0.1', 0), object(), PACKAGE / 'web/intrinsic',
-        frame_ancestors="'self'", intrinsic_service=service)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
+    server = CalibrationHttpServer(('127.0.0.1', 0), None, PACKAGE / 'web/intrinsic',
+        frame_ancestors="'self'", intrinsic_service=service).start()
     base = f'http://127.0.0.1:{server.server_address[1]}/api/v1/intrinsic/'
     latencies = []
     def request(path, body=None):
@@ -118,9 +115,7 @@ def main():
         (output / 'acceptance.json').write_text(json.dumps(report, indent=2))
         print(json.dumps(report), flush=True)
     finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(2)
+        server.close()
 
 
 if __name__ == '__main__':

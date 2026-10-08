@@ -243,11 +243,16 @@ class IntrinsicSolverTest(unittest.TestCase):
         np.testing.assert_allclose(result.distortion, truth_d, atol=0.001)
 
     def test_parallel_leave_one_out_matches_serial_results_and_order(self):
+        from xgc2_xrpc import Runtime
         board, square, _k, _d, images = _project_nonzero_distortion_views()
-        with mock.patch.object(solver, "_intrinsic_validation_workers", return_value=1):
-            serial = solver.calibrate_intrinsic(images, board, square, (1280, 720))
-        with mock.patch.object(solver, "_intrinsic_validation_workers", return_value=4):
-            parallel = solver.calibrate_intrinsic(images, board, square, (1280, 720))
+        serial = solver.calibrate_intrinsic(images, board, square, (1280, 720))
+        runtime = Runtime(blocking_workers=4)
+        try:
+            parallel = solver.calibrate_intrinsic(images, board, square, (1280, 720),
+                validation_submit=lambda function, *args: runtime.submit_blocking(runtime, function, *args),
+                validation_workers=4)
+        finally:
+            runtime.close()
         np.testing.assert_array_equal(serial.camera_matrix, parallel.camera_matrix)
         self.assertEqual(serial.diagnostics.stability, parallel.diagnostics.stability)
 
@@ -268,17 +273,24 @@ class IntrinsicSolverTest(unittest.TestCase):
             tuple(i for i in range(100, 113) if i != 103))
 
     def test_parallel_progress_failure_propagates_without_finishing_all_folds(self):
+        from xgc2_xrpc import Runtime
         board, square, _k, _d, images = _project_nonzero_distortion_views()
         objects, corners, size = solver._prepare_calibration_observations(images, board, square, (1280, 720), None)
         reference = solver._run_extended_calibration(objects, corners, size)
         original = solver._run_extended_calibration
         def expired(*_args):
             raise TimeoutError("analysis deadline")
-        with mock.patch.object(solver, "_intrinsic_validation_workers", return_value=2), \
-             mock.patch.object(solver, "_run_extended_calibration", wraps=original) as fits:
-            with self.assertRaisesRegex(TimeoutError, "analysis deadline"):
-                solver._leave_one_out_stability(objects, corners, size, reference, progress=expired)
-            self.assertLessEqual(fits.call_count, 2)
+        runtime = Runtime(blocking_workers=2)
+        try:
+            with mock.patch.object(solver, "_run_extended_calibration", wraps=original) as fits:
+                with self.assertRaisesRegex(TimeoutError, "analysis deadline"):
+                    solver._leave_one_out_stability(objects, corners, size, reference, progress=expired,
+                        validation_submit=lambda function, *args: runtime.submit_blocking(runtime, function, *args),
+                        validation_workers=2)
+                self.assertLessEqual(fits.call_count, 2)
+                self.assertFalse(runtime._jobs)
+        finally:
+            runtime.close()
 
     def test_consistent_high_noise_is_not_rejected_by_an_absolute_rms_gate(self):
         board, square, _truth_k, _truth_d, image_points = (
