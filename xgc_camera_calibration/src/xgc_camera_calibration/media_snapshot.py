@@ -268,15 +268,14 @@ class MediaSnapshotClient:
         return metadata, payloads[1], payloads[2] if include_rgb else b""
 
     def _capture(self, include_rgb, maximum_pixels):
-        identity = uuid.uuid4().hex
+        cleanup_id = None
         try:
             response = self.client.call("/v1/media/sources/{}/capture".format(quote(self.source_id, safe="")),
-                {"snapshotId": identity, "includeRgb": include_rgb,
-                 "requireFresh": True, "requestKeyframe": False}, timeout=self.timeout_seconds)
+                {"includeRgb": include_rgb, "requireFresh": True, "requestKeyframe": False},
+                method="POST", request_id=uuid.uuid4().hex, timeout=self.timeout_seconds)
             metadata, jpeg, raw = self._parts(response, include_rgb)
+            cleanup_id = self._snapshot_id(metadata)
             parsed = self._metadata(metadata)
-            if parsed["id"] != identity:
-                raise MediaSnapshotError("media snapshot identity does not match the capture request")
             if (metadata.get("jpegBytes") != len(jpeg) or metadata.get("rgbBytes") != len(raw)
                     or len(jpeg) < 2):
                 raise MediaSnapshotError("media snapshot announced lengths do not match frame bytes")
@@ -288,7 +287,7 @@ class MediaSnapshotClient:
             else:
                 bgr = self._decode_detection_jpeg(jpeg, parsed["width"], parsed["height"],
                     maximum_pixels or parsed["width"] * parsed["height"])
-            return MediaSnapshot(id=identity, source_id=parsed["source_id"], frame_id=parsed["frame_id"],
+            return MediaSnapshot(id=parsed["id"], source_id=parsed["source_id"], frame_id=parsed["frame_id"],
                 timestamp_nanoseconds=parsed["timestamp_nanoseconds"], width=parsed["width"],
                 height=parsed["height"], camera_matrix=None if parsed["camera_matrix"] is None else
                     np.asarray(parsed["camera_matrix"], dtype=np.float64).reshape(3, 3),
@@ -301,12 +300,13 @@ class MediaSnapshotClient:
             # transport cause, not a claim that capture never happened.
             raise MediaSnapshotError("media edge capture is unavailable") from error
         finally:
-            try:
-                self.client.call("/v1/media/snapshots/" + identity, method="DELETE",
-                                 timeout=min(2.0, self.timeout_seconds))
-                self.last_cleanup_error = None
-            except (Fault, TransportError, OSError, TimeoutError) as error:
-                self.last_cleanup_error = type(error).__name__
+            if cleanup_id is not None:
+                try:
+                    self.client.call("/v1/media/snapshots/" + cleanup_id, method="DELETE",
+                                     timeout=min(2.0, self.timeout_seconds))
+                    self.last_cleanup_error = None
+                except (Fault, TransportError, OSError, TimeoutError) as error:
+                    self.last_cleanup_error = type(error).__name__
 
     @staticmethod
     def _decode_detection_jpeg(

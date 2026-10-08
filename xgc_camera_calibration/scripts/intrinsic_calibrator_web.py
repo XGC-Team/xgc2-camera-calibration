@@ -71,7 +71,7 @@ def main():
     server = None
     try:
         snapshot_client = MediaSnapshotClient(
-            rospy.get_param("~media_edge_rpc_socket"),
+            rospy.get_param("~media_edge_rpc_socket", "/run/xgc2/media-edge/control/control.sock"),
             rospy.get_param("~media_source_id", "usb_cam"),
             float(rospy.get_param("~snapshot_timeout", 5.0)),
             runtime=runtime,
