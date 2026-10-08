@@ -607,7 +607,7 @@ class CalibrationHttpServer:
     def __init__(self, address, service, web_root, *, frame_ancestors,
                  allowed_origins=(), logger=None, intrinsic_service=None,
                  runtime=None, limits=None, upload_timeout=30.0, rpc_socket=None, target_id=None,
-                 validation_workers=2, preferences=None):
+                 validation_workers=2, preferences=None, binding=None):
         if service is None and intrinsic_service is None:
             raise ValueError("at least one of service / intrinsic_service is required")
         root = Path(web_root).resolve()
@@ -628,7 +628,16 @@ class CalibrationHttpServer:
         self.limits = limits or Limits(connections=16, in_flight=8,
             body_bytes=IMAGE_BYTES, response_bytes=1 << 30, call_timeout=3600.0)
         private_reference = None
-        if rpc_socket is not None:
+        if binding is not None:
+            if rpc_socket is not None or target_id is not None:
+                raise ValueError("Bootstrap binding is the calibration transport authority")
+            private_reference = binding.service_ref(uuid.uuid4().hex)
+            if (private_reference.service != "xgc2.calibration.v1.Calibration"
+                    or private_reference.api_version != "1" or private_reference.profile != "http.v1"
+                    or private_reference.endpoint.kind != "unix"):
+                raise ValueError("A private calibration service binding is required")
+            rpc_socket = private_reference.endpoint.address
+        elif rpc_socket is not None:
             private_reference = ServiceRef(target_id, "xgc2.calibration.v1.Calibration", "1",
                 uuid.uuid4().hex, "http.v1", Endpoint("unix", str(rpc_socket))).validate()
         self.runtime = runtime or Runtime(blocking_workers=4, max_calls=8,

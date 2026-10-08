@@ -14,7 +14,7 @@ from pathlib import Path
 
 import rospkg
 import rospy
-from xgc2_xrpc import Runtime
+from xgc2_xrpc import Runtime, load_bootstrap_input
 
 from xgc_camera_calibration.intrinsic_service import (
     IntrinsicCalibrationService,
@@ -63,19 +63,21 @@ def maybe_camera_control(board_center, *, runtime):
 
 def main():
     rospy.init_node("xgc_camera_intrinsic_calibrator_web")
-    runtime = Runtime(blocking_workers=4, max_calls=16, max_connections=24)
+    runtime = None
     snapshot_client = None
     metadata_client = None
     camera = None
     service = None
     server = None
     try:
+        bootstrap = load_bootstrap_input(str(rospy.get_param("~bootstrap_input")), role="client")
+        runtime = Runtime(blocking_workers=4, max_calls=16, max_connections=24)
         snapshot_client = MediaSnapshotClient(
             rospy.get_param("~media_edge_rpc_socket", "/run/xgc2/media-edge/control/control.sock"),
             rospy.get_param("~media_source_id", "usb_cam"),
             float(rospy.get_param("~snapshot_timeout", 5.0)),
             runtime=runtime,
-            local_target=str(rospy.get_param("~target_id")),
+            local_target=bootstrap.binding.target_id,
         )
         snapshot_client.health()
         package_root = Path(rospkg.RosPack().get_path("xgc_camera_calibration"))
@@ -168,8 +170,7 @@ def main():
             logger=lambda message: rospy.logdebug("Intrinsic web: %s", message),
             intrinsic_service=service,
             runtime=runtime,
-            rpc_socket=rospy.get_param("~rpc_socket"),
-            target_id=rospy.get_param("~target_id"),
+            binding=bootstrap.binding,
         )
         server.start()
     except Exception as error:
@@ -184,7 +185,8 @@ def main():
             snapshot_client.close()
         if metadata_client is not None:
             metadata_client.close()
-        runtime.close()
+        if runtime is not None:
+            runtime.close()
         return 1
 
     rospy.loginfo(

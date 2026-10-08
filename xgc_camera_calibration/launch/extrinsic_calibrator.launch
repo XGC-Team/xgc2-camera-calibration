@@ -1,6 +1,5 @@
 <launch>
-  <arg name="rpc_socket" />
-  <arg name="target_id" />
+  <arg name="bootstrap_input" />
   <arg name="image_topic" default="/usb_cam/image_raw" />
   <arg name="preview_image_topic" default="/usb_cam/image_raw/compressed" />
   <arg name="intrinsic_file" />
@@ -31,8 +30,7 @@
         name="xgc_camera_extrinsic_calibrator_web"
         output="screen"
         args="--resolved-extrinsic-json '$(arg resolved_extrinsic_json)' --frame-roles-json '$(arg frame_roles_json)' --application-state-param '$(arg application_state_param)'">
-    <param name="rpc_socket" value="$(arg rpc_socket)" />
-    <param name="target_id" value="$(arg target_id)" />
+    <param name="bootstrap_input" value="$(arg bootstrap_input)" />
     <param name="image_topic" value="$(arg image_topic)" />
     <param name="preview_image_topic" value="$(arg preview_image_topic)" />
     <param name="intrinsic_file" value="$(arg intrinsic_file)" />

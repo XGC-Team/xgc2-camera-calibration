@@ -43,7 +43,7 @@ class NativeStorageCalls:
     """Thin use of an owner-authenticated maintained XRPC Client.
 
     Credential resolution and native headers belong to the SDK composition
-    root. Until that official API is supplied, no unauthenticated fallback exists.
+    root. No unauthenticated fallback or product-owned HTTP session exists.
     """
     def __init__(self, client):
         self.client = client
@@ -64,6 +64,35 @@ class NativeStorageCalls:
             raise PreferenceError("invalid_response", "Preference storage returned invalid JSON", 502,
                 outcome="outcome_unknown" if path == "/v1/batch" else None,
                 request_id=request_id) from error
+
+
+def create_preferences(startup, *, grant, authorization, reference, scope, runtime):
+    """Borrow explicit deployment grants and the composition owner's Runtime.
+
+    The owner injects the returned domain into its Host and closes the returned
+    client before closing Runtime. This function never reads application fields.
+    """
+    from xgc2_xrpc import Client, Limits, ServiceRef
+    if not isinstance(grant, str) or grant not in startup.binding.storage_grants:
+        raise ValueError("An explicitly declared preference storage grant is required")
+    if not isinstance(reference, ServiceRef):
+        raise ValueError("An observed typed preference storage reference is required")
+    reference.validate()
+    if (reference.target_id != startup.binding.target_id
+            or reference.service != "xgc2.storage.v1.Storage" or reference.api_version != "1"
+            or reference.profile != "http.v1" or reference.endpoint.kind != "unix"):
+        raise ValueError("A target-local Storage v1 reference is required")
+    headers = startup.resolve_grant(authorization, "authorization").headers
+    client = Client.from_service(reference, runtime=runtime,
+        local_target=startup.binding.target_id, headers=headers,
+        limits=Limits(connections=2, in_flight=4, body_bytes=64 << 10,
+                      response_bytes=128 << 10, call_timeout=5.0))
+    try:
+        domain = PreferencesDomain(NativeStorageCalls(client), dict(scope))
+    except BaseException:
+        client.close()
+        raise
+    return domain, client
 
 
 class PreferencesDomain:
