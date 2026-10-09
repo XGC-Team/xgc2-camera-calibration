@@ -44,7 +44,9 @@ docker run --rm \
       -o "$sdk_wheel"
     echo "8e505ab2366eed198dcd4343e758fed5b7936990b2a72ba635d73d81b195187c  $sdk_wheel" | sha256sum -c -
     rm -rf /workspace/work/sdk
-    python3 -m pip install --no-index --no-deps --target /workspace/work/sdk "$sdk_wheel"
+    python3 -m zipfile -e "$sdk_wheel" /workspace/work/sdk
+    printf "%s\n" "{\"url\":\"https://github.com/XGC-Team/xgc2-xrpc/releases/download/v0.1.0-1/xgc2_xrpc-0.1.0-py3-none-any.whl\",\"archive_info\":{\"hashes\":{\"sha256\":\"8e505ab2366eed198dcd4343e758fed5b7936990b2a72ba635d73d81b195187c\"}}}" \
+      > /workspace/work/sdk/xgc2_xrpc-0.1.0.dist-info/direct_url.json
     export PYTHONPATH="/workspace/work/sdk:${PYTHONPATH:-}"
     catkin_make -DCMAKE_BUILD_TYPE=RelWithDebInfo
     ROS_HOME=/workspace/work/ros-home ROS_LOG_DIR=/workspace/work/ros-log catkin_make run_tests
