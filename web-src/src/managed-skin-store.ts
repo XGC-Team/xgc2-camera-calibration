@@ -78,12 +78,12 @@ export class ManagedSkinStore implements SkinStore {
     } finally { clearTimeout(deadline) }
   }
   async restore() {
-    try { this.publish(snapshot(await this.call('/api/v1/preferences'))) }
+    try { this.publish(snapshot(await this.call('api/v1/preferences'))) }
     catch (error) { this.issue = String((error as Error).message); this.notify(); throw error }
   }
   private async resolvePending() {
     if (!this.pending) return
-    const result = await this.call('/api/v1/preferences?request_id=' + encodeURIComponent(this.pending))
+    const result = await this.call('api/v1/preferences?request_id=' + encodeURIComponent(this.pending))
     if (result.request_id !== this.pending || result.durability !== 'sqlite-full') {
       throw new PreferenceFailure('Earlier appearance write has no FULL receipt', 'outcome_unknown', true)
     }
@@ -100,7 +100,7 @@ export class ManagedSkinStore implements SkinStore {
         if (this.current.skin === next) return
         requestId = crypto.randomUUID()
         const expected = this.current
-        const result = await this.call('/api/v1/preferences', { skin: next, expected_version: this.current.version,
+        const result = await this.call('api/v1/preferences', { skin: next, expected_version: this.current.version,
           expected: this.current.token, request_id: requestId })
         if (result.request_id !== requestId || result.durability !== 'sqlite-full') {
           throw new PreferenceFailure('Appearance write has no FULL receipt', 'outcome_unknown', true)
@@ -129,7 +129,7 @@ export class ManagedSkinStore implements SkinStore {
   }
   connectEvents(create: (url: string) => EventSource = url => new EventSource(url)) {
     if (this.events) return
-    this.events = create('/api/v1/events')
+    this.events = create('api/v1/events')
     this.events.addEventListener('state', event => {
       try {
         const preferences = JSON.parse((event as MessageEvent<string>).data).preferences
