@@ -1,5 +1,6 @@
 <launch>
-  <arg name="media_edge_address" default="http://127.0.0.1:18090" />
+  <arg name="bootstrap_input" />
+  <arg name="media_edge_rpc_socket" default="/run/xgc2/media-edge/control/control.sock" />
   <arg name="media_source_id" default="usb_cam" />
   <arg name="snapshot_timeout" default="5.0" />
   <arg name="calibration_root" />
@@ -14,6 +15,7 @@
   <!-- camera_control:=true lights up the guide's fly-to / auto-run / live pose
        when running against a Gazebo simulation; leave false for a real camera. -->
   <arg name="camera_control" default="false" />
+  <arg name="simulation_endpoint" default="" />
   <arg name="camera_model_name" default="gazebo_static_camera" />
   <arg name="camera_control_timeout" default="8.0" />
   <arg name="bind_address" default="127.0.0.1" />
@@ -25,7 +27,8 @@
         type="intrinsic_calibrator_web.py"
         name="xgc_camera_intrinsic_calibrator_web"
         output="screen">
-    <param name="media_edge_address" value="$(arg media_edge_address)" />
+    <param name="bootstrap_input" value="$(arg bootstrap_input)" />
+    <param name="media_edge_rpc_socket" value="$(arg media_edge_rpc_socket)" />
     <param name="media_source_id" value="$(arg media_source_id)" />
     <param name="snapshot_timeout" value="$(arg snapshot_timeout)" />
     <param name="calibration_root" value="$(arg calibration_root)" />
@@ -38,6 +41,7 @@
     <param name="display_width" value="$(arg display_width)" />
     <param name="jpeg_quality" value="$(arg jpeg_quality)" />
     <param name="camera_control" value="$(arg camera_control)" />
+    <param name="simulation_endpoint" value="$(arg simulation_endpoint)" />
     <param name="camera_model_name" value="$(arg camera_model_name)" />
     <param name="camera_control_timeout" value="$(arg camera_control_timeout)" />
     <param name="bind_address" value="$(arg bind_address)" />

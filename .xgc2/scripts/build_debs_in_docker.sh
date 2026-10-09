@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-DOCKER_IMAGE="${DOCKER_IMAGE:-ghcr.io/xgc-team/xgc2-images/xgc2-build-focal-full-noetic:1.0.1}"
+DOCKER_IMAGE="${DOCKER_IMAGE:-ghcr.io/xgc-team/xgc2-images/xgc2-build-focal-full-noetic:1.0.8@sha256:fce2d76fddf4f6439bf0a188249b731650febdc163befc360bed186b269d252a}"
 WORK_DIR="${WORK_DIR:-${REPO_ROOT}/.work/docker}"
 OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/debs}"
 INSTALL_CHECK="${INSTALL_CHECK:-true}"
@@ -34,8 +34,18 @@ docker run --rm \
     mkdir -p \
       /workspace/work/src/xgc_camera_calibration
     rsync -a --delete /workspace/repo/xgc_camera_calibration/ /workspace/work/src/xgc_camera_calibration/
+    rsync -a --delete /workspace/repo/contracts/ /workspace/work/src/contracts/
     cd /workspace/work
     source /opt/ros/noetic/setup.bash
+    # First-party official SDK; third-party modules remain image-owned.
+    sdk_wheel=/workspace/work/xgc2_xrpc-0.1.0-py3-none-any.whl
+    curl -fsSL --retry 5 \
+      https://github.com/XGC-Team/xgc2-xrpc/releases/download/v0.1.0-1/xgc2_xrpc-0.1.0-py3-none-any.whl \
+      -o "$sdk_wheel"
+    echo "8e505ab2366eed198dcd4343e758fed5b7936990b2a72ba635d73d81b195187c  $sdk_wheel" | sha256sum -c -
+    rm -rf /workspace/work/sdk
+    python3 -m pip install --no-index --no-deps --target /workspace/work/sdk "$sdk_wheel"
+    export PYTHONPATH="/workspace/work/sdk:${PYTHONPATH:-}"
     catkin_make -DCMAKE_BUILD_TYPE=RelWithDebInfo
     ROS_HOME=/workspace/work/ros-home ROS_LOG_DIR=/workspace/work/ros-log catkin_make run_tests
     catkin_test_results --verbose

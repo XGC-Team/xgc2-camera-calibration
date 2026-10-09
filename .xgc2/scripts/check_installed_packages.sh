@@ -36,7 +36,7 @@ python3 -c 'from xgc_camera_calibration.extrinsic_application import ExtrinsicAp
 RUNTIME="$(mktemp -d)"
 CALIBRATION_ROOT="${RUNTIME}/calibrations"
 CAMERA_NAME="package_smoke"
-INTRINSIC_FILE="${CALIBRATION_ROOT}/sim/${CAMERA_NAME}/intrinsics-20260101T000000.000000Z.yaml"
+INTRINSIC_FILE="${CALIBRATION_ROOT}/sim/${CAMERA_NAME}/intrinsics-2026-01-01_00-00-00.yaml"
 mkdir -p "$(dirname "${INTRINSIC_FILE}")"
 cat >"${INTRINSIC_FILE}" <<'YAML'
 schema: xgc2.camera.intrinsic.v1
@@ -73,10 +73,11 @@ roslaunch --files xgc_camera_calibration extrinsic_calibrator.launch \
   application_state_param:="${APPLICATION_STATE_PARAM}" pose_coordinate_source:=experiment-world \
   child_frame:=xgc_world_camera_optical_frame \
   calibration_root:="${CALIBRATION_ROOT}" calibration_mode:=sim \
-  camera_name:="${CAMERA_NAME}" intrinsic_file:="${INTRINSIC_FILE}" >/dev/null
+  camera_name:="${CAMERA_NAME}" intrinsic_file:="${INTRINSIC_FILE}" \
+  bootstrap_input:="${RUNTIME}/extrinsic-bootstrap.json" >/dev/null
 roslaunch --files xgc_camera_calibration intrinsic_calibrator.launch \
   calibration_root:="${CALIBRATION_ROOT}" calibration_mode:=sim \
-  camera_name:=package_smoke >/dev/null
+  camera_name:=package_smoke bootstrap_input:="${RUNTIME}/intrinsic-bootstrap.json" >/dev/null
 roslaunch --files xgc_camera_calibration extrinsic_tf.launch \
   resolved_extrinsic_json:="${RESOLVED_EXTRINSIC_JSON}" frame_roles_json:="${FRAME_ROLES_JSON}" \
   optical_frame:=xgc_world_camera_optical_frame \
@@ -103,6 +104,8 @@ cleanup() {
 }
 trap cleanup EXIT
 export ROS_MASTER_URI="http://127.0.0.1:11359"
+unset ROS_HOSTNAME
+export ROS_IP=127.0.0.1
 export ROS_HOME="${RUNTIME}/ros-home"
 export ROS_LOG_DIR="${RUNTIME}/ros-log"
 mkdir -p "${ROS_HOME}" "${ROS_LOG_DIR}"
@@ -117,6 +120,17 @@ wait_http() {
   done
   return 1
 }
+# Formal central-sim 1.2.8 owns this SDK wheel and its runtime dependencies.
+# XRPC publishes Python as a wheel, not a Debian package.
+/usr/bin/python3 - <<'PYRUNTIME'
+import importlib.metadata, json, sys
+import aiohttp, httpx, xgc2_xrpc
+assert sys.version_info >= (3, 8)
+sdk = importlib.metadata.distribution("xgc2-xrpc")
+assert sdk.version == "0.1.0"
+origin = json.loads(sdk.read_text("direct_url.json"))
+assert origin["archive_info"]["hashes"]["sha256"] == "8e505ab2366eed198dcd4343e758fed5b7936990b2a72ba635d73d81b195187c"
+PYRUNTIME
 roscore -p 11359 >"${RUNTIME}/roscore.log" 2>&1 &
 ROSCORE_PID="$!"
 for _ in $(seq 1 50); do
@@ -125,29 +139,68 @@ for _ in $(seq 1 50); do
 done
 rosparam list >/dev/null
 
-python3 -c '
-import json
-from http.server import BaseHTTPRequestHandler, HTTPServer
-
-class Handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path != "/healthz":
-            self.send_error(404)
-            return
-        payload = json.dumps({"sources": [{"id": "usb_cam"}]}).encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(payload)))
-        self.end_headers()
-        self.wfile.write(payload)
-
-    def log_message(self, _format, *_args):
-        pass
-
-HTTPServer(("127.0.0.1", 18790), Handler).serve_forever()
-' >"${RUNTIME}/media-edge.log" 2>&1 &
+# This fixture exercises the installed native discovery/health binding only;
+# it never fabricates a camera frame or a successful calibration.
+MEDIA_EDGE_RPC_SOCKET="${RUNTIME}/media-edge.sock"
+python3 - "${MEDIA_EDGE_RPC_SOCKET}" <<'PYMEDIA' >"${RUNTIME}/media-edge.log" 2>&1 &
+import json, signal, socket, sys, threading, uuid
+from pathlib import Path
+from xgc2_xrpc import Fault, Host, Runtime
+path = sys.argv[1]
+ref = {"target_id": socket.gethostname(), "service": "media-edge", "api_version": "v1",
+       "instance_id": "package-smoke", "profile": "http.v1",
+       "endpoint": {"kind": "unix", "address": path}}
+runtime = Runtime()
+routes = {("GET", "/v1/describe"): lambda c, r: {"service_ref": ref, "sources": [{"id": "usb_cam"}]},
+          ("GET", "/v1/health"): lambda c, r: {"sources": [{"id": "usb_cam"}]}}
+host = Host(path, routes, runtime=runtime, instance_id="package-smoke",
+            discovery_routes=("/v1/describe",)).start()
+# An explicit, read-only storage contract double for this package smoke.
+# It proves grant/client wiring, not storage durability or camera calibration.
+root = Path(path).parent
+scope = {"namespace": "camera-calibration", "user": "operator", "workspace": "station"}
+storage_ref = {"target_id": socket.gethostname(), "service": "xgc2.storage.v1.Storage",
+    "api_version": "1", "instance_id": uuid.uuid4().hex, "profile": "http.v1",
+    "endpoint": {"kind": "unix", "address": str(root / "storage.sock")}}
+def snapshot(context, value):
+    if value.get("scope") != scope:
+        raise Fault("permission_denied", "scope differs", 403)
+    return {"scope": scope, "token": {"database_id": "package-smoke", "schema": "camera-calibration.preferences.v1", "revision": "0"},
+        "results": [{"collection": "preferences", "records": [{"collection": "preferences", "key": "appearance", "version": "0", "missing": True}]}]}
+storage = Host(storage_ref["endpoint"]["address"], {("POST", "/v1/snapshot"): snapshot},
+    runtime=runtime, instance_id=storage_ref["instance_id"]).start()
+token = root / "storage-token"
+token.write_text(uuid.uuid4().hex)
+token.chmod(0o600)
+for name in ("intrinsic", "extrinsic"):
+    value = {"schema_version": 1, "binding": {"schema_version": 1, "target_id": socket.gethostname(),
+        "service": "xgc2.calibration.v1.Calibration", "api_version": "1", "profile": "http.v1",
+        "endpoint": {"kind": "unix", "address": str(root / (name + ".sock"))},
+        "runtime_grant": "package-smoke", "authentication": "local_private", "secret_handles": {},
+        "storage_grants": ["preferences"]}, "grants": {"storage-auth": {"kind": "bearer", "token_file": str(token)}},
+        "application": {"storage": {"grant": "preferences", "authorization": "storage-auth", "reference": storage_ref, "scope": scope}}}
+    target = root / (name + "-bootstrap.json")
+    target.write_text(json.dumps(value))
+    target.chmod(0o600)
+stop = threading.Event()
+for signum in (signal.SIGTERM, signal.SIGINT):
+    signal.signal(signum, lambda *_: stop.set())
+try:
+    stop.wait()
+finally:
+    storage.close()
+    host.close()
+    runtime.close()
+PYMEDIA
 MEDIA_EDGE_PID="$!"
-wait_http 18790 "${MEDIA_EDGE_PID}"
+for _ in $(seq 1 50); do
+  if [ -S "${MEDIA_EDGE_RPC_SOCKET}" ] && [ -f "${RUNTIME}/intrinsic-bootstrap.json" ] && [ -f "${RUNTIME}/extrinsic-bootstrap.json" ]; then break; fi
+  if ! kill -0 "${MEDIA_EDGE_PID}" 2>/dev/null; then exit 1; fi
+  sleep 0.1
+done
+[ -S "${MEDIA_EDGE_RPC_SOCKET}" ]
+[ -f "${RUNTIME}/intrinsic-bootstrap.json" ]
+[ -f "${RUNTIME}/extrinsic-bootstrap.json" ]
 
 "${PREFIX}/lib/xgc_camera_calibration/extrinsic_tf_publisher.py" \
   --resolved-extrinsic-json "${RESOLVED_EXTRINSIC_JSON}" --frame-roles-json "${FRAME_ROLES_JSON}" \
@@ -176,14 +229,15 @@ PYREADY
   _image_topic:=/not_installed_by_this_product/image_raw \
   _intrinsic_file:="${INTRINSIC_FILE}" \
   _calibration_root:="${CALIBRATION_ROOT}" _calibration_mode:=sim \
-  _camera_name:="${CAMERA_NAME}" _http_port:=18765 \
+  _camera_name:="${CAMERA_NAME}" _bootstrap_input:="${RUNTIME}/extrinsic-bootstrap.json" _http_port:=18765 \
   _parent_frame:=world _child_frame:=xgc_world_camera_optical_frame _pose_coordinate_source:=experiment-world \
   >"${RUNTIME}/extrinsic.log" 2>&1 &
 EXTRINSIC_PID="$!"
 "${PREFIX}/lib/xgc_camera_calibration/intrinsic_calibrator_web.py" \
   __name:=xgc_camera_intrinsic_calibrator_web \
-  _media_edge_address:=http://127.0.0.1:18790 \
+  _media_edge_rpc_socket:="${MEDIA_EDGE_RPC_SOCKET}" \
   _media_source_id:=usb_cam _snapshot_timeout:=1 \
+  _bootstrap_input:="${RUNTIME}/intrinsic-bootstrap.json" \
   _http_port:=18766 _calibration_root:="${RUNTIME}/calibrations" \
   _calibration_mode:=sim _camera_name:=usb_cam \
   >"${RUNTIME}/intrinsic.log" 2>&1 &
@@ -191,6 +245,8 @@ INTRINSIC_PID="$!"
 
 wait_http 18765 "${EXTRINSIC_PID}"
 wait_http 18766 "${INTRINSIC_PID}"
+python3 -c 'import json, urllib.request; p=json.load(urllib.request.urlopen("http://127.0.0.1:18765/api/v1/preferences")); assert p["skin"] == "dark" and p["version"] == "0"'
+python3 -c 'import json, urllib.request; p=json.load(urllib.request.urlopen("http://127.0.0.1:18766/api/v1/preferences")); assert p["skin"] == "dark" and p["version"] == "0"'
 python3 -c 'import json, urllib.request; p=json.load(urllib.request.urlopen("http://127.0.0.1:18765/healthz")); assert p["status"] == "ok" and not p["image_ready"] and p["intrinsic_ready"]'
 python3 -c 'import json, urllib.request; p=json.load(urllib.request.urlopen("http://127.0.0.1:18766/healthz")); assert p["status"] == "ok" and not p["image_ready"] and not p["camera_control"]'
 python3 -c 'import urllib.request; assert b"Camera extrinsic calibration" in urllib.request.urlopen("http://127.0.0.1:18765/").read()'
@@ -210,7 +266,7 @@ from xgc_camera_calibration.extrinsic_coordinates import coordinate_provenance
 root, camera, frozen, roles_json, parameter = sys.argv[1:]
 roles = json.loads(roles_json)
 rospy.init_node("camera_package_apply_check", anonymous=True, disable_signals=True)
-output = Path(root) / "sim" / camera / "extrinsics-20260101T000001.000000Z.yaml"
+output = Path(root) / "sim" / camera / "extrinsics-2026-01-01_00-00-01.yaml"
 result = ExtrinsicResult(translation=np.asarray([1., 2., 3.]), quaternion_xyzw=np.asarray([0., 0., 0., 1.]),
     rotation_world_to_camera=np.eye(3), translation_world_to_camera=np.asarray([-1., -2., -3.]),
     reprojection_errors_px=np.asarray([0., 0., 0., 0.]), inlier_indices=np.asarray([0, 1, 2, 3]), warnings=())

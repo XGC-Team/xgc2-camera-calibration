@@ -13,6 +13,8 @@ from pathlib import Path
 import cv2
 import rospkg
 import rospy
+from xgc2_xrpc import Runtime, load_bootstrap_input
+from xgc_camera_calibration.preferences import create_preferences
 from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import CompressedImage, Image
 
@@ -425,14 +427,24 @@ def split_list_parameter(value):
 def main():
     args = application_arguments(rospy.myargv()[1:], with_state_parameter=True)
     rospy.init_node("xgc_camera_extrinsic_calibrator_web")
+    runtime = None
+    snapshot_client = None
+    preference_client = None
+    source = None
+    server = None
     try:
-        media_edge_address = str(rospy.get_param("~media_edge_address", "")).strip()
+        bootstrap = load_bootstrap_input(str(rospy.get_param("~bootstrap_input")), role="client")
+        runtime = Runtime(blocking_workers=4, max_calls=16, max_connections=24)
+        preferences, preference_client = create_preferences(bootstrap, runtime=runtime)
+        media_edge_rpc_socket = str(rospy.get_param("~media_edge_rpc_socket", "")).strip()
         snapshot_client = None
-        if media_edge_address:
+        if media_edge_rpc_socket:
             snapshot_client = MediaSnapshotClient(
-                media_edge_address,
+                media_edge_rpc_socket,
                 rospy.get_param("~media_source_id", "usb_cam"),
                 float(rospy.get_param("~snapshot_timeout", 5.0)),
+                runtime=runtime,
+                local_target=bootstrap.binding.target_id,
             )
             try:
                 snapshot_client.health()
@@ -500,17 +512,27 @@ def main():
                 rospy.get_param("~allowed_origins", [])
             ),
             logger=lambda message: rospy.logdebug("Web calibrator: %s", message),
+            runtime=runtime,
+            binding=bootstrap.binding,
+            preferences=preferences,
         )
+        server.start()
     except Exception as error:
         rospy.logfatal("Could not start camera extrinsic WebUI: %s", error)
+        if source is not None:
+            source.discovery_timer.shutdown()
+            if source.snapshot_health_timer is not None:
+                source.snapshot_health_timer.shutdown()
+        if server is not None:
+            server.close()
+        if snapshot_client is not None:
+            snapshot_client.close()
+        if preference_client is not None:
+            preference_client.close()
+        if runtime is not None:
+            runtime.close()
         return 1
 
-    server_thread = threading.Thread(
-        target=server.serve_forever,
-        name="camera-calibration-http",
-        daemon=True,
-    )
-    server_thread.start()
     rospy.loginfo(
         "Camera extrinsic WebUI listening on http://%s:%d "
         "(capture=%s, preview=%s, poses=%s)",
@@ -542,9 +564,14 @@ def main():
     try:
         rospy.spin()
     finally:
-        server.shutdown()
-        server.server_close()
-        server_thread.join(timeout=5.0)
+        source.discovery_timer.shutdown()
+        if source.snapshot_health_timer is not None:
+            source.snapshot_health_timer.shutdown()
+        server.close()
+        if snapshot_client is not None:
+            snapshot_client.close()
+        preference_client.close()
+        runtime.close()
     return 0
 
 

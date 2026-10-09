@@ -19,6 +19,7 @@ from unittest.mock import patch
 import cv2
 import numpy as np
 
+from xgc2_xrpc import Host, Runtime
 from xgc_camera_calibration import intrinsic_solver, intrinsic_validation
 from xgc_camera_calibration.intrinsic_service import (
     APRILGRID_ADAPTIVE_EVIDENCE_QUADS,
@@ -429,7 +430,7 @@ class IntrinsicServiceTest(unittest.TestCase):
     def test_saved_snapshot_is_fresh_native_jpeg_without_calibration_mutation(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory) / "intrinsics.yaml"
-            saved = Path(directory) / "intrinsics-20260919T120000.000000Z.yaml"
+            saved = Path(directory) / "intrinsics-2026-09-19_12-00-00.yaml"
             intrinsic_solver.save_intrinsic(
                 saved,
                 intrinsic_solver.IntrinsicResult(
@@ -565,8 +566,7 @@ class IntrinsicServiceTest(unittest.TestCase):
                 ("127.0.0.1", 0), object(), WEB_ROOT,
                 frame_ancestors="'self'", intrinsic_service=service,
             )
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
-            thread.start()
+            server.start()
             base = "http://127.0.0.1:{}".format(server.server_address[1])
             try:
                 with urllib.request.urlopen(base + "/api/v1/intrinsic/snapshot.jpg") as response:
@@ -581,10 +581,7 @@ class IntrinsicServiceTest(unittest.TestCase):
                     urllib.request.urlopen(base + "/api/v1/intrinsic/snapshot.jpg")
                 self.assertEqual(caught.exception.code, HTTPStatus.SERVICE_UNAVAILABLE)
             finally:
-                server.shutdown()
-                server.server_close()
-                thread.join(3)
-
+                server.close()
     def test_algorithm_provenance_preserves_the_selected_feature_model(self):
         feature_model = "checkerboard_corners_v1"
         self.assertEqual(
@@ -706,14 +703,14 @@ class IntrinsicServiceTest(unittest.TestCase):
         self.assertEqual(DEFAULT_AUTO_CAPTURE_INTERVAL_SECONDS, 0.2)
         self.assertIn('rospy.get_param("~maximum_detect_width", display_width)', source)
         self.assertIn('rospy.get_param("~detection_target_pixels", 640 * 480)', " ".join(source.split()))
-        self.assertIn('kwargs={"poll_interval": 0.05}', source)
+        self.assertIn("server.start()", source)
         self.assertIn('rospy.get_param("~calibration_root"', source)
-        self.assertIn('rospy.get_param("~calibration_mode", "sim")', source)
-        self.assertIn('rospy.get_param("~camera_name", "usb_cam")', source)
+        self.assertIn('rospy.get_param("~calibration_mode")', source)
+        self.assertIn('rospy.get_param("~camera_name")', source)
         self.assertIn('intrinsic_calibration_directory(', source)
         self.assertNotIn('rospy.get_param("~output_file"', source)
         self.assertNotIn('rospy.get_param("~references_dir"', source)
-        self.assertIn("time.sleep(0.1)", WEB_SERVICE_SOURCE.read_text(encoding="utf-8"))
+        self.assertIn("await asyncio.sleep(0.1)", WEB_SERVICE_SOURCE.read_text(encoding="utf-8"))
 
     def test_process_frame_collects_a_board_sample(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -881,7 +878,7 @@ class IntrinsicServiceTest(unittest.TestCase):
 
     def test_wrong_mode_file_cannot_be_restored_or_compared(self):
         with tempfile.TemporaryDirectory() as directory:
-            output = Path(directory) / "intrinsics-20260907T010000.000000Z.yaml"
+            output = Path(directory) / "intrinsics-2026-09-07_01-00-00.yaml"
             result = intrinsic_solver.IntrinsicResult(
                 camera_matrix=np.array([[638.,0.,600.],[0.,637.,390.],[0.,0.,1.]]),
                 distortion=np.zeros(5), image_size=(1280,720),
@@ -1814,7 +1811,7 @@ class IntrinsicServiceTest(unittest.TestCase):
     def test_legacy_result_without_quality_contract_is_not_restored(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory) / "intrinsics.yaml"
-            output = Path(directory) / "intrinsics-20260830T120000.000000Z.yaml"
+            output = Path(directory) / "intrinsics-2026-08-30_12-00-00.yaml"
             result = intrinsic_solver.IntrinsicResult(
                 camera_matrix=np.array([[638.0, 0.0, 600.0], [0.0, 637.0, 390.0], [0.0, 0.0, 1.0]]),
                 distortion=np.array([0.01, -0.02, 0.0, 0.0, 0.0]),
@@ -1847,8 +1844,8 @@ class IntrinsicServiceTest(unittest.TestCase):
     def test_latest_timestamped_result_restores_by_created_time(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory) / "intrinsics.yaml"
-            older = Path(directory) / "intrinsics-20260829T120000.000000Z.yaml"
-            newer = Path(directory) / "intrinsics-20260830T120000.000000Z.yaml"
+            older = Path(directory) / "intrinsics-2026-08-29_12-00-00.yaml"
+            newer = Path(directory) / "intrinsics-2026-08-30_12-00-00.yaml"
             older_result = intrinsic_solver.IntrinsicResult(
                 camera_matrix=np.array([[638.0, 0.0, 600.0], [0.0, 637.0, 390.0], [0.0, 0.0, 1.0]]),
                 distortion=np.array([0.01, -0.02, 0.0, 0.0, 0.0]),
@@ -1913,7 +1910,7 @@ class IntrinsicServiceTest(unittest.TestCase):
             with stage.lock:
                 stage._save_checkpoint_locked()
 
-            saved = Path(directory) / "intrinsics-20260829T120000.000000Z.yaml"
+            saved = Path(directory) / "intrinsics-2026-08-29_12-00-00.yaml"
             saved_result = intrinsic_solver.IntrinsicResult(
                 camera_matrix=np.array(
                     [[638.0, 0.0, 600.0], [0.0, 637.0, 390.0], [0.0, 0.0, 1.0]]
@@ -2075,15 +2072,15 @@ class IntrinsicServiceTest(unittest.TestCase):
             self.assertTrue(evidence["available"])
             self.assertEqual(evidence["sample_count"], 1)
             self.assertEqual(
-                evidence["filename"], candidate["candidate_id"] + "-evidence.zip"
+                evidence["filename"], "intrinsic-candidate_ready-evidence-{}-revision-{:03d}-{:03d}.zip".format(
+                    service._evidence_root.name.removeprefix("capture-"), service.session_revision, service.collection_revision)
             )
 
             server = CalibrationHttpServer(
                 ("127.0.0.1", 0), object(), WEB_ROOT,
                 frame_ancestors="'self'", intrinsic_service=service,
             )
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
-            thread.start()
+            server.start()
             try:
                 url = "http://127.0.0.1:{}/api/v1/intrinsic/evidence.zip".format(
                     server.server_address[1]
@@ -2096,9 +2093,7 @@ class IntrinsicServiceTest(unittest.TestCase):
                     )
                     archive_payload = response.read()
             finally:
-                server.shutdown()
-                server.server_close()
-
+                server.close()
             with zipfile.ZipFile(io.BytesIO(archive_payload)) as archive:
                 self.assertEqual(
                     sorted(archive.namelist()),
@@ -2140,7 +2135,8 @@ class IntrinsicServiceTest(unittest.TestCase):
             self.assertTrue(saved["saved"])
             self.assertEqual(service.state()["phase"], "saved")
             saved_filename, saved_bundle = service.evidence_bundle()
-            self.assertEqual(saved_filename, evidence["filename"])
+            self.assertNotEqual(saved_filename, evidence["filename"])
+            self.assertEqual((service._evidence_root / evidence["filename"]).read_bytes(), archive_payload)
             with zipfile.ZipFile(saved_bundle) as archive:
                 self.assertIn("intrinsics.yaml", archive.namelist())
                 saved_manifest = json.loads(archive.read("manifest.json"))
@@ -2321,8 +2317,7 @@ class IntrinsicServiceTest(unittest.TestCase):
                 ("127.0.0.1", 0), object(), WEB_ROOT,
                 frame_ancestors="'self'", intrinsic_service=service,
             )
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
-            thread.start()
+            server.start()
             try:
                 request = urllib.request.Request(
                     "http://127.0.0.1:{}/api/v1/intrinsic/auto_capture/start".format(
@@ -2341,9 +2336,7 @@ class IntrinsicServiceTest(unittest.TestCase):
                 )
             finally:
                 service.stop_auto_capture()
-                server.shutdown()
-                server.server_close()
-
+                server.close()
     def test_http_start_does_not_resume_unbounded_detection(self):
         with tempfile.TemporaryDirectory() as directory:
             service = make_service(Path(directory) / "intrinsics.yaml")
@@ -2356,8 +2349,7 @@ class IntrinsicServiceTest(unittest.TestCase):
                 ("127.0.0.1", 0), object(), WEB_ROOT,
                 frame_ancestors="'self'", intrinsic_service=service,
             )
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
-            thread.start()
+            server.start()
             try:
                 request = urllib.request.Request(
                     "http://127.0.0.1:{}/api/v1/intrinsic/auto_capture/start".format(
@@ -2376,9 +2368,7 @@ class IntrinsicServiceTest(unittest.TestCase):
                 )
             finally:
                 service.stop_auto_capture()
-                server.shutdown()
-                server.server_close()
-
+                server.close()
     def test_physical_auto_capture_does_not_retain_invalid_frames(self):
         with tempfile.TemporaryDirectory() as directory:
             service = make_service(Path(directory) / "intrinsics.yaml")
@@ -2405,9 +2395,19 @@ class IntrinsicServiceTest(unittest.TestCase):
                     action()
                 self.assertEqual(caught.exception.status, int(HTTPStatus.NOT_FOUND))
 
+    def attach_native_work(self, service, directory):
+        runtime = Runtime(blocking_workers=4)
+        owner = Host(str(Path(directory) / "work.sock"), {}, runtime=runtime).start()
+        service.attach_work_runtime(runtime, owner)
+        self.addCleanup(runtime.close)
+        self.addCleanup(owner.close)
+        self.addCleanup(service.stop_auto_capture)
+        return runtime
+
     def test_auto_run_is_nonblocking_and_serializes_mutating_actions(self):
         with tempfile.TemporaryDirectory() as directory:
             service = make_service(Path(directory) / "intrinsics.yaml")
+            runtime = self.attach_native_work(service, directory)
             camera = FakeCameraControl()
             service.attach_camera_control(camera)
 
@@ -2444,10 +2444,9 @@ class IntrinsicServiceTest(unittest.TestCase):
                     self.assertEqual(caught.exception.status, int(HTTPStatus.CONFLICT))
                     self.assertIn("already running", caught.exception.message)
 
-                auto_thread = service._auto_run_thread
-                self.assertIsNotNone(auto_thread)
-                auto_thread.join(timeout=len(service.views) * 0.3 + 2.0)
-                self.assertFalse(auto_thread.is_alive())
+                auto_future = service._auto_run_future
+                self.assertIsNotNone(auto_future)
+                auto_future.result(timeout=len(service.views) * 0.3 + 2.0)
             self.assertEqual(service.state()["action"]["status"], "succeeded")
             self.assertEqual(len(camera.positions), 15)
             self.assertEqual(len(service.samples), 15)
@@ -2460,6 +2459,7 @@ class IntrinsicServiceTest(unittest.TestCase):
     def test_auto_run_fails_when_a_guide_target_never_detects_the_board(self):
         with tempfile.TemporaryDirectory() as directory:
             service = make_service(Path(directory) / "intrinsics.yaml")
+            runtime = self.attach_native_work(service, directory)
             service.attach_camera_control(FakeCameraControl())
             service.attach_frame_capture(lambda: np.full((200, 320, 3), 127, np.uint8))
             service.start_auto_capture(interval=0.1)
@@ -2481,6 +2481,7 @@ class IntrinsicServiceTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             service = make_service(Path(directory) / "intrinsics.yaml")
+            runtime = self.attach_native_work(service, directory)
             service.attach_camera_control(FailingCameraControl())
             service.attach_frame_capture(lambda: render_board())
             service.start_auto_capture(interval=0.1)
@@ -2495,17 +2496,17 @@ class IntrinsicServiceTest(unittest.TestCase):
             self.assertEqual(service.reset()["samples"], 0)
             self.assertIsNone(service.state()["action"])
 
-    def test_auto_run_thread_start_failure_does_not_leave_permanent_busy_state(self):
+    def test_auto_run_executor_admission_failure_does_not_leave_permanent_busy_state(self):
         with tempfile.TemporaryDirectory() as directory:
             service = make_service(Path(directory) / "intrinsics.yaml")
+            runtime = self.attach_native_work(service, directory)
             service.attach_camera_control(FakeCameraControl())
             service.attach_frame_capture(lambda: render_board())
             service.start_auto_capture(interval=0.1)
-            with patch("xgc_camera_calibration.intrinsic_service.threading.Thread") as constructor:
-                constructor.return_value.start.side_effect = RuntimeError("thread unavailable")
+            with patch.object(runtime, "submit_blocking", side_effect=RuntimeError("executor full")):
                 with self.assertRaises(ApiError) as caught:
                     service.auto_run()
-            self.assertEqual(caught.exception.status, int(HTTPStatus.INTERNAL_SERVER_ERROR))
+            self.assertEqual(caught.exception.status, int(HTTPStatus.TOO_MANY_REQUESTS))
             self.assertEqual(service.state()["action"]["status"], "failed")
             service.stop_auto_capture()
             self.assertEqual(service.reset()["samples"], 0)
@@ -2514,7 +2515,7 @@ class IntrinsicServiceTest(unittest.TestCase):
     def test_validation_v2_captures_once_and_keeps_generation_atomic(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory) / "intrinsics.yaml"
-            calibration = Path(directory) / "intrinsics-20260830T120000.000000Z.yaml"
+            calibration = Path(directory) / "intrinsics-2026-08-30_12-00-00.yaml"
             intrinsic_solver.save_intrinsic(
                 calibration,
                 intrinsic_solver.IntrinsicResult(
@@ -2646,8 +2647,7 @@ class IntrinsicServiceTest(unittest.TestCase):
                 frame_ancestors="'self'",
                 intrinsic_service=service,
             )
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
-            thread.start()
+            server.start()
             base = "http://127.0.0.1:{}".format(server.server_address[1])
 
             def post(path, payload):
@@ -2715,9 +2715,7 @@ class IntrinsicServiceTest(unittest.TestCase):
                             post(path, payload)
                         self.assertEqual(caught.exception.code, int(status))
             finally:
-                server.shutdown()
-                server.server_close()
-
+                server.close()
     def test_transport_routes_intrinsic_and_gates_when_absent(self):
         with tempfile.TemporaryDirectory() as directory:
             service = make_service(Path(directory) / "intrinsics.yaml")
@@ -2727,8 +2725,7 @@ class IntrinsicServiceTest(unittest.TestCase):
                 ("127.0.0.1", 0), object(), WEB_ROOT,
                 frame_ancestors="'self'", intrinsic_service=service,
             )
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
-            thread.start()
+            server.start()
             try:
                 base = "http://127.0.0.1:{}".format(server.server_address[1])
                 with urllib.request.urlopen(base + "/api/v1/intrinsic/state") as response:
@@ -2757,7 +2754,7 @@ class IntrinsicServiceTest(unittest.TestCase):
                 with urllib.request.urlopen(request) as response:
                     self.assertFalse(json.loads(response.read())["auto_capture"]["enabled"])
 
-                calibration_path = Path(directory) / "intrinsics-20260830T120000.000000Z.yaml"
+                calibration_path = Path(directory) / "intrinsics-2026-08-30_12-00-00.yaml"
                 intrinsic_solver.save_intrinsic(
                     calibration_path,
                     intrinsic_solver.IntrinsicResult(
@@ -2873,24 +2870,18 @@ class IntrinsicServiceTest(unittest.TestCase):
                     self.assertEqual(response.status, int(HTTPStatus.ACCEPTED))
                     self.assertTrue(json.loads(response.read())["accepted"])
             finally:
-                server.shutdown()
-                server.server_close()
-
+                server.close()
             # With no intrinsic service the route is gated off.
             gated = CalibrationHttpServer(
                 ("127.0.0.1", 0), object(), WEB_ROOT, frame_ancestors="'self'",
             )
-            thread = threading.Thread(target=gated.serve_forever, daemon=True)
-            thread.start()
+            gated.start()
             try:
                 base = "http://127.0.0.1:{}".format(gated.server_address[1])
                 with self.assertRaises(urllib.error.HTTPError) as caught:
                     urllib.request.urlopen(base + "/api/v1/intrinsic/state")
                 self.assertEqual(caught.exception.code, int(HTTPStatus.NOT_FOUND))
             finally:
-                gated.shutdown()
-                gated.server_close()
-
-
+                gated.close()
 if __name__ == "__main__":
     unittest.main()

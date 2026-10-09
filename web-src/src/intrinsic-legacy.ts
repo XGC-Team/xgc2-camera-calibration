@@ -9,6 +9,7 @@ let pendingImageSequence = 0;
 let imageRefreshInFlight = false;
 let displayedImageUrl = "";
 let currentCandidateId = "";
+let savedCandidateId = "";
 
 async function postJSON(path, body) {
   try {
@@ -129,6 +130,7 @@ function applyState(s) {
   const phase = s.phase;
   const candidate = phase === "candidate_ready" ? s.candidate : null;
   currentCandidateId = candidate && candidate.candidate_id || "";
+  savedCandidateId = phase === "saved" ? s.saved_candidate_id || "" : "";
   el("conn").textContent = "connected";
   el("conn").className = "legacy-state-source pill pill-on";
   el("samples").textContent = solveJob && solveJob.status === "running"
@@ -141,6 +143,14 @@ function applyState(s) {
     || !candidate || !candidate.quality || candidate.quality.status !== "save_ready";
   el("btn-continue").disabled = autoRunning || phase !== "candidate_ready";
   el("btn-reset").disabled = autoRunning;
+  const application = s.metadata_application || {};
+  el("btn-apply-metadata").disabled = autoRunning || !savedCandidateId || !application.available
+    || application.attempted_candidate_id === savedCandidateId;
+  el("metadata-application").textContent = application.receipt
+    ? `CameraInfo estimates published · revision ${application.receipt.published_calibration_revision}`
+    : application.available
+      ? "Apply saved estimates to CameraInfo. Native optical/capture truth remains source-owned."
+      : "Source-owned CameraInfo metadata application is unavailable.";
   renderResult(phase === "saved" ? s.result : candidate, phase);
   renderPose(s.pose);
   renderDetection(s.detection, s.board);
@@ -219,6 +229,14 @@ function wireButtons() {
     setStatus("Saving the validated candidate…");
     const r = await postJSON("api/v1/intrinsic/save", { candidate_id: currentCandidateId });
     setStatus(r.ok === false ? (r.error || "Save failed.") : "Calibration saved.");
+    poll();
+  });
+  el("btn-apply-metadata").addEventListener("click", async () => {
+    if (!savedCandidateId) return;
+    el("btn-apply-metadata").disabled = true;
+    const r = await postJSON("api/v1/intrinsic/apply-metadata", { candidate_id: savedCandidateId });
+    setStatus(r.ok === false ? r.error || "CameraInfo publication was not confirmed."
+      : `CameraInfo estimates published · revision ${r.published_calibration_revision}`);
     poll();
   });
   el("btn-continue").addEventListener("click", async () => {

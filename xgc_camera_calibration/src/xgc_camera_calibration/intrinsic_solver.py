@@ -10,7 +10,7 @@ resolution.
 
 from __future__ import annotations
 
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, wait
 import hashlib
 import math
 import os
@@ -1571,6 +1571,8 @@ def _leave_one_out_stability(
     reference: _ExtendedCalibration,
     original_view_indices: Optional[Sequence[int]] = None,
     progress: Optional[Callable[[str, int, int], None]] = None,
+    validation_submit: Optional[Callable[..., Any]] = None,
+    validation_workers: int = 0,
 ) -> IntrinsicStabilityDiagnostics:
     names = _intrinsic_parameter_names(reference.distortion.size)
     reference_parameters = _intrinsic_parameter_vector(reference)
@@ -1624,31 +1626,41 @@ def _leave_one_out_stability(
                 undistorted_ray_rms_equivalent_px=ray_rms,
                 undistorted_ray_max_equivalent_px=ray_max,
             )
-    # Folds have no shared mutable numerical state. Bound both workers and
-    # pending work so progress/deadline failures stop admitting further folds.
-    workers = _intrinsic_validation_workers(len(image_points))
+    # The application owns parallel resources. Without an explicitly granted
+    # submitter, run in the caller's existing worker and never create a pool.
     completed_folds = {}
-    executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="intrinsic-loo")
-    pending = {}
-    remaining = iter(range(len(image_points)))
-    try:
-        for omitted in range(workers):
-            index = next(remaining)
-            pending[executor.submit(estimate_fold, index)] = index
-        while pending:
-            done, _ = wait(pending, return_when=FIRST_COMPLETED)
-            for future in done:
-                omitted = pending.pop(future)
-                completed_folds[omitted] = future.result()
-                if progress:
-                    progress("validating", len(completed_folds), len(image_points))
-                index = next(remaining, None)
-                if index is not None:
-                    pending[executor.submit(estimate_fold, index)] = index
-    finally:
-        for future in pending:
-            future.cancel()
-        executor.shutdown(wait=True)
+    if validation_submit is None or validation_workers == 0:
+        for omitted in range(len(image_points)):
+            completed_folds[omitted] = estimate_fold(omitted)
+            if progress:
+                progress("validating", len(completed_folds), len(image_points))
+    else:
+        if type(validation_workers) is not int or validation_workers < 0:
+            raise ValueError("validation workers must be a non-negative owner budget")
+        workers = min(validation_workers, _intrinsic_validation_workers(len(image_points)))
+        pending = {}
+        remaining = iter(range(len(image_points)))
+        try:
+            for omitted in range(workers):
+                index = next(remaining)
+                pending[validation_submit(estimate_fold, index)] = index
+            while pending:
+                done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                for future in done:
+                    omitted = pending.pop(future)
+                    completed_folds[omitted] = future.result()
+                    if progress:
+                        progress("validating", len(completed_folds), len(image_points))
+                    index = next(remaining, None)
+                    if index is not None:
+                        pending[validation_submit(estimate_fold, index)] = index
+        finally:
+            for future in pending:
+                future.cancel()
+            # Cancellation only stops queued work. Already running fits retain
+            # the owner's real slot until completion, including failed progress.
+            if pending:
+                wait(pending)
     for omitted, fold in sorted(completed_folds.items()):
         if fold is None:
             failed.append(int(original_view_indices[omitted]))
@@ -1712,6 +1724,8 @@ def calibrate_intrinsic(
     object_points: Optional[Sequence[np.ndarray]] = None,
     observation_uncertainty: Optional[float] = None,
     progress: Optional[Callable[[str, int, int], None]] = None,
+    validation_submit: Optional[Callable[..., Any]] = None,
+    validation_workers: int = 0,
 ) -> IntrinsicResult:
     """Batch-estimate free K/D and return continuous solve-quality evidence."""
     if len(image_points) < 3:
@@ -1749,6 +1763,8 @@ def calibrate_intrinsic(
         calibration,
         original_view_indices=selected_indices,
         progress=progress,
+        validation_submit=validation_submit,
+        validation_workers=validation_workers,
     )
     diagnostics = IntrinsicCalibrationDiagnostics(
         finite=True,
@@ -1885,7 +1901,8 @@ def save_intrinsic(
             stream.flush()
             os.fsync(stream.fileno())
         os.chmod(temporary_name, 0o644)
-        os.replace(temporary_name, destination)
+        os.link(temporary_name, destination)
+        os.unlink(temporary_name)
     except Exception:
         try:
             os.unlink(temporary_name)

@@ -1,0 +1,13 @@
+{
+  "format": "storage-v1",
+  "namespaces": [{
+    "id": "camera-calibration", "owner": "xgc-camera-calibration",
+    "schema": "camera-calibration.preferences.v1",
+    "max_scopes": 256, "max_receipts": 4096, "receipt_ttl_seconds": 604800,
+    "collections": [{
+      "id": "preferences", "max_record_bytes": 1024, "max_records": 1, "max_bytes": 1024,
+      "retention": "Appearance is retained until an explicit owner-authorized document operation; no automatic user preference deletion.",
+      "recovery": "Deploy this current schema explicitly and restore current-schema user/workspace documents through a consistent Storage v1 snapshot. Resolve uncertain writes by FULL durable receipt. No browser or historical database fallback."
+    }]
+  }]
+}

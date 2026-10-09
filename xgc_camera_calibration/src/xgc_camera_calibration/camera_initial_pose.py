@@ -48,7 +48,7 @@ def authored_gazebo_extrinsic_path(
     camera_name: str,
     extrinsic_file: str,
 ) -> Path:
-    """Return one concrete extrinsics-UTC.yaml under {root}/{sim|phy}/{camera}/."""
+    """Return one concrete versioned extrinsics file under {root}/{sim|phy}/{camera}/."""
 
     authored = Path(str(extrinsic_file).strip()).expanduser()
     if not str(extrinsic_file).strip():
@@ -76,7 +76,7 @@ def authored_gazebo_extrinsic_path(
         or not EXTRINSIC_FILENAME_PATTERN.fullmatch(selected.name)
     ):
         raise CalibrationError(
-            "extrinsic file must be a concrete extrinsics-UTC.yaml under {}/{{sim|phy}}/{}/".format(
+            "extrinsic file must be a concrete versioned extrinsics file under {}/{{sim|phy}}/{}/".format(
                 canonical_root.as_posix(), identity
             )
         )

@@ -168,8 +168,7 @@ class PlanarRansacTest(unittest.TestCase):
             server = CalibrationHttpServer(
                 ('127.0.0.1', 0), service, web_root, frame_ancestors="'self'",
             )
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
-            thread.start()
+            server.start()
             base = 'http://127.0.0.1:{}'.format(server.server_address[1])
 
             def post(path, body):
@@ -207,7 +206,7 @@ class PlanarRansacTest(unittest.TestCase):
                 saved = post('/api/v1/save', {'candidate_id': candidate['candidate_id']})
                 output = Path(saved['output_file'])
                 self.assertEqual(output.parent, Path(root) / 'sim' / 'camera')
-                self.assertRegex(output.name, r'^extrinsics-\d{8}T\d{6}\.\d{6}Z(?:-\d{2})?\.yaml$')
+                self.assertRegex(output.name, r'^extrinsics-\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}(?:-\d{2,4})?\.yaml$')
                 document = solver.load_extrinsic(output)
                 np.testing.assert_allclose(document['translation_array'], position, atol=1e-7, rtol=0)
                 self.assertFalse(document['points'][0]['inlier'])
@@ -215,10 +214,7 @@ class PlanarRansacTest(unittest.TestCase):
                 repeated = post('/api/v1/save', {'candidate_id': candidate['candidate_id']})
                 self.assertEqual(repeated['output_file'], str(output))
             finally:
-                server.shutdown()
-                server.server_close()
-                thread.join(timeout=3)
-                self.assertFalse(thread.is_alive())
+                server.close()
 
 
 if __name__ == '__main__':

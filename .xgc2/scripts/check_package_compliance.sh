@@ -87,7 +87,7 @@ grep -q '^id: xgc2-camera-calibration-ros1$' .xgc2/product.yml
 grep -Eq '^version: [0-9]+\.[0-9]+\.[0-9]+-[0-9]+$' .xgc2/product.yml
 product_version="$(awk '/^version:/ {print $2; exit}' .xgc2/product.yml)"
 grep -Fqx "    focal: $product_version" .xgc2/product.yml
-grep -Fq 'DOCKER_IMAGE="${DOCKER_IMAGE:-ghcr.io/xgc-team/xgc2-images/xgc2-build-focal-full-noetic:1.0.1}"' \
+grep -Fq 'DOCKER_IMAGE="${DOCKER_IMAGE:-ghcr.io/xgc-team/xgc2-images/xgc2-build-focal-full-noetic:1.0.8@sha256:fce2d76fddf4f6439bf0a188249b731650febdc163befc360bed186b269d252a}"' \
   .xgc2/scripts/build_debs_in_docker.sh
 if grep -q '^    focal: .*~focal' .xgc2/product.yml; then
   echo "single-distribution ROS1 package version must not retain a focal suffix" >&2
@@ -96,9 +96,9 @@ fi
 grep -q '<exec_depend>gazebo_msgs</exec_depend>' xgc_camera_calibration/package.xml
 grep -q '<exec_depend>tf</exec_depend>' xgc_camera_calibration/package.xml
 grep -q 'catkin_add_nosetests(test/test_media_snapshot.py)' xgc_camera_calibration/CMakeLists.txt
-grep -q 'http://127.0.0.1:18090' \
-  xgc_camera_calibration/scripts/intrinsic_calibrator_web.py \
-  xgc_camera_calibration/launch/intrinsic_calibrator.launch
+grep -q 'load_bootstrap_input' xgc_camera_calibration/scripts/intrinsic_calibrator_web.py
+grep -q '<arg name="bootstrap_input" />' xgc_camera_calibration/launch/intrinsic_calibrator.launch
+grep -q '<arg name="media_edge_rpc_socket"' xgc_camera_calibration/launch/intrinsic_calibrator.launch
 grep -q '<arg name="media_source_id" default="usb_cam"' \
   xgc_camera_calibration/launch/intrinsic_calibrator.launch
 grep -q '<arg name="snapshot_timeout" default="5.0"' \
@@ -116,7 +116,7 @@ if grep -Eq 'camera_info_topic|_camera_info_topic' \
   exit 1
 fi
 if grep -Eq 'camera_info_(topic|ready)|CameraInfo|info-topic' \
-  web-src/src/extrinsic-legacy.ts web-src/src/main.tsx \
+  web-src/src/extrinsic-legacy.ts \
   xgc_camera_calibration/src/xgc_camera_calibration/web_service.py; then
   echo "extrinsic WebUI retained the removed CameraInfo compatibility state" >&2
   exit 1

@@ -23,10 +23,10 @@ import yaml
 
 CAMERA_NAME_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9._-]{0,63}$")
 INTRINSIC_FILENAME_PATTERN = re.compile(
-    r"^intrinsics-\d{8}T\d{6}\.\d{6}Z\.yaml$"
+    r"^intrinsics-\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}(?:-\d{2,4})?\.yaml$"
 )
 EXTRINSIC_FILENAME_PATTERN = re.compile(
-    r"^extrinsics-\d{8}T\d{6}\.\d{6}Z(?:-\d{2})?\.yaml$"
+    r"^extrinsics-\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}(?:-\d{2,4})?\.yaml$"
 )
 EXTRINSIC_SELECTION_SCHEMA = "xgc2.camera.extrinsic-selection.v1"
 
@@ -82,7 +82,7 @@ def selected_intrinsic_path(
         or not INTRINSIC_FILENAME_PATTERN.fullmatch(selected.name)
     ):
         raise ValueError(
-            "intrinsic file must be a concrete intrinsics-UTC.yaml under {}/".format(
+            "intrinsic file must be a concrete versioned intrinsics file under {}/".format(
                 expected_directory
             )
         )
@@ -90,12 +90,12 @@ def selected_intrinsic_path(
 
 
 def versioned_extrinsic_path(directory: os.PathLike) -> Path:
-    """Allocate a concrete UTC-named result path without creating an alias."""
+    """Allocate a readable second-resolution result path without creating an alias."""
 
     destination = Path(directory).expanduser()
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    timestamp = datetime.now().astimezone().strftime("%Y-%m-%d_%H-%M-%S")
     candidate = destination / "extrinsics-{}.yaml".format(timestamp)
-    sequence = 1
+    sequence = 2
     while candidate.exists():
         candidate = destination / "extrinsics-{}-{:02d}.yaml".format(timestamp, sequence)
         sequence += 1
@@ -125,7 +125,7 @@ def selected_extrinsic_path(
         or not EXTRINSIC_FILENAME_PATTERN.fullmatch(selected.name)
     ):
         raise ValueError(
-            "extrinsic file must be a concrete extrinsics-UTC.yaml under {}/".format(
+            "extrinsic file must be a concrete versioned extrinsics file under {}/".format(
                 expected_directory
             )
         )
@@ -686,7 +686,8 @@ def save_extrinsic(
             stream.flush()
             os.fsync(stream.fileno())
         os.chmod(temporary_name, 0o644)
-        os.replace(temporary_name, destination)
+        os.link(temporary_name, destination)
+        os.unlink(temporary_name)
     except Exception:
         try:
             os.unlink(temporary_name)

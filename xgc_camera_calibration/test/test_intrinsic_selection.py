@@ -19,7 +19,7 @@ class IntrinsicSelectionTest(unittest.TestCase):
             "metadata":{"stability_assessment":{"passed":True}}}
 
     def save(self, stamp, document=None, mode="phy"):
-        path=self.root/mode/"usb_cam"/("intrinsics-20260907T"+stamp+".000000Z.yaml")
+        path=self.root/mode/"usb_cam"/("intrinsics-2026-09-07_"+stamp[:2]+"-"+stamp[2:4]+"-"+stamp[4:]+".yaml")
         path.parent.mkdir(parents=True,exist_ok=True)
         path.write_text(yaml.safe_dump(document or self.document))
         return path

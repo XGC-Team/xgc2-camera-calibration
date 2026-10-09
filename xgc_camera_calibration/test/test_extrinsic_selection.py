@@ -47,7 +47,7 @@ class SelectionFixture(unittest.TestCase):
         self.store = SelectionStore(str(self.root), "usb_cam", ROLES)
         self.result, self.path = self.version()
 
-    def version(self, mode="phy", name="extrinsics-20260920T010203.000001Z.yaml", candidate="candidate-a", provenance=True):
+    def version(self, mode="phy", name="extrinsics-2026-09-20_01-02-03.yaml", candidate="candidate-a", provenance=True):
         document = {"schema": "xgc2.camera.extrinsic.v1", "calibration_mode": mode,
                     "camera_name": "usb_cam", "frame_convention": "parent_T_camera_optical",
                     "parent_frame": "world", "child_frame": ROLES["opticalFrames"][mode],

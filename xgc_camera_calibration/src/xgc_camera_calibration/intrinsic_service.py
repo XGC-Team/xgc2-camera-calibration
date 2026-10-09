@@ -36,7 +36,7 @@ import cv2
 import numpy as np
 
 from xgc_camera_calibration import intrinsic_solver, intrinsic_validation
-from xgc_camera_calibration.solver import CalibrationError
+from xgc_camera_calibration.solver import CalibrationError, INTRINSIC_FILENAME_PATTERN
 from xgc_camera_calibration.web_service import ApiError
 
 APRILGRID_ADAPTIVE_DETECTION_WIDTH = 2200
@@ -101,7 +101,7 @@ def intrinsic_algorithm_provenance(
 
 
 def intrinsic_calibration_directory(root: str, mode: str, camera_name: str) -> Path:
-    calibration_root = Path(str(root)).expanduser()
+    calibration_root = Path(str(root))
     calibration_mode = str(mode).strip()
     identity = str(camera_name).strip()
     if not calibration_root.is_absolute():
@@ -286,6 +286,9 @@ class IntrinsicCalibrationService:
         self._candidate_diagnostics_full: Optional[Dict[str, Any]] = None
         self._candidate_error: Optional[Dict[str, Any]] = None
         self._saved_candidate_id: Optional[str] = None
+        self._metadata_application = None
+        self._metadata_receipt = None
+        self._metadata_attempted_candidate = None
         self.session_revision = 1
         self.collection_revision = 0
         self.restored_coverage: List[Dict[str, Any]] = []
@@ -358,7 +361,7 @@ class IntrinsicCalibrationService:
         self._target_capture_epoch = 0
         self._target_expected_pose: Optional[Dict[str, Any]] = None
         self._target_pose_ack_enabled = False
-        self._auto_run_thread: Optional[threading.Thread] = None
+        self._auto_run_future = None
         self._auto_capture_thread: Optional[threading.Thread] = None
         self._auto_capture_stop = threading.Event()
         self._auto_capture_requested = False
@@ -371,11 +374,27 @@ class IntrinsicCalibrationService:
         self._evidence_samples: List[Dict[str, Any]] = []
         self._evidence_bundle_path: Optional[Path] = None
         self._solve_job = None
-        self._solve_thread = None
+        self._solve_future = None
+        self._work_runtime = None
+        self._work_owner = None
         self._load_refs()
         self._load_recovery()
 
     # -- guide wiring ---------------------------------------------------------
+    def attach_work_runtime(self, runtime, owner, *, validation_workers=2) -> None:
+        """Bind background computation to the process owner's fixed XRPC pool."""
+        if runtime.blocking_workers < 2:
+            raise ValueError("calibration requires a solve worker and a reserved state worker")
+        if type(validation_workers) is not int or validation_workers < 0:
+            raise ValueError("validation workers must be a non-negative owner budget")
+        with self.lock:
+            if self._solve_running():
+                raise RuntimeError("cannot replace execution ownership during a solve")
+            if self._work_runtime is not None and (self._work_runtime is not runtime or self._work_owner is not owner):
+                raise RuntimeError("calibration already has an execution owner")
+            self._work_runtime, self._work_owner = runtime, owner
+            self._validation_workers = min(validation_workers, runtime.blocking_workers - 2)
+
     def attach_camera_control(self, camera: Any) -> None:
         """Attach an optional sim camera adapter (goto/reset/current pose)."""
         with self.lock:
@@ -385,6 +404,42 @@ class IntrinsicCalibrationService:
         """Attach an immutable Media Edge snapshot transaction."""
         with self.lock:
             self.frame_capture = capture
+
+    def attach_metadata_application(self, application: Any) -> None:
+        """Attach a source-owned adapter; domain values remain transport-free."""
+        with self.lock:
+            if self._metadata_application is not None:
+                raise RuntimeError("camera metadata application already has an owner")
+            self._metadata_application = application
+
+    def apply_metadata(self, candidate_id: str) -> Dict[str, Any]:
+        """Apply one saved candidate as ephemeral CameraInfo estimates."""
+        with self.lock:
+            self._require_idle_locked()
+            if (self.result is None or not isinstance(candidate_id, str)
+                    or not candidate_id or candidate_id != self._saved_candidate_id):
+                raise ApiError(HTTPStatus.CONFLICT, "Apply requires the current saved candidate_id")
+            if self._metadata_application is None:
+                raise ApiError(HTTPStatus.SERVICE_UNAVAILABLE, "CameraInfo metadata application was not granted")
+            if self._metadata_receipt and self._metadata_receipt.get("candidate_id") == candidate_id:
+                return copy.deepcopy(self._metadata_receipt)
+            if self._metadata_attempted_candidate == candidate_id:
+                raise ApiError(HTTPStatus.CONFLICT, "Metadata apply outcome needs source-owner inspection; mutation will not be replayed")
+            # A failure after submission can have native effects. Retain the
+            # attempt fence and never turn a repeated browser request into a
+            # second mutation. The source owner retains its authoritative receipt.
+            self._metadata_attempted_candidate = candidate_id
+            result = self.result
+            calibration = {"scope": "calibration-metadata", "model": "plumb_bob",
+                "width": result.image_size[0], "height": result.image_size[1],
+                "camera_matrix": [float(value) for value in result.camera_matrix.reshape(-1)],
+                "distortion": [float(value) for value in result.distortion]}
+            try:
+                receipt = self._metadata_application.apply(calibration)
+            except Exception as error:
+                raise ApiError(HTTPStatus.BAD_GATEWAY, "CameraInfo metadata apply was not confirmed: {}".format(error)) from error
+            self._metadata_receipt = {**receipt, "candidate_id": candidate_id}
+            return copy.deepcopy(self._metadata_receipt)
 
     def _coverage_state_locked(self) -> Tuple[List[Dict[str, Any]], bool]:
         """Return monotonic, advisory image-plane collection coverage.
@@ -524,8 +579,11 @@ class IntrinsicCalibrationService:
             thread = self._auto_capture_thread
             self._auto_capture_requested = False
             self._auto_capture_stop.set()
+            if self.action is not None and self.action.get("status") == "running":
+                self.action.update(status="failed", error="Continuous detection stopped")
+                self._detection_condition.notify_all()
         if thread is not None and thread is not threading.current_thread():
-            thread.join(timeout=6.0)
+            thread.join()
         with self.lock:
             if self._auto_capture_thread is not None and not self._auto_capture_thread.is_alive():
                 self._auto_capture_thread = None
@@ -855,9 +913,9 @@ class IntrinsicCalibrationService:
 
     def _versioned_output_path(self) -> Path:
         base = Path(self.output_file_base)
-        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+        timestamp = datetime.now().astimezone().strftime("%Y-%m-%d_%H-%M-%S")
         candidate = base.with_name("{}-{}{}".format(base.stem, timestamp, base.suffix))
-        sequence = 1
+        sequence = 2
         while candidate.exists():
             candidate = base.with_name(
                 "{}-{}-{:02d}{}".format(base.stem, timestamp, sequence, base.suffix)
@@ -872,7 +930,7 @@ class IntrinsicCalibrationService:
         parent = base.parent.resolve()
         candidates = []
         for path in base.parent.glob("{}-*{}".format(base.stem, base.suffix)):
-            if path.is_symlink():
+            if path.is_symlink() or not INTRINSIC_FILENAME_PATTERN.fullmatch(path.name):
                 continue
             try:
                 resolved = path.resolve(strict=True)
@@ -1234,7 +1292,7 @@ class IntrinsicCalibrationService:
         self.image_size = (int(image_size_values[0]), int(image_size_values[1]))
         self.collection_revision = collection_revision
         if capture_id:
-            if not re.fullmatch(r"[0-9]{8}T[0-9]{6}\.[0-9]{6}Z-[0-9a-f]{32}", capture_id):
+            if not re.fullmatch(r"capture-[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{2}-[0-9]{2}-[0-9]{2}(?:-[0-9]{2,4})?", capture_id):
                 raise CalibrationError("Checkpoint capture identity is invalid")
             capture = Path(self.output_file_base).parent / "captures" / capture_id
             if capture.is_symlink():
@@ -1255,7 +1313,11 @@ class IntrinsicCalibrationService:
                         raise CalibrationError("Capture evidence must not be a symlink")
                     if hashlib.sha256(path.read_bytes()).hexdigest() != entry.get(kind + "_sha256"):
                         raise CalibrationError("Capture evidence checksum does not match")
+            reserved = self._evidence_root
+            if reserved != capture:
+                reserved.rmdir()
             self._evidence_root = capture
+            self._capture_started_at = manifest["created_at"]
             self._evidence_samples = entries
             previous_job = manifest.get("solve_job")
             if previous_job:
@@ -1339,15 +1401,9 @@ class IntrinsicCalibrationService:
             self._recovery_error = str(error) or error.__class__.__name__
 
     def _save_ref(self, index: int, jpeg: bytes) -> None:
+        if self.references_dir:
+            self._write_evidence_file(Path(self.references_dir) / "{}.jpg".format(index), jpeg)
         self.refs[index] = jpeg
-        if not self.references_dir:
-            return
-        try:
-            os.makedirs(self.references_dir, exist_ok=True)
-            with open(os.path.join(self.references_dir, "{}.jpg".format(index)), "wb") as handle:
-                handle.write(jpeg)
-        except OSError:
-            pass
 
     @staticmethod
     def _write_evidence_file(path: Path, payload: bytes) -> None:
@@ -1466,12 +1522,10 @@ class IntrinsicCalibrationService:
         )
         filename = ""
         if available:
-            identity = (
-                str(self._saved_candidate_id)
-                if self.result is not None
-                else str((self.candidate_payload or {}).get("candidate_id", self._evidence_root.name))
-            )
-            filename = "{}-evidence.zip".format(identity)
+            filename = "intrinsic-{}-evidence-{}-revision-{:03d}-{:03d}.zip".format(
+                self._phase_locked(), self._evidence_root.name[len("capture-"):],
+                self.session_revision, self.collection_revision)
+
         return {
             "available": available,
             "sample_count": len(self._evidence_samples),
@@ -2291,6 +2345,12 @@ class IntrinsicCalibrationService:
                 "goodenough": bool(sample_goodenough),
                 "image_ready": self._display is not None,
                 "media_source": self.media_source,
+                "metadata_application": {
+                    **(self._metadata_application.state() if self._metadata_application is not None
+                       else {"available": False, "scope": "calibration-metadata"}),
+                    "receipt": copy.deepcopy(self._metadata_receipt),
+                    "attempted_candidate_id": self._metadata_attempted_candidate,
+                },
                 "board": self._board_document(),
                 "targets": targets,
                 "next": next_index,
@@ -2509,6 +2569,11 @@ class IntrinsicCalibrationService:
                     HTTPStatus.SERVICE_UNAVAILABLE,
                     "Continuous intrinsic detection is not running",
                 )
+            if self._work_runtime is None or self._work_owner is None:
+                raise ApiError(HTTPStatus.SERVICE_UNAVAILABLE, "No process execution owner")
+            if self._work_runtime.blocking_workers < 3:
+                raise ApiError(HTTPStatus.SERVICE_UNAVAILABLE,
+                    "Automatic sweep requires separate sweep, solve and state capacity")
             self._clear_session_locked()
             self.action = {
                 "name": "auto_run",
@@ -2517,31 +2582,15 @@ class IntrinsicCalibrationService:
                 "target_name": None,
                 "error": None,
             }
-            thread = threading.Thread(
-                target=self._run_auto_sweep,
-                args=(camera, float(settle), float(detection_timeout)),
-                name="intrinsic-auto-run",
-                daemon=True,
-            )
-            self._auto_run_thread = thread
-            accepted = {"accepted": True, "action": dict(self.action)}
-        try:
-            thread.start()
-        except RuntimeError as error:
-            with self.lock:
-                self.action = {
-                    "name": "auto_run",
-                    "status": "failed",
-                    "target_index": None,
-                    "target_name": None,
-                    "error": str(error) or "Could not start the automatic coverage sweep",
-                }
-                self._auto_run_thread = None
-            raise ApiError(
-                HTTPStatus.INTERNAL_SERVER_ERROR,
-                "Could not start the automatic coverage sweep",
-            ) from error
-        return accepted
+            try:
+                self._auto_run_future = self._work_runtime.submit_blocking(
+                    self._work_owner, self._run_auto_sweep, camera,
+                    float(settle), float(detection_timeout))
+            except Exception as error:
+                self.action.update(status="failed", error="Computation capacity is unavailable")
+                raise ApiError(HTTPStatus.TOO_MANY_REQUESTS,
+                    "Could not admit the automatic coverage sweep") from error
+            return {"accepted": True, "action": dict(self.action)}
 
     def _run_auto_sweep(self, camera: Any, settle: float, detection_timeout: float) -> None:
         try:
@@ -2575,7 +2624,7 @@ class IntrinsicCalibrationService:
                     "target_name": self.action.get("target_name") if self.action else None,
                     "error": str(error) or error.__class__.__name__,
                 }
-                self._auto_run_thread = None
+                self._auto_run_future = None
                 self._target_capture_phase = "idle"
                 self._target_capture_epoch += 1
                 self._target_expected_pose = None
@@ -2605,7 +2654,7 @@ class IntrinsicCalibrationService:
                         "quality": dict(result.get("quality", {})),
                     },
                 }
-                self._auto_run_thread = None
+                self._auto_run_future = None
                 self._target_capture_phase = "idle"
                 self._target_capture_epoch += 1
                 self._target_expected_pose = None
@@ -2619,7 +2668,7 @@ class IntrinsicCalibrationService:
                     "target_name": self.action.get("target_name") if self.action else None,
                     "error": str(error) or error.__class__.__name__,
                 }
-                self._auto_run_thread = None
+                self._auto_run_future = None
                 self._target_capture_phase = "idle"
                 self._target_capture_epoch += 1
                 self._target_expected_pose = None
@@ -2667,10 +2716,20 @@ class IntrinsicCalibrationService:
         return {"ok": True, "saved": saved}
 
     def _new_capture_path(self) -> Path:
-        # Created lazily on first accepted source frame, retained across Reset/exit.
-        return Path(self.output_file_base).parent / "captures" / (
-            datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ-") + uuid.uuid4().hex
-        )
+        # Reserve the human-readable identity atomically. Original frame clocks
+        # and opaque snapshot/solve identities stay inside metadata.
+        directory = Path(self.output_file_base).parent / "captures"
+        directory.mkdir(parents=True, exist_ok=True)
+        self._capture_started_at = datetime.now(timezone.utc).isoformat()
+        stem = "capture-" + datetime.now().astimezone().strftime("%Y-%m-%d_%H-%M-%S")
+        for sequence in range(1, 10000):
+            path = directory / (stem if sequence == 1 else stem + "-{:02d}".format(sequence))
+            try:
+                path.mkdir()
+                return path
+            except FileExistsError:
+                continue
+        raise OSError("same-second capture versions exhausted")
 
     def _solve_running(self) -> bool:
         return self._solve_job is not None and self._solve_job["status"] == "running"
@@ -2678,6 +2737,8 @@ class IntrinsicCalibrationService:
     def _persist_capture_manifest_locked(self, *, write_job: bool = True) -> None:
         document = {
             "schema": "xgc2.camera.intrinsic-capture.v1",
+            "created_at": self._capture_started_at,
+            "created_clock_domain": "system_realtime",
             "board_fingerprint": self._recovery_fingerprint(),
             "session_revision": self.session_revision,
             "collection_revision": self.collection_revision,
@@ -2713,6 +2774,13 @@ class IntrinsicCalibrationService:
             frozen.samples = list(self.samples)
             frozen.sample_target_ids = list(self.sample_target_ids)
             frozen.sample_snapshot_ids = list(self.sample_snapshot_ids)
+            if self._work_runtime is not None:
+                runtime, owner = self._work_runtime, self._work_owner
+                frozen._solve_validation_submit = lambda function, *args: runtime.submit_blocking(owner, function, *args)
+                # Auto-run occupies an additional outer worker while waiting
+                # for its solve. Always leave one slot for state/stop requests.
+                frozen._solve_validation_workers = min(self._validation_workers,
+                    max(0, runtime.blocking_workers - (3 if _auto_run else 2)))
             revision = (self.session_revision, self.collection_revision)
             deadline = time.monotonic() + 30 * 60
             job = {"id": uuid.uuid4().hex, "status": "running", "stage": "solving",
@@ -2753,17 +2821,33 @@ class IntrinsicCalibrationService:
                                 json.dumps(self._candidate_diagnostics_full, allow_nan=False).encode())
                     except Exception as cause:
                         job.update(status="failed", error="Could not persist solve result: " + str(cause))
-            self._solve_thread = threading.Thread(target=work, name="intrinsic-candidate", daemon=True)
-            self._solve_thread.start()
+            if self._work_runtime is None or self._work_owner is None:
+                job.update(status="failed", stage="admission", error="No process execution owner")
+                self._persist_capture_manifest_locked()
+                raise ApiError(HTTPStatus.SERVICE_UNAVAILABLE, "No process execution owner")
+            try:
+                # submit_blocking reserves a real fixed slot before acceptance.
+                # Future cancellation is never used as a promise of rollback.
+                self._solve_future = self._work_runtime.submit_blocking(self._work_owner, work)
+            except Exception as cause:
+                job.update(status="failed", stage="admission", error="Computation admission failed")
+                self._persist_capture_manifest_locked()
+                raise ApiError(HTTPStatus.TOO_MANY_REQUESTS, "Computation capacity is unavailable") from cause
             return {"accepted": True, "job": dict(job)}
 
     def calibrate(self, *, _auto_run: bool = False) -> Dict[str, Any]:
+        if self._work_runtime is None:
+            # Direct library use is synchronous and owns no background thread.
+            with self.lock:
+                if not _auto_run:
+                    self._require_idle_locked()
+                return self._calibrate_locked()
         receipt = self.start_candidate(_auto_run=_auto_run)
         if not receipt.get("accepted"):
             return receipt
-        thread = self._solve_thread
-        if thread is not None:
-            thread.join()
+        future = self._solve_future
+        if future is not None:
+            future.result()
         with self.lock:
             if self.candidate_result is None:
                 raise ApiError(HTTPStatus.UNPROCESSABLE_ENTITY,
@@ -3096,6 +3180,9 @@ class IntrinsicCalibrationService:
                     self.board_type
                 ),
                 **({"progress": self._solve_progress} if hasattr(self, "_solve_progress") else {}),
+                **({"validation_submit": self._solve_validation_submit,
+                    "validation_workers": self._solve_validation_workers}
+                   if hasattr(self, "_solve_validation_submit") else {}),
             )
         except (CalibrationError, cv2.error) as error:
             raise ApiError(HTTPStatus.UNPROCESSABLE_ENTITY, str(error)) from error
