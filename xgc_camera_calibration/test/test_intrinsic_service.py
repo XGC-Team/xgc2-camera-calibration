@@ -2071,9 +2071,10 @@ class IntrinsicServiceTest(unittest.TestCase):
             evidence = service.state()["evidence"]
             self.assertTrue(evidence["available"])
             self.assertEqual(evidence["sample_count"], 1)
+            self.assertTrue(service._evidence_root.name.startswith("capture-"))
             self.assertEqual(
                 evidence["filename"], "intrinsic-candidate_ready-evidence-{}-revision-{:03d}-{:03d}.zip".format(
-                    service._evidence_root.name.removeprefix("capture-"), service.session_revision, service.collection_revision)
+                    service._evidence_root.name[len("capture-"):], service.session_revision, service.collection_revision)
             )
 
             server = CalibrationHttpServer(

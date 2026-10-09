@@ -2,6 +2,7 @@
 import json
 import tempfile
 import unittest
+import uuid
 from dataclasses import asdict
 from pathlib import Path
 
@@ -13,7 +14,7 @@ from xgc_camera_calibration.media_snapshot import MediaSnapshotClient, MediaSnap
 
 class FakeMediaEdge:
     def __init__(self):
-        self.requests, self.deleted = [], []
+        self.requests, self.deleted, self.snapshot_ids = [], [], []
         self.sources = [{"id": "usb_cam"}]
         self.image = np.full((216, 384, 3), (10, 20, 30), dtype=np.uint8)
         self.jpeg = cv2.imencode(".jpg", self.image)[1].tobytes()
@@ -35,22 +36,24 @@ class FakeMediaEdge:
         ref = {"target_id": "test-target", "service": "media-edge", "api_version": "v1",
                "instance_id": "edge-1", "profile": "http.v1",
                "endpoint": {"kind": "unix", "address": self.path}}
-        def capture(context, value):
+        def capture(context, value, snapshot_id):
             self.requests.append((context.request_id, value))
             if self.custom_capture:
                 return self.custom_capture(value)
             raw = self.raw if value["includeRgb"] else b""
-            metadata = {**self.metadata, "snapshotId": value["snapshotId"],
+            metadata = {**self.metadata, "snapshotId": snapshot_id,
                 "jpegBytes": len(self.jpeg), "rgbBytes": len(raw) + self.announced_rgb_delta}
             return multipart(metadata, self.jpeg, raw)
-        def release(context, value):
-            self.deleted.append(context.request_id)
-            return Response(b"", 204)
-        # Runtime Host resolves explicit routes; capture identities are known
-        # only after admission, so extend the release route in this fixture.
+        # The provider admits and owns the snapshot; the request does not
+        # choose its identity. Release the exact identity returned in metadata.
         def capture_with_release(context, value):
-            self.host.routes[("DELETE", "/v1/media/snapshots/" + value["snapshotId"])] = release
-            return capture(context, value)
+            snapshot_id = uuid.uuid4().hex
+            self.snapshot_ids.append(snapshot_id)
+            def release(context, value):
+                self.deleted.append(snapshot_id)
+                return Response(b"", 204)
+            self.host.routes[("DELETE", "/v1/media/snapshots/" + snapshot_id)] = release
+            return capture(context, value, snapshot_id)
         routes = {("GET", "/v1/describe"): lambda c, r: {"service_ref": ref, "sources": self.sources},
                   ("GET", "/v1/health"): lambda c, r: {"sources": self.sources},
                   ("POST", "/v1/media/sources/usb_cam/capture"): capture_with_release}
@@ -78,7 +81,9 @@ class MediaSnapshotClientTest(unittest.TestCase):
             self.assertEqual(snapshot.timestamp_clock_domain, "simulation")
             self.assertEqual(snapshot.frame_sequence, 1)
             self.assertEqual(len(edge.requests), 1)
-            self.assertEqual(len(edge.deleted), 1)
+            self.assertEqual(edge.deleted, [snapshot.id])
+            self.assertEqual(edge.snapshot_ids, [snapshot.id])
+            self.assertNotIn("snapshotId", edge.requests[0][1])
             self.assertTrue(edge.requests[0][1]["requireFresh"])
 
     def test_detection_capture_is_same_frame_jpeg_only_and_preserves_source_plane(self):
@@ -99,6 +104,7 @@ class MediaSnapshotClientTest(unittest.TestCase):
                 if corrupt == "sequence": edge.metadata["frameSequence"] = 0
                 if corrupt == "pose": edge.metadata.pop("poseFrameId")
                 with self.assertRaises(MediaSnapshotError): edge.client.capture()
+                self.assertEqual(edge.deleted, edge.snapshot_ids)
                 self.assertEqual(len(edge.deleted), 1)
 
     def test_simulation_zero_time_and_unavailable_calibration_are_preserved(self):
@@ -115,7 +121,8 @@ class MediaSnapshotClientTest(unittest.TestCase):
             edge.host.instance_id = "edge-2"
             with self.assertRaises(MediaSnapshotError): edge.client.capture()
             self.assertEqual(edge.requests, [])
-            self.assertEqual(edge.client.last_cleanup_error, "TransportError")
+            self.assertEqual(edge.deleted, [])
+            self.assertIsNone(edge.client.last_cleanup_error)
 
     def test_health_requires_configured_source_and_bootstrap_rejects_http(self):
         with FakeMediaEdge() as edge:
@@ -133,7 +140,9 @@ class MediaSnapshotClientTest(unittest.TestCase):
                 return Response(body, content_type="multipart/mixed; boundary=b")
             edge.custom_capture = malformed
             with self.assertRaises(MediaSnapshotError): edge.client.capture()
-            self.assertEqual(len(edge.deleted), 1)
+            self.assertEqual(len(edge.requests), 1)
+            self.assertEqual(edge.deleted, [])
+            self.assertIsNone(edge.client.last_cleanup_error)
 
 
 if __name__ == "__main__": unittest.main()
