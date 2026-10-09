@@ -11,6 +11,7 @@ catkin_install_python(PROGRAMS
   scripts/extrinsic_tf_publisher.py
   scripts/gazebo_camera_from_extrinsic.py
   scripts/resolve_extrinsic.py
+  scripts/render_asset.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 install(PROGRAMS scripts/resolve_intrinsic.sh
@@ -25,6 +26,7 @@ install(DIRECTORY web
 )
 
 if(CATKIN_ENABLE_TESTING)
+  catkin_add_nosetests(test/test_asset_document.py)
   catkin_add_nosetests(test/test_solver.py)
   catkin_add_nosetests(test/test_planar_ransac.py)
   catkin_add_nosetests(test/test_intrinsic_solver.py)

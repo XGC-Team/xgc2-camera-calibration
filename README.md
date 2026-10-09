@@ -297,3 +297,21 @@ simulation comparison. `rebase` applies target offset minus saved offset. A
 nonzero rebase of a legacy result without coordinate provenance is rejected.
 The ROS acceptance tool also accepts `--saved-offset X Y Z`, `--target-offset X Y Z`
 and `--world-offset-mode stored|rebase`.
+
+### Workflow file export
+
+The installed `render_asset.py` renders an explicitly pinned Calibration Asset
+spec JSON file, without contacting Core, looking up a branch, or starting ROS:
+
+```sh
+/opt/ros/noetic/lib/xgc_camera_calibration/render_asset.py \
+  --input "$PINNED_CALIBRATION_SPEC_FILE" --format camera_info_yaml \
+  --output "$GRANTED_CAMERA_YAML_FILE"
+```
+
+Use `extrinsics_yaml` for the existing optical transform document. A workflow
+passes the exact spec through its ordinary structured process input and runs
+this command as a finite process. The caller supplies the output directory;
+the tool atomically replaces only the explicit output file and prints its
+path, byte count, and digest. Calibration asset commits use the existing asset
+API. No calibration-specific workflow node, Job, or Core renderer is required.
