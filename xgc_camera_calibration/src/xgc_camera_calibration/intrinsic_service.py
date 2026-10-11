@@ -1088,15 +1088,22 @@ class IntrinsicCalibrationService:
                 )
             return None, None
         if kind == "calibration":
-            if set(configuration) != {"kind", "calibration_id"}:
+            if set(configuration) != {"kind", "calibration_id", "document"}:
                 raise ApiError(
                     HTTPStatus.BAD_REQUEST,
-                    "Intrinsic validation calibration {} requires only kind and calibration_id".format(name),
+                    "Intrinsic validation calibration {} requires a Core-resolved document".format(name),
                 )
-            path, document = self._calibration_document(
-                configuration.get("calibration_id")
-            )
-            return path.name, document
+            identity = configuration.get("calibration_id")
+            document = configuration.get("document")
+            if not isinstance(identity, str) or not identity or not isinstance(document, dict):
+                raise ApiError(HTTPStatus.BAD_REQUEST, "Invalid resolved calibration identity or document")
+            if document.get("camera_name") != self.camera_name:
+                raise ApiError(HTTPStatus.UNPROCESSABLE_ENTITY, "Selected intrinsic calibration belongs to another camera")
+            try:
+                intrinsic_validation.intrinsic_parameters(document)
+            except (ValueError, CalibrationError) as error:
+                raise ApiError(HTTPStatus.UNPROCESSABLE_ENTITY, str(error)) from error
+            return identity, document
         raise ApiError(
             HTTPStatus.BAD_REQUEST,
             "Intrinsic validation {} kind must be raw or calibration".format(name),

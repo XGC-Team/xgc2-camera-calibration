@@ -176,7 +176,7 @@ class MediaSnapshotClient:
     @property
     def client(self):
         try:
-            return self.peer.require_client()
+            return self.peer.require_client(self.timeout_seconds)
         except PeerUnavailable as error:
             raise MediaSnapshotError(str(error)) from error
 

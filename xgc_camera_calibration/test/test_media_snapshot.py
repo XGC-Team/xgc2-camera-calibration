@@ -80,6 +80,32 @@ class FakeMediaEdge:
 
 
 class MediaSnapshotClientTest(unittest.TestCase):
+    def test_first_capture_discovers_peer_without_an_events_subscription(self):
+        with FakeMediaEdge() as edge:
+            cold = MediaSnapshotClient(edge.path, "usb_cam", local_target="test-target")
+            try:
+                self.assertEqual(cold.status()["reason"], "not_requested")
+                snapshot = cold.capture_detection()
+                self.assertEqual(snapshot.jpeg, edge.jpeg)
+                self.assertEqual(len(edge.requests), 1)
+                self.assertEqual(edge.deleted, [snapshot.id])
+                self.assertEqual(cold.status()["connect_attempts"], 1)
+            finally:
+                cold.close()
+
+    def test_missing_peer_capture_has_a_finite_wait_and_no_side_effect(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cold = MediaSnapshotClient(str(Path(directory) / "absent.sock"), "usb_cam",
+                                       timeout_seconds=.05, local_target="test-target")
+            try:
+                start = time.monotonic()
+                with self.assertRaises(MediaSnapshotError):
+                    cold.capture_detection()
+                self.assertLess(time.monotonic() - start, 1)
+                self.assertEqual(cold.status()["connect_attempts"], 0)
+            finally:
+                cold.close()
+
     def test_source_failure_is_status_without_invalidating_media_service(self):
         with FakeMediaEdge() as edge:
             edge.client.capture()

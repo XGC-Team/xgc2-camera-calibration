@@ -74,9 +74,14 @@ class UnixPeer:
         except (OSError, TypeError):
             pass
 
-    def require_client(self):
+    def require_client(self, timeout_seconds=0):
         self.activate()
         with self._condition:
+            if timeout_seconds > 0:
+                # A capture worker may be the first consumer after startup.
+                # Wait on the existing discovery, never replay its command.
+                self._condition.wait_for(
+                    lambda: self._stop or self._state["ready"], timeout_seconds)
             if not self._state["ready"] or self.client is None:
                 raise PeerUnavailable(self.reference.service + " is " + self._state["reason"])
             return self.client

@@ -428,6 +428,22 @@ class FakeCameraControl:
 
 class IntrinsicServiceTest(unittest.TestCase):
 
+    def test_validation_resolves_core_document_without_result_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = make_service(Path(directory) / "intrinsics.yaml")
+            document = {
+                "camera_name": "usb_cam", "image_width": 640, "image_height": 480,
+                "camera_matrix": {"data": [500, 0, 320, 0, 500, 240, 0, 0, 1]},
+                "distortion_coefficients": {"data": [0, 0, 0, 0, 0]},
+                "distortion_model": "plumb_bob",
+            }
+            selected = {"kind": "calibration", "calibration_id": "asset:commit", "document": document}
+            self.assertEqual(service._validation_configuration(selected, "comparison"), ("asset:commit", document))
+            with self.assertRaises(ApiError):
+                service._validation_configuration({"kind": "calibration", "calibration_id": "old.yaml"}, "comparison")
+            with self.assertRaises(ApiError):
+                service._validation_configuration({**selected, "document": {**document, "camera_name": "other"}}, "comparison")
+
     def test_snapshot_rejects_missing_or_failed_source_without_cached_display_fallback(self):
         with tempfile.TemporaryDirectory() as directory:
             service = make_service(Path(directory) / "intrinsics.yaml")
