@@ -132,8 +132,9 @@ INTRINSIC_PID="$!"
 python3 - "${RUNTIME}" "${EXTRINSIC_PORT}" "${INTRINSIC_PORT}" <<'PYCHECK'
 import json, sys, time, urllib.request
 from pathlib import Path
-from xgc2_xrpc import Client, Endpoint, ServiceRef
+from xgc2_xrpc import Client, Endpoint, Runtime, ServiceRef
 root = Path(sys.argv[1])
+runtime = Runtime()
 for kind, port in zip(("extrinsic", "intrinsic"), sys.argv[2:]):
     for _ in range(100):
         try:
@@ -146,16 +147,17 @@ for kind, port in zip(("extrinsic", "intrinsic"), sys.argv[2:]):
         raise RuntimeError(kind + ' did not start')
     ref = ServiceRef('package-smoke', 'xgc2.calibration.v1.Calibration', '1', '', 'http.v1',
                      Endpoint('unix', str(root / (kind + '.sock'))))
-    with Client.from_service(ref, local_target='package-smoke', discovery=True) as client:
+    with Client.from_service(ref, runtime=runtime, local_target='package-smoke', discovery=True) as client:
         started = time.monotonic()
         description = client.json('/v1/describe?wait_ready_ms=100', method='GET', timeout=1)
         assert time.monotonic() - started >= .09
         assert not description['ready']
         assert description['facts']['result_path'] == '/v1/result'
-    with Client.from_service(ServiceRef.from_dict(description['service_ref']), local_target='package-smoke') as client:
+    with Client.from_service(ServiceRef.from_dict(description['service_ref']), runtime=runtime, local_target='package-smoke') as client:
         result = client.json('/v1/result', method='GET')
         assert result['kind'] == kind and result['camera_id'] == 'package_smoke' and result['result'] is None
         assert client.json('/v1/result', method='GET')['revision'] == result['revision']
+runtime.close()
 import rospy
 from tf2_msgs.msg import TFMessage
 rospy.init_node('camera_package_tf_check', anonymous=True, disable_signals=True)
