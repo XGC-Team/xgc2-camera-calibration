@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <package format="2">
   <name>xgc_camera_calibration</name>
-  <version>0.3.0</version>
+  <version>0.4.0</version>
   <description>Independent intrinsic and fixed-world-camera extrinsic calibration tools.</description>
   <maintainer email="maintainers@xgc2.example">XGC2</maintainer>
   <license>BSD-3-Clause</license>

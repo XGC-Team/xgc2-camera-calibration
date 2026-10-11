@@ -37,7 +37,18 @@ docker run --rm \
     rsync -a --delete /workspace/repo/process-definitions/ /workspace/work/src/process-definitions/
     cd /workspace/work
     source /opt/ros/noetic/setup.bash
-    # The image supplies XRPC with path-only discovery and describe query support.
+    # First-party official SDK 0.2.0 (path-only discovery, unbound describe query);
+    # third-party modules remain image-owned.
+    sdk_wheel=/workspace/work/xgc2_xrpc-0.2.0-py3-none-any.whl
+    curl -fsSL --retry 5 \
+      https://github.com/XGC-Team/xgc2-xrpc/releases/download/v0.2.0-1/xgc2_xrpc-0.2.0-py3-none-any.whl \
+      -o "$sdk_wheel"
+    echo "fc81fe2ee5ef1abf2e7313ff4ae9401ce60f3dee14292b5228ea46e01f97c298  $sdk_wheel" | sha256sum -c -
+    rm -rf /workspace/work/sdk
+    python3 -m zipfile -e "$sdk_wheel" /workspace/work/sdk
+    printf "%s\n" "{\"url\":\"https://github.com/XGC-Team/xgc2-xrpc/releases/download/v0.2.0-1/xgc2_xrpc-0.2.0-py3-none-any.whl\",\"archive_info\":{\"hashes\":{\"sha256\":\"fc81fe2ee5ef1abf2e7313ff4ae9401ce60f3dee14292b5228ea46e01f97c298\"}}}" \
+      > /workspace/work/sdk/xgc2_xrpc-0.2.0.dist-info/direct_url.json
+    export PYTHONPATH="/workspace/work/sdk:${PYTHONPATH:-}"
     python3 /workspace/repo/.xgc2/scripts/check_python_xrpc.py
     catkin_make -j1 -DCMAKE_BUILD_TYPE=RelWithDebInfo
     ROS_HOME=/workspace/work/ros-home ROS_LOG_DIR=/workspace/work/ros-log catkin_make -j1 run_tests
