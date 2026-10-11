@@ -58,6 +58,9 @@ usage:
     '
 ownership:
   paths:
+  - /usr/share/xgc2/process-definitions/xgc2-camera-extrinsic-calibrator-ros1.json
+  - /usr/share/xgc2/process-definitions/xgc2-camera-extrinsic-tf-ros1.json
+  - /usr/share/xgc2/process-definitions/xgc2-camera-intrinsic-calibrator-ros1.json
   - /opt/ros/noetic/share/xgc_camera_calibration
   - /opt/ros/noetic/lib/xgc_camera_calibration
   - /opt/ros/noetic/lib/python3/dist-packages/xgc_camera_calibration

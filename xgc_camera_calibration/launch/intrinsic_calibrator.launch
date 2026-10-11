@@ -1,5 +1,6 @@
 <launch>
   <arg name="bootstrap_input" />
+  <arg name="socket_path" default="" />
   <arg name="media_edge_rpc_socket" default="/run/xgc2/media-edge/control/control.sock" />
   <arg name="media_source_id" default="usb_cam" />
   <arg name="snapshot_timeout" default="5.0" />
@@ -28,6 +29,7 @@
         name="xgc_camera_intrinsic_calibrator_web"
         output="screen">
     <param name="bootstrap_input" value="$(arg bootstrap_input)" />
+    <param if="$(eval arg('socket_path') != '')" name="socket_path" value="$(arg socket_path)" />
     <param name="media_edge_rpc_socket" value="$(arg media_edge_rpc_socket)" />
     <param name="media_source_id" value="$(arg media_source_id)" />
     <param name="snapshot_timeout" value="$(arg snapshot_timeout)" />

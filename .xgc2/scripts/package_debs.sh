@@ -45,6 +45,11 @@ copy_path() {
 copy_path "${INSTALL_ROOT}${PREFIX}/share/xgc_camera_calibration"
 copy_path "${INSTALL_ROOT}${PREFIX}/lib/xgc_camera_calibration"
 copy_path "${INSTALL_ROOT}${PREFIX}/lib/python3/dist-packages/xgc_camera_calibration"
+mkdir -p "${PACKAGE_ROOT}/usr/share/xgc2"
+mv "${PACKAGE_ROOT}${PREFIX}/share/xgc_camera_calibration/process-definitions" "${PACKAGE_ROOT}/usr/share/xgc2/"
+for definition in xgc2-camera-extrinsic-calibrator-ros1 xgc2-camera-extrinsic-tf-ros1 xgc2-camera-intrinsic-calibrator-ros1; do
+  test -s "${PACKAGE_ROOT}/usr/share/xgc2/process-definitions/${definition}.json"
+done
 
 mkdir -p "${PACKAGE_ROOT}/DEBIAN" "${PACKAGE_ROOT}/usr/share/doc/${PACKAGE_NAME}"
 cat >"${PACKAGE_ROOT}/DEBIAN/control" <<EOF

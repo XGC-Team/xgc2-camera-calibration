@@ -35,19 +35,11 @@ docker run --rm \
       /workspace/work/src/xgc_camera_calibration
     rsync -a --delete /workspace/repo/xgc_camera_calibration/ /workspace/work/src/xgc_camera_calibration/
     rsync -a --delete /workspace/repo/contracts/ /workspace/work/src/contracts/
+    rsync -a --delete /workspace/repo/process-definitions/ /workspace/work/src/process-definitions/
     cd /workspace/work
     source /opt/ros/noetic/setup.bash
-    # First-party official SDK; third-party modules remain image-owned.
-    sdk_wheel=/workspace/work/xgc2_xrpc-0.1.0-py3-none-any.whl
-    curl -fsSL --retry 5 \
-      https://github.com/XGC-Team/xgc2-xrpc/releases/download/v0.1.0-1/xgc2_xrpc-0.1.0-py3-none-any.whl \
-      -o "$sdk_wheel"
-    echo "8e505ab2366eed198dcd4343e758fed5b7936990b2a72ba635d73d81b195187c  $sdk_wheel" | sha256sum -c -
-    rm -rf /workspace/work/sdk
-    python3 -m zipfile -e "$sdk_wheel" /workspace/work/sdk
-    printf "%s\n" "{\"url\":\"https://github.com/XGC-Team/xgc2-xrpc/releases/download/v0.1.0-1/xgc2_xrpc-0.1.0-py3-none-any.whl\",\"archive_info\":{\"hashes\":{\"sha256\":\"8e505ab2366eed198dcd4343e758fed5b7936990b2a72ba635d73d81b195187c\"}}}" \
-      > /workspace/work/sdk/xgc2_xrpc-0.1.0.dist-info/direct_url.json
-    export PYTHONPATH="/workspace/work/sdk:${PYTHONPATH:-}"
+    # The image supplies XRPC with path-only discovery and describe query support.
+    python3 -c "from importlib.metadata import version; assert version(\"xgc2-xrpc\") == \"0.2.0\", \"the build image must supply Python XRPC 0.2.0\""
     catkin_make -DCMAKE_BUILD_TYPE=RelWithDebInfo
     ROS_HOME=/workspace/work/ros-home ROS_LOG_DIR=/workspace/work/ros-log catkin_make run_tests
     catkin_test_results --verbose

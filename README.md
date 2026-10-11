@@ -8,11 +8,10 @@ physical cameras while marker poses continue to arrive through ROS.
 
 The native Web entrypoints use the maintained Python `xgc2_xrpc` SDK on
 Focal's system `/usr/bin/python3` (3.8) and its image-owned aiohttp/httpx
-dependencies. The formal central-sim 1.2.8 runtime installs the official SDK
-release `v0.1.0-1` wheel (SHA256
-`8e505ab2366eed198dcd4343e758fed5b7936990b2a72ba635d73d81b195187c`)
-offline without dependency installation. The package's installed check verifies
-that identity; there is no Python SDK Debian package dependency. AprilGrid
+dependencies. The build and runtime images must supply the official Python
+XRPC 0.2.0 wheel, including unbound describe query support. The product does
+not bootstrap the SDK or its dependencies. The package's installed check
+verifies the SDK version; there is no Python SDK Debian package dependency. AprilGrid
 retains its OpenCV contrib 4.12 runtime gate.
 
 Public browser HTTP uses native aiohttp on a process-owned Runtime. Media and
@@ -22,6 +21,16 @@ The same process exposes the private service `xgc2.calibration.v1.Calibration`
 then bind the returned ServiceRef. Core reads `/api/v1/intrinsic/state` or
 `/api/v1/state` there; it never uses an unfenced browser endpoint as fallback.
 The private and public hosts share the exact domain objects and Runtime.
+Core's `socketPath` is passed as the private ROS parameter `_socket_path`; the
+launch files expose `socket_path`. It selects the private listener while
+`bootstrapInput` retains the target identity and preferences grants.
+`applicationStateParam` remains the exact owned TF publisher's ROS state name.
+The listener admits calls after domain initialization and returns the Core
+readiness fields for unbound `GET /v1/describe?wait_ready_ms=N` immediately.
+The package installs its three strict definitions from `process-definitions/`
+under `/usr/share/xgc2/process-definitions/`. Gazebo camera entities retain
+their native lifecycle in the camera product's `native_camera_entity.py`;
+calibrators do not delete another process's camera model.
 Background solves and sweeps occupy the Runtime's fixed worker pool until real
 completion; disconnecting a request does not release ongoing work. Saved YAML
 and capture evidence use readable local-time names to the second, with short

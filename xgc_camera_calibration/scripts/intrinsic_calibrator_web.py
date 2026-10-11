@@ -175,6 +175,7 @@ def main():
             intrinsic_service=service,
             runtime=runtime,
             binding=bootstrap.binding,
+            rpc_socket=rospy.get_param("~socket_path", None),
             preferences=preferences,
         )
         server.start()

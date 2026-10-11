@@ -514,6 +514,7 @@ def main():
             logger=lambda message: rospy.logdebug("Web calibrator: %s", message),
             runtime=runtime,
             binding=bootstrap.binding,
+            rpc_socket=rospy.get_param("~socket_path", None),
             preferences=preferences,
         )
         server.start()

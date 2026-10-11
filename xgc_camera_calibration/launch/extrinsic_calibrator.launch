@@ -1,5 +1,6 @@
 <launch>
   <arg name="bootstrap_input" />
+  <arg name="socket_path" default="" />
   <arg name="image_topic" default="/usb_cam/image_raw" />
   <arg name="preview_image_topic" default="/usb_cam/image_raw/compressed" />
   <arg name="intrinsic_file" />
@@ -31,6 +32,7 @@
         output="screen"
         args="--resolved-extrinsic-json '$(arg resolved_extrinsic_json)' --frame-roles-json '$(arg frame_roles_json)' --application-state-param '$(arg application_state_param)'">
     <param name="bootstrap_input" value="$(arg bootstrap_input)" />
+    <param if="$(eval arg('socket_path') != '')" name="socket_path" value="$(arg socket_path)" />
     <param name="image_topic" value="$(arg image_topic)" />
     <param name="preview_image_topic" value="$(arg preview_image_topic)" />
     <param name="intrinsic_file" value="$(arg intrinsic_file)" />

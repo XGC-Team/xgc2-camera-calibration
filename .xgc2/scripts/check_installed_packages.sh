@@ -21,6 +21,9 @@ PREFIX="/opt/ros/${ROS_DISTRO}"
 # shellcheck disable=SC1090
 source "${PREFIX}/setup.bash"
 dpkg -s ros-noetic-xgc2-camera-calibration >/dev/null
+for definition in xgc2-camera-extrinsic-calibrator-ros1 xgc2-camera-extrinsic-tf-ros1 xgc2-camera-intrinsic-calibrator-ros1; do
+  test -s "/usr/share/xgc2/process-definitions/${definition}.json"
+done
 test "$(rospack find xgc_camera_calibration)" = "${PREFIX}/share/xgc_camera_calibration"
 test -x "${PREFIX}/lib/xgc_camera_calibration/extrinsic_calibrator_web.py"
 test -x "${PREFIX}/lib/xgc_camera_calibration/intrinsic_calibrator_web.py"
@@ -120,16 +123,14 @@ wait_http() {
   done
   return 1
 }
-# Formal central-sim 1.2.8 owns this SDK wheel and its runtime dependencies.
+# The runtime image owns this SDK wheel and its runtime dependencies.
 # XRPC publishes Python as a wheel, not a Debian package.
 /usr/bin/python3 - <<'PYRUNTIME'
-import importlib.metadata, json, sys
+import importlib.metadata, sys
 import aiohttp, httpx, xgc2_xrpc
 assert sys.version_info >= (3, 8)
 sdk = importlib.metadata.distribution("xgc2-xrpc")
-assert sdk.version == "0.1.0"
-origin = json.loads(sdk.read_text("direct_url.json"))
-assert origin["archive_info"]["hashes"]["sha256"] == "8e505ab2366eed198dcd4343e758fed5b7936990b2a72ba635d73d81b195187c"
+assert sdk.version == "0.2.0", "the runtime image must supply Python XRPC 0.2.0"
 PYRUNTIME
 roscore -p 11359 >"${RUNTIME}/roscore.log" 2>&1 &
 ROSCORE_PID="$!"

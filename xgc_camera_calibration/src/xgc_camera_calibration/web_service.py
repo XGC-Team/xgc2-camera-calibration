@@ -15,6 +15,7 @@ from aiohttp import web
 from xgc2_xrpc import AppRouter, Endpoint, Fault, Host, Limits, RawStreamResponse, Response, Runtime, ServiceRef, iter_body
 from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
+from urllib.parse import parse_qs
 
 import cv2
 import numpy as np
@@ -629,13 +630,18 @@ class CalibrationHttpServer:
             body_bytes=IMAGE_BYTES, response_bytes=1 << 30, call_timeout=3600.0)
         private_reference = None
         if binding is not None:
-            if rpc_socket is not None or target_id is not None:
-                raise ValueError("Bootstrap binding is the calibration transport authority")
+            if target_id is not None:
+                raise ValueError("Bootstrap binding supplies the calibration target identity")
             private_reference = binding.service_ref(uuid.uuid4().hex)
             if (private_reference.service != "xgc2.calibration.v1.Calibration"
                     or private_reference.api_version != "1" or private_reference.profile != "http.v1"
                     or private_reference.endpoint.kind != "unix"):
                 raise ValueError("A private calibration service binding is required")
+            if rpc_socket is not None:
+                if str(rpc_socket) == "/" or str(rpc_socket).startswith("//") or "\x00" in str(rpc_socket):
+                    raise ValueError("A private canonical Unix socket path is required")
+                private_reference = replace(private_reference,
+                    endpoint=Endpoint("unix", str(rpc_socket))).validate()
             rpc_socket = private_reference.endpoint.address
         elif rpc_socket is not None:
             private_reference = ServiceRef(target_id, "xgc2.calibration.v1.Calibration", "1",
@@ -702,8 +708,19 @@ class CalibrationHttpServer:
             if self._stopping:
                 raise Fault("unavailable", "Calibration application is draining", 503)
             empty(value)
-            return {"service_ref": asdict(self.service_ref),
-                "capabilities": {"intrinsic": self.intrinsic_service is not None, "extrinsic": self.service is not None},
+            if context.query:
+                query = parse_qs(context.query, keep_blank_values=True)
+                wait = query.get("wait_ready_ms", [])
+                if (set(query) != {"wait_ready_ms"} or len(wait) != 1
+                        or len(wait[0]) > 5 or not wait[0].isascii() or not wait[0].isdigit()
+                        or int(wait[0]) > 30000):
+                    raise Fault("invalid_argument", "wait_ready_ms must be in [0, 30000]", 400)
+            capabilities = {"intrinsic": self.intrinsic_service is not None, "extrinsic": self.service is not None}
+            # Admission starts after domain initialization, so readiness waits can complete immediately.
+            return {"service": self.service_ref.service, "api_version": self.service_ref.api_version,
+                "instance_id": self.service_ref.instance_id, "ready": True,
+                "facts": {"capabilities": capabilities}, "service_ref": asdict(self.service_ref),
+                "capabilities": capabilities,
                 "routes": [{"method": method, "path": path} for method, path in sorted(routes)]}
         routes[("GET", "/v1/describe")] = describe
         return routes

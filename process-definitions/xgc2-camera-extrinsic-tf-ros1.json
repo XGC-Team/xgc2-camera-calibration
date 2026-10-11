@@ -1,0 +1,151 @@
+{
+  "apiVersion": "xgc.execution.process/v1",
+  "definitions": [
+    {
+      "id": "xgc2-camera-extrinsic-tf-ros1",
+      "version": "1.4.0",
+      "label": "XGC2 camera extrinsic TF",
+      "description": "Publish the workflow-frozen camera pose; apply only exact pending requests for this producer and confirm global selection after publishing the complete transform chain.",
+      "parameters": {
+        "groups": [
+          {
+            "id": "calibration-storage",
+            "label": "Calibration Storage",
+            "collapsed": true,
+            "parameters": [
+              "calibrationRoot",
+              "calibrationMode",
+              "cameraName"
+            ]
+          },
+          {
+            "id": "ros-advanced",
+            "label": "ROS Advanced",
+            "collapsed": true,
+            "parameters": [
+              "rosMasterUri",
+              "rosLogDir"
+            ]
+          }
+        ],
+        "properties": {
+          "calibrationRoot": {
+            "type": "string",
+            "description": "Absolute storage root containing mode and camera partitions.",
+            "x-xgc-path-kind": "directory"
+          },
+          "calibrationMode": {
+            "type": "string",
+            "default": "sim",
+            "enum": [
+              "sim",
+              "phy"
+            ]
+          },
+          "cameraName": {
+            "type": "string",
+            "default": "usb_cam",
+            "description": "Stable camera identity and directory name; independent from ROS frame and media source names."
+          },
+          "parentFrame": {
+            "type": "string",
+            "default": "map"
+          },
+          "cameraLinkFrame": {
+            "type": "string",
+            "default": "usb_cam_link"
+          },
+          "opticalFrame": {
+            "type": "string",
+            "default": "usb_cam_optical_frame"
+          },
+          "linkToOpticalX": {
+            "type": "number",
+            "default": 0.0
+          },
+          "linkToOpticalY": {
+            "type": "number",
+            "default": 0.0
+          },
+          "linkToOpticalZ": {
+            "type": "number",
+            "default": 0.0
+          },
+          "static": {
+            "type": "boolean",
+            "default": true
+          },
+          "publishRate": {
+            "type": "number",
+            "default": 10.0,
+            "minimum": 0.1
+          },
+          "filePollRate": {
+            "type": "number",
+            "default": 5.0,
+            "minimum": 0.1
+          },
+          "rosMasterUri": {
+            "type": "string",
+            "default": "http://127.0.0.1:11311",
+            "output": true
+          },
+          "rosLogDir": {
+            "type": "string",
+            "default": "/var/lib/xgc2/ros/log/camera-tf"
+          },
+          "resolvedExtrinsicJson": {
+            "type": "string",
+            "description": "One immutable extrinsic resolution produced by the camera workflow."
+          },
+          "frameRolesJson": {
+            "type": "string",
+            "default": "{\"parentFrame\":\"world\",\"opticalFrames\":{\"sim\":\"xgc_world_camera_optical_frame\",\"phy\":\"usb_cam_optical_frame\"}}"
+          }
+        },
+        "required": [
+          "resolvedExtrinsicJson"
+        ]
+      },
+      "command": {
+        "executable": "/opt/ros/noetic/lib/xgc_camera_calibration/extrinsic_tf_publisher.py",
+        "args": [
+          "--resolved-extrinsic-json",
+          "${resolvedExtrinsicJson}",
+          "--frame-roles-json",
+          "${frameRolesJson}",
+          "__name:=xgc_camera_extrinsic_tf",
+          "_calibration_root:=${calibrationRoot}",
+          "_calibration_mode:=${calibrationMode}",
+          "_camera_name:=${cameraName}",
+          "_parent_frame:=${parentFrame}",
+          "_camera_link_frame:=${cameraLinkFrame}",
+          "_optical_frame:=${opticalFrame}",
+          "_link_to_optical_x:=${linkToOpticalX}",
+          "_link_to_optical_y:=${linkToOpticalY}",
+          "_link_to_optical_z:=${linkToOpticalZ}",
+          "_static:=${static}",
+          "_publish_rate:=${publishRate}",
+          "_file_poll_rate:=${filePollRate}"
+        ],
+        "env": {
+          "ROS_MASTER_URI": "${rosMasterUri}",
+          "ROS_LOG_DIR": "${rosLogDir}"
+        }
+      },
+      "setupFiles": [
+        "/opt/ros/noetic/setup.bash"
+      ],
+      "readiness": {
+        "kind": "none"
+      },
+      "stop": {
+        "graceMs": 5000
+      },
+      "logs": {
+        "maxBytes": 1048576,
+        "files": 3
+      }
+    }
+  ]
+}

@@ -1,0 +1,219 @@
+{
+  "apiVersion": "xgc.execution.process/v1",
+  "definitions": [
+    {
+      "id": "xgc2-camera-intrinsic-calibrator-ros1",
+      "version": "3.0.0",
+      "label": "XGC2 camera intrinsic calibration WebUI",
+      "description": "Request bounded immutable snapshots from a co-located Media Edge, collect strict AprilGrid observations, analyze a robust held-out intrinsic candidate, and persist camera_matrix + distortion only after explicit Save while streaming a reproducibility evidence bundle.",
+      "parameters": {
+        "groups": [
+          {
+            "id": "calibration-storage",
+            "label": "Calibration Storage",
+            "collapsed": true,
+            "parameters": [
+              "calibrationRoot",
+              "calibrationMode",
+              "cameraName"
+            ]
+          },
+          {
+            "id": "ros-advanced",
+            "label": "ROS Advanced",
+            "collapsed": true,
+            "parameters": [
+              "rosMasterUri",
+              "rosLogDir"
+            ]
+          }
+        ],
+        "properties": {
+          "mediaSourceId": {
+            "type": "string",
+            "default": "usb_cam"
+          },
+          "snapshotTimeout": {
+            "type": "number",
+            "default": 5.0,
+            "minimum": 0.1,
+            "maximum": 120.0
+          },
+          "calibrationRoot": {
+            "type": "string",
+            "description": "Absolute storage root. Results are stored under <root>/<sim|phy>/<cameraName>/.",
+            "x-xgc-path-kind": "directory"
+          },
+          "calibrationMode": {
+            "type": "string",
+            "default": "sim",
+            "enum": [
+              "sim",
+              "phy"
+            ],
+            "description": "Explicit persistence partition selected by the Experiment run mode."
+          },
+          "cameraName": {
+            "type": "string",
+            "default": "usb_cam",
+            "description": "Stable camera identity and directory name; independent from the Media Edge source ID."
+          },
+          "boardProfile": {
+            "type": "string",
+            "default": "field_6x6_88mm_30pct",
+            "enum": [
+              "field_6x6_88mm_30pct",
+              "a4_6x6_24mm_30pct_kalibr_v1"
+            ],
+            "description": "Atomic AprilGrid geometry used by the detector, solver, persistence metadata, and Gazebo target."
+          },
+          "boardX": {
+            "type": "number",
+            "default": 2.0
+          },
+          "boardY": {
+            "type": "number",
+            "default": 0.0
+          },
+          "boardZ": {
+            "type": "number",
+            "default": 2.2
+          },
+          "displayWidth": {
+            "type": "integer",
+            "default": 720,
+            "minimum": 64,
+            "maximum": 16384
+          },
+          "jpegQuality": {
+            "type": "integer",
+            "default": 80,
+            "minimum": 1,
+            "maximum": 100
+          },
+          "cameraControl": {
+            "type": "boolean",
+            "default": false
+          },
+          "cameraModelName": {
+            "type": "string",
+            "default": "gazebo_static_camera"
+          },
+          "cameraControlTimeout": {
+            "type": "number",
+            "default": 8.0,
+            "minimum": 0.0
+          },
+          "bindAddress": {
+            "type": "string",
+            "default": "127.0.0.1"
+          },
+          "httpPort": {
+            "type": "integer",
+            "default": 18083,
+            "minimum": 1,
+            "maximum": 65535
+          },
+          "frameAncestors": {
+            "type": "string",
+            "default": "'''self'' http://127.0.0.1:* http://localhost:*'"
+          },
+          "allowedOrigins": {
+            "type": "string",
+            "default": ""
+          },
+          "rosMasterUri": {
+            "type": "string",
+            "default": "http://127.0.0.1:11311",
+            "output": true
+          },
+          "rosLogDir": {
+            "type": "string",
+            "default": "/tmp/xgc2/ros/log/camera-calibration"
+          },
+          "mediaEdgeRPCSocket": {
+            "type": "string",
+            "description": "Unix endpoint from the ready target-local Media Edge ServiceRef.",
+            "default": ""
+          },
+          "bootstrapInput": {
+            "type": "string",
+            "fixedOnly": true,
+            "sensitive": true,
+            "x-xgc-path-kind": "file",
+            "description": "Private deployment BootstrapInput bound to the ready preferences storage."
+          },
+          "socketPath": {
+            "type": "string",
+            "fixedOnly": true,
+            "description": "Deployment-owned private calibration RPC endpoint."
+          },
+          "simulationEndpoint": {
+            "type": "string",
+            "default": "",
+            "description": "Unix endpoint from the ready Session world ServiceRef; required when cameraControl is enabled."
+          }
+        },
+        "required": [
+          "bootstrapInput",
+          "socketPath"
+        ]
+      },
+      "command": {
+        "executable": "/opt/ros/noetic/lib/xgc_camera_calibration/intrinsic_calibrator_web.py",
+        "args": [
+          "__name:=xgc_camera_intrinsic_calibrator_web",
+          "_media_edge_rpc_socket:=${mediaEdgeRPCSocket}",
+          "_media_source_id:=${mediaSourceId}",
+          "_snapshot_timeout:=${snapshotTimeout}",
+          "_calibration_root:=${calibrationRoot}",
+          "_calibration_mode:=${calibrationMode}",
+          "_camera_name:=${cameraName}",
+          "_board_profile:=${boardProfile}",
+          "_board_x:=${boardX}",
+          "_board_y:=${boardY}",
+          "_board_z:=${boardZ}",
+          "_display_width:=${displayWidth}",
+          "_jpeg_quality:=${jpegQuality}",
+          "_camera_control:=${cameraControl}",
+          "_camera_model_name:=${cameraModelName}",
+          "_camera_control_timeout:=${cameraControlTimeout}",
+          "_bind_address:=${bindAddress}",
+          "_http_port:=${httpPort}",
+          "_frame_ancestors:=${frameAncestors}",
+          "_allowed_origins:=${allowedOrigins}",
+          "_socket_path:=${socketPath}",
+          "_bootstrap_input:=${bootstrapInput}",
+          "_simulation_endpoint:=${simulationEndpoint}"
+        ],
+        "env": {
+          "ROS_MASTER_URI": "${rosMasterUri}",
+          "ROS_LOG_DIR": "${rosLogDir}"
+        }
+      },
+      "services": [
+        {
+          "service": "xgc2.calibration.v1.Calibration",
+          "api_version": "1",
+          "profile": "http.v1",
+          "endpointParameter": "socketPath"
+        }
+      ],
+      "setupFiles": [
+        "/opt/ros/noetic/setup.bash"
+      ],
+      "readiness": {
+        "kind": "describe",
+        "startGraceMs": 30000,
+        "timeoutMs": 30000
+      },
+      "stop": {
+        "graceMs": 5000
+      },
+      "logs": {
+        "maxBytes": 1048576,
+        "files": 3
+      }
+    }
+  ]
+}

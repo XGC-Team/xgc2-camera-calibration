@@ -4,6 +4,15 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 cd "${REPO_ROOT}"
+python3 - <<'PY'
+import json
+from pathlib import Path
+for name in ('xgc2-camera-extrinsic-calibrator-ros1', 'xgc2-camera-extrinsic-tf-ros1', 'xgc2-camera-intrinsic-calibrator-ros1'):
+    document = json.loads((Path('process-definitions') / (name + '.json')).read_text())
+    assert document['apiVersion'] == 'xgc.execution.process/v1'
+    definition, = document['definitions']
+    assert definition['id'] == name
+PY
 
 for script in .xgc2/scripts/*.sh; do
   bash -n "${script}"

@@ -1,0 +1,248 @@
+{
+  "apiVersion": "xgc.execution.process/v1",
+  "definitions": [
+    {
+      "id": "xgc2-camera-extrinsic-calibrator-ros1",
+      "version": "3.0.0",
+      "label": "XGC2 camera extrinsic calibration WebUI",
+      "description": "Use the explicitly selected intrinsic YAML with one immutable camera frame and the latest poses of static markers, solve robust PnP, and persist parent_T_camera_optical.",
+      "parameters": {
+        "groups": [
+          {
+            "id": "calibration-storage",
+            "label": "Calibration Storage",
+            "collapsed": true,
+            "parameters": [
+              "calibrationRoot",
+              "calibrationMode",
+              "cameraName"
+            ]
+          },
+          {
+            "id": "ros-advanced",
+            "label": "ROS Advanced",
+            "collapsed": true,
+            "parameters": [
+              "rosMasterUri",
+              "rosLogDir"
+            ]
+          }
+        ],
+        "properties": {
+          "imageTopic": {
+            "type": "string",
+            "default": "/usb_cam/image_raw"
+          },
+          "previewImageTopic": {
+            "type": "string",
+            "default": "/usb_cam/image_raw/compressed"
+          },
+          "intrinsicFile": {
+            "type": "string",
+            "default": "",
+            "description": "Absolute path to the timestamped xgc2.camera.intrinsic.v1 YAML used by solvePnP.",
+            "x-xgc-path-kind": "file",
+            "x-xgc-file-extensions": [
+              ".yaml"
+            ]
+          },
+          "mediaSourceId": {
+            "type": "string",
+            "default": "usb_cam"
+          },
+          "snapshotTimeout": {
+            "type": "number",
+            "default": 5.0,
+            "minimum": 0.1
+          },
+          "poseCoordinateSource": {
+            "type": "string",
+            "default": "unspecified",
+            "enum": [
+              "unspecified",
+              "raw-vrpn",
+              "experiment-world"
+            ],
+            "description": "Explicit coordinate provenance of pose input; never inferred from ROS frame names."
+          },
+          "posePrefix": {
+            "type": "string",
+            "default": "/vrpn_client_node"
+          },
+          "trackers": {
+            "type": "string",
+            "default": "",
+            "description": "Comma-separated UAV/UGV names allowed as pose markers; empty discovers all markers under posePrefix."
+          },
+          "calibrationRoot": {
+            "type": "string",
+            "description": "Absolute storage root. Results are stored under <root>/<sim|phy>/<cameraName>/.",
+            "x-xgc-path-kind": "directory"
+          },
+          "calibrationMode": {
+            "type": "string",
+            "default": "sim",
+            "enum": [
+              "sim",
+              "phy"
+            ],
+            "description": "Explicit persistence partition selected by the Experiment run mode."
+          },
+          "cameraName": {
+            "type": "string",
+            "default": "usb_cam",
+            "description": "Stable camera identity and directory name; independent from the Media Edge source ID."
+          },
+          "parentFrame": {
+            "type": "string",
+            "default": "map"
+          },
+          "opticalFrame": {
+            "type": "string",
+            "default": "usb_cam_optical_frame"
+          },
+          "maximumErrorPx": {
+            "type": "number",
+            "default": 10.0,
+            "minimum": 0.0
+          },
+          "freezeImageTimeout": {
+            "type": "number",
+            "default": 2.0,
+            "minimum": 0.1
+          },
+          "jpegQuality": {
+            "type": "integer",
+            "default": 80,
+            "minimum": 1,
+            "maximum": 100
+          },
+          "bindAddress": {
+            "type": "string",
+            "default": "127.0.0.1"
+          },
+          "httpPort": {
+            "type": "integer",
+            "default": 18082,
+            "minimum": 1,
+            "maximum": 65535
+          },
+          "frameAncestors": {
+            "type": "string",
+            "default": "'''self'' http://127.0.0.1:* http://localhost:*'"
+          },
+          "allowedOrigins": {
+            "type": "string",
+            "default": ""
+          },
+          "rosMasterUri": {
+            "type": "string",
+            "default": "http://127.0.0.1:11311",
+            "output": true
+          },
+          "rosLogDir": {
+            "type": "string",
+            "default": "/tmp/xgc2/ros/log/camera-calibration"
+          },
+          "resolvedExtrinsicJson": {
+            "type": "string",
+            "description": "One immutable extrinsic resolution produced by the camera workflow."
+          },
+          "frameRolesJson": {
+            "type": "string",
+            "default": "{\"parentFrame\":\"world\",\"opticalFrames\":{\"sim\":\"xgc_world_camera_optical_frame\",\"phy\":\"usb_cam_optical_frame\"}}"
+          },
+          "applicationStateParam": {
+            "type": "string",
+            "description": "Exact TF publisher state parameter for this owned camera provider."
+          },
+          "mediaEdgeRPCSocket": {
+            "type": "string",
+            "description": "Unix endpoint from the ready target-local Media Edge ServiceRef.",
+            "default": ""
+          },
+          "bootstrapInput": {
+            "type": "string",
+            "fixedOnly": true,
+            "sensitive": true,
+            "x-xgc-path-kind": "file",
+            "description": "Private deployment BootstrapInput bound to the ready preferences storage."
+          },
+          "socketPath": {
+            "type": "string",
+            "fixedOnly": true,
+            "description": "Deployment-owned private calibration RPC endpoint."
+          }
+        },
+        "required": [
+          "resolvedExtrinsicJson",
+          "applicationStateParam",
+          "bootstrapInput",
+          "socketPath"
+        ]
+      },
+      "command": {
+        "executable": "/opt/ros/noetic/lib/xgc_camera_calibration/extrinsic_calibrator_web.py",
+        "args": [
+          "--application-state-param",
+          "${applicationStateParam}",
+          "--resolved-extrinsic-json",
+          "${resolvedExtrinsicJson}",
+          "--frame-roles-json",
+          "${frameRolesJson}",
+          "__name:=xgc_camera_extrinsic_calibrator_web",
+          "_image_topic:=${imageTopic}",
+          "_preview_image_topic:=${previewImageTopic}",
+          "_intrinsic_file:=${intrinsicFile}",
+          "_media_edge_rpc_socket:=${mediaEdgeRPCSocket}",
+          "_media_source_id:=${mediaSourceId}",
+          "_snapshot_timeout:=${snapshotTimeout}",
+          "_pose_prefix:=${posePrefix}",
+          "_pose_coordinate_source:=${poseCoordinateSource}",
+          "_trackers:=${trackers}",
+          "_calibration_root:=${calibrationRoot}",
+          "_calibration_mode:=${calibrationMode}",
+          "_camera_name:=${cameraName}",
+          "_parent_frame:=${parentFrame}",
+          "_child_frame:=${opticalFrame}",
+          "_maximum_inlier_error_px:=${maximumErrorPx}",
+          "_freeze_image_timeout:=${freezeImageTimeout}",
+          "_jpeg_quality:=${jpegQuality}",
+          "_bind_address:=${bindAddress}",
+          "_http_port:=${httpPort}",
+          "_frame_ancestors:=${frameAncestors}",
+          "_allowed_origins:=${allowedOrigins}",
+          "_socket_path:=${socketPath}",
+          "_bootstrap_input:=${bootstrapInput}"
+        ],
+        "env": {
+          "ROS_MASTER_URI": "${rosMasterUri}",
+          "ROS_LOG_DIR": "${rosLogDir}"
+        }
+      },
+      "services": [
+        {
+          "service": "xgc2.calibration.v1.Calibration",
+          "api_version": "1",
+          "profile": "http.v1",
+          "endpointParameter": "socketPath"
+        }
+      ],
+      "setupFiles": [
+        "/opt/ros/noetic/setup.bash"
+      ],
+      "readiness": {
+        "kind": "describe",
+        "startGraceMs": 30000,
+        "timeoutMs": 30000
+      },
+      "stop": {
+        "graceMs": 5000
+      },
+      "logs": {
+        "maxBytes": 1048576,
+        "files": 3
+      }
+    }
+  ]
+}
