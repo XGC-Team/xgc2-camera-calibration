@@ -27,9 +27,10 @@ const ui = {
 const context = ui.canvas.getContext("2d");
 const state = { server:null, frameImage:null, display:null, points:[], candidate:null,
   busy:false, frameLoading:false, stateLoading:false, reviewId:null, replaceId:null,
-  pending:null, disposed:false, controller:new AbortController(), frameEpoch:0 };
+  pending:null, pendingState:null, disposed:false, controller:new AbortController(), frameEpoch:0 };
 const pageEpoch = `page-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 let nextID = 0, loadVersion = 0, mutationEpoch = 0;
+let events = null, retryTimer = null, retryCeiling = 250, lastImageStamp = null;
 const uniqueID = () => `${pageEpoch}-${++nextID}`;
 
 function showBanner(element,message) {
@@ -49,9 +50,15 @@ function post(path,body={}) {
 function revision() {
   return {sampling_session_id:state.server.sampling_session_id,expected_revision:state.server.dataset_revision};
 }
-function setBusy(busy) { state.busy=busy;renderControls(); }
+function setBusy(busy) {
+  state.busy=busy;
+  if(!busy && state.pendingState) {
+    const latest=state.pendingState;state.pendingState=null;renderState(latest);
+  } else renderControls();
+}
 function renderState(server) {
   if (state.disposed) return;
+  if(!server.peers && state.server?.peers) server={...server,peers:state.server.peers};
   if (state.server?.sampling_session_id===server.sampling_session_id
       && server.dataset_revision<state.server.dataset_revision) return;
   if (state.server && state.server.sampling_session_id!==server.sampling_session_id) {
@@ -63,6 +70,13 @@ function renderState(server) {
   }
   ui.modeChip.textContent=state.reviewId ? "Sample review" : server.mode==="frozen" ? "Paused" : "Live";
   ui.inputChip.textContent=`${server.source.marker_count} pose markers`;
+  const peers=server.peers || {};
+  document.getElementById("ros-peer").textContent=peers.ros_master?.available ? "ROS master connected" : "ROS master waiting";
+  document.getElementById("media-peer").textContent=peers.media?.source_available ? "Media source connected"
+    : peers.media?.ready ? "Media service connected; source waiting"
+    : peers.media?.reason==="not_configured" ? "Media source disabled" : "Media source waiting";
+  document.getElementById("info-peer").textContent=server.source.camera_info_received ? "CameraInfo received" : "CameraInfo waiting";
+  document.getElementById("world-peer").textContent=server.source.world_pose_available ? "World pose available" : "World pose waiting";
   ui.imageTopic.textContent=server.source.image_topic;ui.posePrefix.textContent=server.source.pose_prefix;
   ui.outputFile.textContent="Core";
   const model=server.result?.camera_model || server.frame?.camera_model || server.source;
@@ -83,7 +97,7 @@ function renderControls() {
   }
   if ([...ui.markerSelect.options].some(option=>option.value===old)) ui.markerSelect.value=old;
   ui.markerSelect.disabled=state.busy || !ui.markerSelect.options.length || !!state.reviewId;
-  ui.freeze.disabled=state.busy || !state.server?.source.image_ready;
+  ui.freeze.disabled=state.busy || !(state.server?.source.capture_ready ?? state.server?.source.image_ready);
   ui.live.disabled=state.busy || (!state.reviewId && !state.replaceId && state.server?.mode==="live");
   ui.remove.disabled=state.busy || !state.points.length;ui.clear.disabled=state.busy || !state.points.length;
   ui.solve.disabled=state.busy || state.points.length<4;
@@ -224,13 +238,34 @@ ui.freeze.addEventListener("click",freezeFrame);ui.live.addEventListener("click"
 ui.remove.addEventListener("click",()=>{const point=state.points.at(-1);if(point) void mutate("remove",{sample_id:point.sample_id});});
 ui.clear.addEventListener("click",()=>mutate("clear"));ui.solve.addEventListener("click",solve);
 window.addEventListener("resize",fitCanvas);
+function connectEvents() {
+  if(state.disposed) return;
+  const connection=new EventSource("api/v1/events");
+  events=connection;
+  connection.addEventListener("state",event=>{
+    retryCeiling=250;
+    const server=JSON.parse(event.data);
+    if(state.busy) {state.pendingState=server;return;}
+    renderState(server);
+    const stamp=server.source.latest_image_stamp_sec;
+    if(server.mode==="live" && server.source.image_ready && !state.reviewId && stamp!==lastImageStamp) {
+      lastImageStamp=stamp;
+      void loadFrame();
+    }
+  });
+  connection.onerror=()=>{
+    if(events!==connection) return;
+    events=null;
+    connection.close();
+    ui.modeChip.textContent="Disconnected";
+    retryTimer=window.setTimeout(connectEvents,Math.random()*retryCeiling);
+    retryCeiling=Math.min(30000,retryCeiling*2);
+  };
+}
 void refreshState();
-const stateTimer=window.setInterval(refreshState,1000);
-const liveTimer=window.setInterval(()=>{
-  if(state.server?.mode==="live" && !state.reviewId && !state.busy) void loadFrame();
-},500);
+connectEvents();
 window.addEventListener("pagehide",()=>{
-  state.disposed=true;state.frameEpoch++;state.controller.abort();clearInterval(stateTimer);clearInterval(liveTimer);
+  state.disposed=true;state.frameEpoch++;state.controller.abort();events?.close();clearTimeout(retryTimer);
   if(state.pending) void fetch("api/v1/samples/cancel",{method:"POST",keepalive:true,
     headers:{"Content-Type":"application/json"},body:JSON.stringify({sampling_session_id:state.pending.session,sample_id:state.pending.id})}).catch(()=>undefined);
 });

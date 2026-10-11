@@ -21,6 +21,7 @@ import copy
 import uuid
 import hashlib
 import math
+import random
 import os
 import re
 import tempfile
@@ -533,8 +534,12 @@ class IntrinsicCalibrationService:
 
     def _run_auto_capture(self) -> None:
         next_capture_at = time.monotonic()
+        retry_ceiling = .25
         try:
             while not self._auto_capture_stop.is_set():
+                peer = getattr(self, "capture_peer", None)
+                if peer is not None and not peer.wait_available(self._auto_capture_stop):
+                    break
                 failed = False
                 try:
                     self._capture_frame()
@@ -543,16 +548,19 @@ class IntrinsicCalibrationService:
                     with self.lock:
                         self._auto_capture_error = str(error) or error.__class__.__name__
                 else:
+                    retry_ceiling = .25
                     with self.lock:
                         self._auto_capture_error = None
                         _bars, complete = self._coverage_state_locked()
                         self._auto_capture_completed = bool(complete)
-                if self._auto_capture_interval <= 0.0:
-                    # The source transaction (fresh camera frame) and detector
-                    # provide natural backpressure. Only failures get a small
-                    # retry backoff so a disconnected source cannot spin.
-                    if failed and self._auto_capture_stop.wait(0.1):
+                if failed:
+                    if self._auto_capture_stop.wait(random.uniform(0, retry_ceiling)):
                         break
+                    retry_ceiling = min(30.0, retry_ceiling * 2)
+                    next_capture_at = time.monotonic()
+                    continue
+                if self._auto_capture_interval <= 0.0:
+                    # Successful fresh-frame transactions provide backpressure.
                     continue
                 next_capture_at += self._auto_capture_interval
                 wait = next_capture_at - time.monotonic()
@@ -2848,8 +2856,7 @@ class IntrinsicCalibrationService:
 
     def wait_ready(self, timeout):
         with self._detection_condition:
-            self._detection_condition.wait_for(lambda: self._display is not None or self._readiness_stopping, timeout)
-            return self._display is not None and not self._readiness_stopping
+            return not self._readiness_stopping
 
     def stop_readiness(self):
         with self._detection_condition:

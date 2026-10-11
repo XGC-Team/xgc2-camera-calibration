@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """ROS1 camera/pose adapter and HTTP entrypoint for extrinsic calibration."""
 
-import re
 import sys
 import threading
 import time
@@ -19,6 +18,7 @@ from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import CameraInfo, CompressedImage
 
 from xgc_camera_calibration.pose_freshness import pose_is_fresh
+from xgc_camera_calibration.ros_lifecycle import NodeParameters, RosMasterBinding
 from xgc_camera_calibration.extrinsic_application import application_arguments, parse_frame_roles
 from xgc_camera_calibration.extrinsic_resolver import decode_frozen
 from xgc_camera_calibration.extrinsic_samples import image_dimensions
@@ -52,24 +52,23 @@ class RosCalibrationSource:
         calibration_mode,
         camera_name,
         snapshot_client=None,
-        snapshot_available=False,
         frozen_extrinsic=None,
+        parameters=None,
     ):
-        self.pose_coordinate_source = str(rospy.get_param("~pose_coordinate_source", "unspecified"))
+        self.parameters = parameters
+        self.pose_coordinate_source = str(parameters.get("~pose_coordinate_source", "unspecified"))
         if self.pose_coordinate_source not in ("unspecified", "raw-vrpn", "experiment-world"):
             raise ValueError("invalid pose coordinate source")
         if frozen_extrinsic is None:
             raise ValueError("calibration source requires its frozen camera context")
         self.pose_world_offset = tuple(frozen_extrinsic["targetCoordinates"]["worldOffset"])
         self.lock = threading.RLock()
-        self.ready_condition = threading.Condition(self.lock)
         self.camera_info = None
-        self.optical_frame = str(rospy.get_param("~child_frame"))
+        self.optical_frame = str(parameters.get("~child_frame"))
         self._readiness_stopping = False
-        self.camera_info_topic = normalize_topic(rospy.get_param("~camera_info_topic", "/usb_cam/camera_info"))
-        self.info_subscriber = rospy.Subscriber(self.camera_info_topic, CameraInfo, self._camera_info_callback, queue_size=1)
+        self.camera_info_topic = normalize_topic(parameters.get("~camera_info_topic", "/usb_cam/camera_info"))
+        self.info_subscriber = None
         self.snapshot_client = snapshot_client
-        self.snapshot_available = bool(snapshot_available)
         self.source_size = None
         selected = Path(str(intrinsic_file).strip()) if str(intrinsic_file).strip() else None
         if selected is not None and (not selected.is_absolute() or not selected.is_file()):
@@ -99,21 +98,21 @@ class RosCalibrationSource:
                 self.intrinsic_distortion,
                 self.intrinsic_size,
             ) = intrinsic_parameters(intrinsic_document)
-        self.image_topic = normalize_topic(rospy.get_param("~image_topic", "/usb_cam/image_raw/compressed"))
+        self.image_topic = normalize_topic(parameters.get("~image_topic", "/usb_cam/image_raw/compressed"))
         self.preview_image_topic = normalize_topic(
-            rospy.get_param(
+            parameters.get(
                 "~preview_image_topic", "/usb_cam/image_raw/compressed"
             )
         )
         self.freeze_image_timeout = float(
-            rospy.get_param("~freeze_image_timeout", 2.0)
+            parameters.get("~freeze_image_timeout", 2.0)
         )
         if self.freeze_image_timeout <= 0.0:
             raise ValueError("~freeze_image_timeout must be positive")
         self.pose_prefix = normalize_topic(
-            rospy.get_param("~pose_prefix", "/vrpn_client_node")
+            parameters.get("~pose_prefix", "/vrpn_client_node")
         ).rstrip("/")
-        tracker_value = rospy.get_param("~trackers", [])
+        tracker_value = parameters.get("~trackers", [])
         if isinstance(tracker_value, list):
             self.tracker_filter = {
                 str(item).strip() for item in tracker_value if str(item).strip()
@@ -126,44 +125,40 @@ class RosCalibrationSource:
         self.preview_stamp_sec = None
         self.marker_latest = {}
         self.marker_receipts = {}
-        self.pose_max_age = float(rospy.get_param("~pose_max_age", 2.0))
+        self.pose_max_age = float(parameters.get("~pose_max_age", 2.0))
         if not math.isfinite(self.pose_max_age) or self.pose_max_age <= 0:
             raise ValueError("pose_max_age must be finite and positive")
         self.marker_subscribers = {}
         self.marker_topics = {}
         self.preview_subscriber = None
-        if self.snapshot_client is None:
-            self.preview_subscriber = rospy.Subscriber(
-                self.preview_image_topic,
-                CompressedImage,
-                self._preview_callback,
-                queue_size=1,
-                buff_size=2**20,
-            )
-        self.discovery_timer = rospy.Timer(rospy.Duration(1.0), self._refresh_markers)
-        self.snapshot_health_timer = None
-        if self.snapshot_client is not None:
-            self.snapshot_health_timer = rospy.Timer(
-                rospy.Duration(1.0), self._refresh_snapshot_health
-            )
-        self._refresh_markers(None)
+        self.image_subscriber = None
+        self._latest_image = None
+        self._preview_received = None
 
-    def _refresh_snapshot_health(self, _event):
-        try:
-            health = self.snapshot_client.health()
-            source = next(item for item in health["sources"] if isinstance(item, dict) and item.get("id") == self.snapshot_client.source_id)
-            size = (source.get("width"), source.get("height"))
-            available = all(type(value) is int and value > 0 for value in size)
-        except MediaSnapshotError as error:
-            available = False
-            rospy.logwarn_throttle(
-                5.0, "Calibration Media Edge source is unavailable: %s", error
-            )
+    def start_ros(self):
+        self.info_subscriber = rospy.Subscriber(self.camera_info_topic, CameraInfo,
+            self._camera_info_callback, queue_size=1)
+        self.preview_subscriber = rospy.Subscriber(self.preview_image_topic, CompressedImage,
+            self._preview_callback, queue_size=1, buff_size=2**20)
+        if self.snapshot_client is None and self.image_topic != self.preview_image_topic:
+            self.image_subscriber = rospy.Subscriber(self.image_topic, CompressedImage,
+                self._image_callback, queue_size=1, buff_size=2**20)
+        # ROS1 has no wildcard subscription or topic-list watch. The run supplies
+        # its tracker names; normal publisher updates handle late/restarted peers.
+        for name in sorted(self.tracker_filter):
+            topic = self.pose_prefix + "/" + name + "/pose"
+            self.marker_subscribers[topic] = rospy.Subscriber(topic, PoseStamped,
+                self._marker_callback(name), queue_size=1)
+
+    def close(self):
+        self.stop_readiness()
+        for subscriber in [self.info_subscriber, self.preview_subscriber, self.image_subscriber] + list(self.marker_subscribers.values()):
+            if subscriber is not None:
+                subscriber.unregister()
+
+    def _image_callback(self, message):
         with self.lock:
-            self.snapshot_available = available
-            if available:
-                self.source_size = size
-            self.ready_condition.notify_all()
+            self._latest_image = (message, time.monotonic())
 
     def _preview_callback(self, message):
         image_format = str(message.format).strip().lower()
@@ -185,42 +180,14 @@ class RosCalibrationSource:
         )
         with self.lock:
             self.preview_jpeg = payload
+            self._preview_received = time.monotonic()
+            if self.image_topic == self.preview_image_topic:
+                self._latest_image = (message, self._preview_received)
             try:
                 self.source_size = image_dimensions(payload, "image/jpeg")
             except ApiError:
                 self.source_size = None
             self.preview_stamp_sec = stamp_sec
-            self.ready_condition.notify_all()
-
-    def _refresh_markers(self, _event):
-        pattern = re.compile(r"^" + re.escape(self.pose_prefix) + r"/([^/]+)/pose$")
-        desired = {}
-        try:
-            topics = rospy.get_published_topics()
-        except rospy.ROSException as error:
-            rospy.logwarn_throttle(5.0, "Could not discover pose markers: %s", error)
-            return
-        for topic, message_type in topics:
-            match = pattern.match(topic)
-            if not match or message_type != "geometry_msgs/PoseStamped":
-                continue
-            name = match.group(1)
-            if self.tracker_filter and name not in self.tracker_filter:
-                continue
-            desired[topic] = name
-        with self.lock:
-            for topic in set(self.marker_subscribers) - set(desired):
-                self.marker_subscribers.pop(topic).unregister()
-                removed_name = self.marker_topics.pop(topic, "")
-                if removed_name and removed_name not in desired.values():
-                    self.marker_latest.pop(removed_name, None)
-            for topic, name in desired.items():
-                if topic in self.marker_subscribers:
-                    continue
-                self.marker_topics[topic] = name
-                self.marker_subscribers[topic] = rospy.Subscriber(
-                    topic, PoseStamped, self._marker_callback(name), queue_size=20
-                )
 
     def _marker_callback(self, name):
         def callback(message):
@@ -246,13 +213,18 @@ class RosCalibrationSource:
 
     def preview_jpeg_bytes(self):
         with self.lock:
-            return self.preview_jpeg
+            return (self.preview_jpeg if self._preview_received is not None
+                    and time.monotonic() - self._preview_received <= self.freeze_image_timeout else None)
 
     def status(self):
         with self.lock:
-            snapshot_ready = self.snapshot_available
-            preview_ready = snapshot_ready or self.preview_jpeg is not None
-            wall_now, ros_now = time.monotonic(), rospy.Time.now().to_sec()
+            media = self.snapshot_client.status() if self.snapshot_client is not None else {"ready": False, "reason": "not_configured"}
+            snapshot_ready = media["ready"]
+            if media.get("width") and media.get("height"):
+                self.source_size = (media["width"], media["height"])
+            preview_ready = self.preview_jpeg_bytes() is not None
+            wall_now = time.monotonic()
+            ros_now = rospy.Time.now().to_sec() if rospy.core.is_initialized() else 0.0
             marker_names = sorted(name for name in self.marker_latest
                 if pose_is_fresh(self.marker_receipts.get(name), wall_now, ros_now, self.pose_max_age))
             return {
@@ -268,9 +240,14 @@ class RosCalibrationSource:
                 ),
                 "pose_prefix": self.pose_prefix,
                 "image_ready": preview_ready,
+                "capture_ready": snapshot_ready or preview_ready,
                 "preview_ready": preview_ready,
                 "intrinsic_ready": not self.use_camera_info or self.camera_info is not None,
                 "camera_info_topic": self.camera_info_topic,
+                "camera_info_received": self.camera_info is not None,
+                "camera_info_connected": bool(self.info_subscriber and self.info_subscriber.get_num_connections()),
+                "world_pose_available": bool(marker_names),
+                "media": media,
                 "marker_count": len(marker_names),
                 "marker_names": marker_names,
                 "latest_image_stamp_sec": self.preview_stamp_sec,
@@ -281,13 +258,11 @@ class RosCalibrationSource:
             try:
                 snapshot = self.snapshot_client.capture()
             except MediaSnapshotError as error:
-                with self.lock:
-                    self.snapshot_available = False
                 raise ApiError(
                     503, "Could not capture a Media Edge camera snapshot: {}".format(error)
                 ) from error
             with self.lock:
-                self.snapshot_available = True
+                self.source_size = (snapshot.width, snapshot.height)
             stamp_sec = float(snapshot.timestamp_nanoseconds) / 1.0e9
             return self._frame_snapshot(
                 snapshot.bgr,
@@ -295,12 +270,11 @@ class RosCalibrationSource:
                 snapshot.frame_id,
                 parent_frame,
             )
-        try:
-            image_message = rospy.wait_for_message(self.image_topic, CompressedImage,
-                                                  timeout=self.freeze_image_timeout)
-        except rospy.ROSException as error:
-            raise ApiError(503, "No compressed camera image arrived within {:.3f}s".format(
-                self.freeze_image_timeout)) from error
+        with self.lock:
+            latest = self._latest_image
+        if latest is None or time.monotonic() - latest[1] > self.freeze_image_timeout:
+            raise ApiError(503, "No recent compressed camera image is available")
+        image_message = latest[0]
         image = cv2.imdecode(np.frombuffer(bytes(image_message.data), dtype=np.uint8), cv2.IMREAD_COLOR)
         if image is None:
             raise ApiError(409, "Could not decode compressed camera image")
@@ -316,23 +290,16 @@ class RosCalibrationSource:
                 or not np.all(np.isfinite(matrix)) or not np.all(np.isfinite(distortion))
                 or matrix[0, 0] <= 0 or matrix[1, 1] <= 0):
             return
-        with self.ready_condition:
+        with self.lock:
             self.camera_info = (matrix, distortion, (message.width, message.height), message.header.frame_id)
-            self.ready_condition.notify_all()
 
     def wait_ready(self, timeout):
-        with self.ready_condition:
-            self.ready_condition.wait_for(lambda: self._readiness_stopping or
-                ((self.snapshot_available or self.preview_jpeg is not None)
-                 and (not self.use_camera_info or self.camera_info is not None)), timeout)
-            return (not self._readiness_stopping
-                    and (self.snapshot_available or self.preview_jpeg is not None)
-                    and (not self.use_camera_info or self.camera_info is not None))
+        with self.lock:
+            return not self._readiness_stopping
 
     def stop_readiness(self):
-        with self.ready_condition:
+        with self.lock:
             self._readiness_stopping = True
-            self.ready_condition.notify_all()
 
     def _frame_snapshot(
         self,
@@ -354,7 +321,7 @@ class RosCalibrationSource:
         # image. Never capture another frame to reinterpret its pixels.
         with self.lock:
             expected_size = self.source_size
-            available = self.snapshot_available if self.snapshot_client is not None else self.preview_jpeg is not None
+            available = self.snapshot_client.status()["ready"] if self.snapshot_client is not None else self.preview_jpeg_bytes() is not None
         if not available or expected_size is None:
             raise ApiError(409, "Calibration source dimensions are unavailable")
         if (width, height) != expected_size:
@@ -428,136 +395,107 @@ def split_list_parameter(value):
 
 def main():
     args = application_arguments(rospy.myargv()[1:])
-    rospy.init_node("xgc_camera_extrinsic_calibrator_web")
+    parameters = NodeParameters("xgc_camera_extrinsic_calibrator_web")
+    binding = RosMasterBinding("xgc_camera_extrinsic_calibrator_web")
     runtime = None
     snapshot_client = None
     source = None
     server = None
     try:
-        target_id = str(rospy.get_param("~target_id"))
-        socket_path = str(rospy.get_param("~socket_path"))
+        target_id = str(parameters.get("~target_id"))
+        socket_path = str(parameters.get("~socket_path"))
         runtime = Runtime(blocking_workers=4, max_calls=16, max_connections=24)
-        media_edge_rpc_socket = str(rospy.get_param("~media_edge_rpc_socket", "")).strip()
+        media_edge_rpc_socket = str(parameters.get("~media_edge_rpc_socket", "")).strip()
         snapshot_client = None
         if media_edge_rpc_socket:
             snapshot_client = MediaSnapshotClient(
                 media_edge_rpc_socket,
-                rospy.get_param("~media_source_id", "usb_cam"),
-                float(rospy.get_param("~snapshot_timeout", 5.0)),
+                parameters.get("~media_source_id", "usb_cam"),
+                float(parameters.get("~snapshot_timeout", 5.0)),
                 runtime=runtime,
                 local_target=target_id,
             )
-            try:
-                snapshot_client.health()
-                snapshot_available = True
-            except MediaSnapshotError as error:
-                snapshot_available = False
-                rospy.logwarn(
-                    "Camera extrinsic WebUI started with its Media Edge source unavailable; "
-                    "the source will be rechecked without failing the Experiment: %s",
-                    error,
-                )
-        else:
-            snapshot_available = False
-        calibration_mode = str(rospy.get_param("~calibration_mode")).strip()
-        camera_name = str(rospy.get_param("~camera_name")).strip()
+        calibration_mode = str(parameters.get("~calibration_mode")).strip()
+        camera_name = str(parameters.get("~camera_name")).strip()
         source = RosCalibrationSource(
-            rospy.get_param("~intrinsic_file", ""),
+            parameters.get("~intrinsic_file", ""),
             calibration_mode,
             camera_name,
             snapshot_client=snapshot_client,
-            snapshot_available=snapshot_available,
+            parameters=parameters,
             frozen_extrinsic=decode_frozen(args.resolved_extrinsic_json, camera_name,
                                           parse_frame_roles(args.frame_roles_json)),
         )
         package_root = Path(rospkg.RosPack().get_path("xgc_camera_calibration"))
-        web_root = Path(rospy.get_param("~web_root", str(package_root / "web" / "extrinsic")))
+        web_root = Path(parameters.get("~web_root", str(package_root / "web" / "extrinsic")))
         service = CalibrationService(
             source,
             calibration_mode=calibration_mode,
             camera_name=camera_name,
-            parent_frame=rospy.get_param("~parent_frame"),
-            child_frame=rospy.get_param("~child_frame"),
-            ransac_threshold_px=float(rospy.get_param("~ransac_threshold_px", 3.0)),
+            parent_frame=parameters.get("~parent_frame"),
+            child_frame=parameters.get("~child_frame"),
+            ransac_threshold_px=float(parameters.get("~ransac_threshold_px", 3.0)),
             maximum_inlier_error_px=float(
-                rospy.get_param("~maximum_inlier_error_px", 10.0)
+                parameters.get("~maximum_inlier_error_px", 10.0)
             ),
-            jpeg_quality=int(rospy.get_param("~jpeg_quality", 80)),
+            jpeg_quality=int(parameters.get("~jpeg_quality", 80)),
             resolved_extrinsic_json=args.resolved_extrinsic_json,
             frame_roles_json=args.frame_roles_json,
         )
         frozen_offset = service.frozen_extrinsic["targetCoordinates"]["worldOffset"]
         if source.pose_coordinate_source == "unspecified" or list(source.pose_world_offset) != frozen_offset:
             raise ValueError("calibration sample coordinates must match the frozen camera context")
-        bind_address = str(rospy.get_param("~bind_address", "127.0.0.1"))
-        http_port = int(rospy.get_param("~http_port", 8765))
+        bind_address = str(parameters.get("~bind_address", "127.0.0.1"))
+        http_port = int(parameters.get("~http_port", 8765))
         if not 1 <= http_port <= 65535:
             raise ValueError("~http_port must be between 1 and 65535")
+        def peer_status():
+            status = source.status()
+            return {"ros_master": binding.status(), "media": status["media"],
+                    "camera_info": {"received": status["camera_info_received"], "connected": status["camera_info_connected"]},
+                    "world": {"pose_available": status["world_pose_available"], "marker_count": status["marker_count"]}}
         server = CalibrationHttpServer(
             (bind_address, http_port),
             service,
             web_root,
             frame_ancestors=str(
-                rospy.get_param(
+                parameters.get(
                     "~frame_ancestors",
                     "'self' http://127.0.0.1:* http://localhost:*",
                 )
             ),
             allowed_origins=split_list_parameter(
-                rospy.get_param("~allowed_origins", [])
+                parameters.get("~allowed_origins", [])
             ),
             logger=lambda message: rospy.logdebug("Web calibrator: %s", message),
             runtime=runtime,
             target_id=target_id,
             rpc_socket=socket_path,
+            lifecycle=binding, peer_status=peer_status,
+            activate_peers=snapshot_client.peer.activate if snapshot_client is not None else None,
         )
         server.start()
+        if not binding.initialize():
+            return 0
+        source.start_ros()
+        binding.mark_ready()
+        rospy.loginfo("Camera extrinsic WebUI listening on http://%s:%d", bind_address, http_port)
+        rospy.spin()
+        return 0
     except Exception as error:
         rospy.logfatal("Could not start camera extrinsic WebUI: %s", error)
-        if source is not None:
-            source.info_subscriber.unregister()
-            source.discovery_timer.shutdown()
-            if source.snapshot_health_timer is not None:
-                source.snapshot_health_timer.shutdown()
+        return 1
+    finally:
+        binding.stop_readiness()
         if server is not None:
             server.close()
+        if source is not None:
+            source.close()
         if snapshot_client is not None:
             snapshot_client.close()
+        binding.close()
         if runtime is not None:
             runtime.close()
-        return 1
-
-    rospy.loginfo(
-        "Camera extrinsic WebUI listening on http://%s:%d "
-        "(capture=%s, preview=%s, poses=%s)",
-        bind_address,
-        http_port,
-        "media:{}".format(snapshot_client.source_id)
-        if snapshot_client is not None
-        else source.image_topic,
-        "WebRTC" if snapshot_client is not None else source.preview_image_topic,
-        source.pose_prefix,
-    )
-    if source.intrinsic_file:
-        rospy.loginfo(
-            "Camera extrinsic calibration uses intrinsics from %s",
-            source.intrinsic_file,
-        )
-    else:
-        rospy.loginfo("Camera extrinsic calibration consumes CameraInfo on %s", source.camera_info_topic)
-    rospy.loginfo("Camera extrinsic results are available to Core at /v1/result for %s", camera_name)
-    try:
-        rospy.spin()
-    finally:
-        source.info_subscriber.unregister()
-        source.discovery_timer.shutdown()
-        if source.snapshot_health_timer is not None:
-            source.snapshot_health_timer.shutdown()
-        server.close()
-        if snapshot_client is not None:
-            snapshot_client.close()
-        runtime.close()
-    return 0
 
 
 if __name__ == "__main__":

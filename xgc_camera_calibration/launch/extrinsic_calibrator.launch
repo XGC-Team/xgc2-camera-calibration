@@ -8,6 +8,7 @@
   <arg name="media_edge_rpc_socket" default="" />
   <arg name="media_source_id" default="usb_cam" />
   <arg name="snapshot_timeout" default="5.0" />
+  <arg name="trackers" default="" />
   <arg name="pose_prefix" default="/vrpn_client_node" />
   <arg name="resolved_extrinsic_json" />
   <arg name="frame_roles_json" />
@@ -39,6 +40,7 @@
     <param name="media_edge_rpc_socket" value="$(arg media_edge_rpc_socket)" />
     <param name="media_source_id" value="$(arg media_source_id)" />
     <param name="snapshot_timeout" value="$(arg snapshot_timeout)" />
+    <param name="trackers" value="$(arg trackers)" />
     <param name="pose_prefix" value="$(arg pose_prefix)" />
     <param name="pose_coordinate_source" value="$(arg pose_coordinate_source)" />
     <param name="calibration_mode" value="$(arg calibration_mode)" />

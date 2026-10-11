@@ -73,6 +73,7 @@ roslaunch --files xgc_camera_calibration extrinsic_calibrator.launch \
   pose_coordinate_source:=experiment-world parent_frame:=world child_frame:=camera_optical \
   calibration_mode:=sim camera_name:=package_smoke >/dev/null
 roslaunch --files xgc_camera_calibration extrinsic_tf.launch \
+  socket_path:="${RUNTIME}/tf.sock" target_id:=package-smoke \
   resolved_extrinsic_json:="${RESOLVED_EXTRINSIC_JSON}" frame_roles_json:="${FRAME_ROLES_JSON}" \
   calibration_mode:=sim camera_name:=package_smoke parent_frame:=world camera_link_frame:=camera_link optical_frame:=camera_optical >/dev/null
 roscore -p "${MASTER_PORT}" >"${RUNTIME}/roscore.log" 2>&1 &
@@ -93,7 +94,7 @@ path = sys.argv[1]
 ref = {"target_id": "package-smoke", "service": "media-edge", "api_version": "v1",
        "instance_id": "package-smoke", "profile": "http.v1", "endpoint": {"kind": "unix", "address": path}}
 runtime = Runtime()
-host = Host(path, {("GET", "/v1/describe"): lambda c, r: {"service_ref": ref},
+host = Host(path, {("GET", "/v1/describe"): lambda c, r: {"ready": True, "service_ref": ref},
     ("GET", "/v1/health"): lambda c, r: {"sources": [{"id": "package_smoke"}]}},
     runtime=runtime, instance_id="package-smoke", discovery_routes=("/v1/describe",)).start()
 stop = threading.Event()
@@ -114,7 +115,7 @@ done
 [[ -S "${MEDIA_EDGE_RPC_SOCKET}" ]]
 "${PREFIX}/lib/xgc_camera_calibration/extrinsic_tf_publisher.py" \
   --resolved-extrinsic-json "${RESOLVED_EXTRINSIC_JSON}" --frame-roles-json "${FRAME_ROLES_JSON}" \
-  __name:=xgc_camera_extrinsic_tf _calibration_mode:=sim _camera_name:=package_smoke \
+  __name:=xgc_camera_extrinsic_tf _target_id:=package-smoke _socket_path:="${RUNTIME}/tf.sock" _calibration_mode:=sim _camera_name:=package_smoke \
   _parent_frame:=world _camera_link_frame:=camera_link _optical_frame:=camera_optical >"${RUNTIME}/extrinsic-tf.log" 2>&1 &
 TF_PID="$!"
 "${PREFIX}/lib/xgc_camera_calibration/extrinsic_calibrator_web.py" \
@@ -150,8 +151,8 @@ for kind, port in zip(("extrinsic", "intrinsic"), sys.argv[2:]):
     with Client.from_service(ref, runtime=runtime, local_target='package-smoke', discovery=True) as client:
         started = time.monotonic()
         description = client.json('/v1/describe?wait_ready_ms=100', method='GET', timeout=1)
-        assert time.monotonic() - started >= .09
-        assert not description['ready']
+        assert description['ready']
+        assert not description['facts']['peers']['camera_info']['received']
         assert description['facts']['result_path'] == '/v1/result'
     with Client.from_service(ServiceRef.from_dict(description['service_ref']), runtime=runtime, local_target='package-smoke') as client:
         result = client.json('/v1/result', method='GET')

@@ -10,7 +10,7 @@ import numpy as np
 
 root = Path(__file__).resolve().parents[1]
 source = (root / "src/extrinsic-legacy.ts").read_text()
-ids = ["camera-placeholder", "mode-chip", "input-chip", "error-banner", "success-banner",
+ids = ["ros-peer", "media-peer", "info-peer", "world-peer", "camera-placeholder", "mode-chip", "input-chip", "error-banner", "success-banner",
        "frame-meta", "coordinate-hint", "result-box", "image-topic", "intrinsic-file", "pose-prefix", "output-file"]
 html = '<div style="width:640px;height:480px"><canvas id="camera-canvas" width="640" height="480"></canvas></div>'
 html += ''.join('<div id="%s"></div>' % item for item in ids)

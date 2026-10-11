@@ -26,6 +26,7 @@ from xgc_camera_calibration.board_profiles import (
 )
 from xgc_camera_calibration.media_snapshot import MediaSnapshotClient
 from xgc_camera_calibration.web_service import CalibrationHttpServer
+from xgc_camera_calibration.ros_lifecycle import NodeParameters, RosMasterBinding
 
 
 def split_list_parameter(value):
@@ -34,79 +35,58 @@ def split_list_parameter(value):
     return [item.strip() for item in str(value).split(",") if item.strip()]
 
 
-def maybe_camera_control(board_center, *, runtime, local_target):
+def maybe_camera_control(board_center, board_profile, parameters, *, runtime, local_target):
     """Attach the optional Gazebo camera adapter, or run camera-agnostic.
 
-    The explicit simulation endpoint supplies one bounded entity query. An
-    unavailable optional camera leaves the sample guide camera-agnostic.
+    The explicit simulation endpoint connects lazily when the guide is viewed.
+    The configured adapter survives an absent or restarted world.
     """
-    if not bool(rospy.get_param("~camera_control", False)):
+    if not bool(parameters.get("~camera_control", False)):
         return None
-    model_name = str(rospy.get_param("~camera_model_name", "gazebo_static_camera"))
-    timeout = float(rospy.get_param("~camera_control_timeout", 8.0))
+    model_name = str(parameters.get("~camera_model_name", "gazebo_static_camera"))
+    timeout = float(parameters.get("~camera_control_timeout", 8.0))
     if not math.isfinite(timeout) or timeout <= 0.0:
         raise ValueError("~camera_control_timeout must be finite and positive")
-    endpoint = str(rospy.get_param("~simulation_endpoint"))
-    try:
-        from xgc_camera_calibration.camera_control import GazeboCameraControl
-
-        control = GazeboCameraControl(
-            model_name, board_center, connection_timeout=timeout,
-            endpoint=endpoint, runtime=runtime, local_target=local_target,
-        )
-    except Exception as error:
-        rospy.logwarn("Sim camera control unavailable (%s); running camera-agnostic", error)
-        return None
-    rospy.loginfo("Sim camera control attached for model '%s'", model_name)
-    return control
+    endpoint = str(parameters.get("~simulation_endpoint"))
+    from xgc_camera_calibration.camera_control import GazeboCameraControl
+    return GazeboCameraControl(model_name, board_center, connection_timeout=timeout,
+        endpoint=endpoint, runtime=runtime, local_target=local_target, board_profile=board_profile)
 
 
 def main():
-    rospy.init_node("xgc_camera_intrinsic_calibrator_web")
+    parameters = NodeParameters("xgc_camera_intrinsic_calibrator_web")
+    binding = RosMasterBinding("xgc_camera_intrinsic_calibrator_web")
     runtime = None
     snapshot_client = None
-    metadata_client = None
     camera = None
     service = None
     server = None
     work_directory = None
     try:
-        target_id = str(rospy.get_param("~target_id"))
-        socket_path = str(rospy.get_param("~socket_path"))
+        target_id = str(parameters.get("~target_id"))
+        socket_path = str(parameters.get("~socket_path"))
         runtime = Runtime(blocking_workers=4, max_calls=16, max_connections=24)
         snapshot_client = MediaSnapshotClient(
-            rospy.get_param("~media_edge_rpc_socket"),
-            rospy.get_param("~media_source_id", "usb_cam"),
-            float(rospy.get_param("~snapshot_timeout", 5.0)),
+            parameters.get("~media_edge_rpc_socket"),
+            parameters.get("~media_source_id", "usb_cam"),
+            float(parameters.get("~snapshot_timeout", 5.0)),
             runtime=runtime,
             local_target=target_id,
         )
-        snapshot_client.health()
         package_root = Path(rospkg.RosPack().get_path("xgc_camera_calibration"))
-        web_root = Path(rospy.get_param("~web_root", str(package_root / "web" / "intrinsic")))
-        calibration_mode = str(rospy.get_param("~calibration_mode")).strip()
-        camera_name = str(rospy.get_param("~camera_name")).strip()
+        web_root = Path(parameters.get("~web_root", str(package_root / "web" / "intrinsic")))
+        calibration_mode = str(parameters.get("~calibration_mode")).strip()
+        camera_name = str(parameters.get("~camera_name")).strip()
         work_directory = tempfile.TemporaryDirectory(prefix="intrinsic-", dir=str(Path(socket_path).parent))
         board_center = (
-            float(rospy.get_param("~board_x", 2.0)),
-            float(rospy.get_param("~board_y", 0.0)),
-            float(rospy.get_param("~board_z", 2.2)),
+            float(parameters.get("~board_x", 2.0)),
+            float(parameters.get("~board_y", 0.0)),
+            float(parameters.get("~board_z", 2.2)),
         )
         board_profile = resolve_aprilgrid_profile(
-            rospy.get_param("~board_profile", FIELD_6X6_88MM_30PCT)
+            parameters.get("~board_profile", FIELD_6X6_88MM_30PCT)
         )
-        if bool(rospy.get_param("~camera_control", False)):
-            from xgc_camera_calibration.camera_control import select_gazebo_board_profile
-
-            select_gazebo_board_profile(
-                board_profile,
-                board_center,
-                float(rospy.get_param("~camera_control_timeout", 8.0)),
-                endpoint=str(rospy.get_param("~simulation_endpoint")),
-                runtime=runtime,
-                local_target=target_id,
-            )
-        display_width = int(rospy.get_param("~display_width", 720))
+        display_width = int(parameters.get("~display_width", 720))
         service = IntrinsicCalibrationService(
             board_size=(board_profile.columns, board_profile.rows),
             square=board_profile.tag_size_m,
@@ -115,8 +95,8 @@ def main():
             calibration_mode=calibration_mode,
             board_profile_id=board_profile.profile_id,
             media_source=snapshot_client.source_id,
-            jpeg_quality=int(rospy.get_param("~jpeg_quality", 80)),
-            maximum_detect_width=int(rospy.get_param("~maximum_detect_width", display_width)),
+            jpeg_quality=int(parameters.get("~jpeg_quality", 80)),
+            maximum_detect_width=int(parameters.get("~maximum_detect_width", display_width)),
             display_width=display_width,
             board_center=board_center,
             board_type="aprilgrid",
@@ -125,34 +105,34 @@ def main():
             tag_start_id=board_profile.start_id,
             min_tags=board_profile.min_tags,
         )
-        try:
-            metadata_client = snapshot_client.camera_metadata_client()
-            service.attach_metadata_application(metadata_client)
-        except Exception as error:
-            rospy.logwarn("Source CameraInfo metadata application unavailable: %s", error)
-        camera = maybe_camera_control(board_center, runtime=runtime, local_target=target_id)
+        service.attach_metadata_application(snapshot_client)
+        service.capture_peer = snapshot_client.peer
+        camera = maybe_camera_control(board_center, board_profile, parameters,
+                                      runtime=runtime, local_target=target_id)
         if camera is not None:
             service.attach_camera_control(camera)
         if service.board_type == "aprilgrid":
             detection_target_pixels = int(
-                rospy.get_param("~detection_target_pixels", 640 * 480)
+                parameters.get("~detection_target_pixels", 640 * 480)
             )
             service.attach_frame_capture(
                 lambda: snapshot_client.capture_detection(detection_target_pixels)
             )
         else:
             service.attach_frame_capture(snapshot_client.capture)
-        automatic_detection = bool(rospy.get_param("~auto_capture", True))
-        if automatic_detection:
-            # Five fresh snapshots per second are sufficient for human motion
-            # and the simulation sweep. An unbounded loop can occupy an entire
-            # CPU core decoding/detecting 4K JPEGs and compete with the 4K30
-            # H264 adapter without improving geometric sample diversity.
-            service.start_auto_capture(
-                float(rospy.get_param("~auto_capture_interval", 0.2))
-            )
-        bind_address = str(rospy.get_param("~bind_address", "127.0.0.1"))
-        http_port = int(rospy.get_param("~http_port", 8766))
+        service.live_capture_interval = (float(parameters.get("~auto_capture_interval", 0.2))
+            if bool(parameters.get("~auto_capture", True)) else None)
+        def peer_status():
+            media = snapshot_client.status()
+            return {"ros_master": binding.status(), "media": media,
+                    "camera_info": {"received": media["camera_info_received"]},
+                    "world": camera.status() if camera is not None else {"reason": "not_configured", "pose_available": False}}
+        def activate_peers():
+            snapshot_client.peer.activate()
+            if camera is not None:
+                camera.world.peer.activate()
+        bind_address = str(parameters.get("~bind_address", "127.0.0.1"))
+        http_port = int(parameters.get("~http_port", 8766))
         if not 1 <= http_port <= 65535:
             raise ValueError("~http_port must be between 1 and 65535")
         server = CalibrationHttpServer(
@@ -160,20 +140,31 @@ def main():
             None,
             web_root,
             frame_ancestors=str(
-                rospy.get_param(
+                parameters.get(
                     "~frame_ancestors", "'self' http://127.0.0.1:* http://localhost:*"
                 )
             ),
-            allowed_origins=split_list_parameter(rospy.get_param("~allowed_origins", [])),
+            allowed_origins=split_list_parameter(parameters.get("~allowed_origins", [])),
             logger=lambda message: rospy.logdebug("Intrinsic web: %s", message),
             intrinsic_service=service,
             runtime=runtime,
             target_id=target_id,
             rpc_socket=socket_path,
+            lifecycle=binding, peer_status=peer_status, activate_peers=activate_peers,
         )
         server.start()
+        if not binding.initialize():
+            return 0
+        binding.mark_ready()
+        rospy.loginfo("Intrinsic calibration WebUI on http://%s:%d (media=%s)",
+                      bind_address, http_port, snapshot_client.source_id)
+        rospy.spin()
+        return 0
     except Exception as error:
         rospy.logfatal("Could not start intrinsic calibration WebUI: %s", error)
+        return 1
+    finally:
+        binding.stop_readiness()
         if service is not None:
             service.stop_auto_capture()
         if server is not None:
@@ -182,34 +173,11 @@ def main():
             camera.close()
         if snapshot_client is not None:
             snapshot_client.close()
-        if metadata_client is not None:
-            metadata_client.close()
+        binding.close()
         if runtime is not None:
             runtime.close()
         if work_directory is not None:
             work_directory.cleanup()
-        return 1
-
-    rospy.loginfo(
-        "Intrinsic calibration WebUI on http://%s:%d (media=%s, camera_control=%s)",
-        bind_address,
-        http_port,
-        snapshot_client.source_id,
-        camera is not None,
-    )
-    try:
-        rospy.spin()
-    finally:
-        service.stop_auto_capture()
-        server.close()
-        if camera is not None:
-            camera.close()
-        snapshot_client.close()
-        if metadata_client is not None:
-            metadata_client.close()
-        runtime.close()
-        work_directory.cleanup()
-    return 0
 
 
 if __name__ == "__main__":

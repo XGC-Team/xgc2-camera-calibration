@@ -59,6 +59,10 @@ class ProcessContractTest(unittest.TestCase):
                     self.assertIn('_media_edge_rpc_socket:=${mediaEdgeRPCSocket}', args)
                 else:
                     self.assertNotIn('filePollRate', properties)
+                    self.assertEqual(definition['services'], [{'service': 'xgc2.calibration.v1.ExtrinsicTf',
+                        'api_version': '1', 'profile': 'http.v1', 'endpointParameter': 'socketPath'}])
+                    self.assertTrue({'socketPath', 'targetId'} <= set(required))
+                    self.assertEqual(definition['readiness']['kind'], 'describe')
 
     def test_ros_inputs_and_frames_match_camera_fragment(self):
         path = ROOT / 'process-definitions/xgc2-camera-extrinsic-calibrator-ros1.json'
@@ -70,7 +74,9 @@ class ProcessContractTest(unittest.TestCase):
         self.assertIn('_camera_info_topic:=${cameraInfoTopic}', definition['command']['args'])
         source = (PACKAGE / 'scripts/extrinsic_calibrator_web.py').read_text()
         self.assertIn('CameraInfo, CompressedImage', source)
-        self.assertIn('rospy.wait_for_message(self.image_topic, CompressedImage', source)
+        self.assertNotIn('rospy.wait_for_message', source)
+        self.assertNotIn('get_published_topics', source)
+        self.assertIn('self._latest_image', source)
         self.assertIn('message.header.frame_id != self.optical_frame', source)
         self.assertIn('if frame_id != self.optical_frame:', source)
         for kind in ('intrinsic', 'extrinsic'):

@@ -233,13 +233,18 @@ class NativeWebTransportTest(unittest.TestCase):
         from dataclasses import asdict
         edge_path = str(self.root / "edge.sock")
         edge_reference = ServiceRef("test-target", "media-edge", "v1", "edge-1", "http.v1", Endpoint("unix", edge_path))
-        edge = Host(edge_path, {("GET", "/v1/describe"): lambda c, v: {"service_ref": asdict(edge_reference)},
+        edge = Host(edge_path, {("GET", "/v1/describe"): lambda c, v: {"ready": True, "service_ref": asdict(edge_reference)},
             ("GET", "/v1/media/sources/camera/ref"): lambda c, v: {"source_id": "camera", "service_ref": asdict(reference)}},
             runtime=runtime, instance_id="edge-1", discovery_routes=("/v1/describe",)).start()
         application = server = snapshots = None
         try:
             snapshots = MediaSnapshotClient(edge_path, "camera", runtime=runtime, local_target="test-target")
-            application = snapshots.camera_metadata_client()
+            snapshots.peer.activate()
+            deadline = time.monotonic() + 3
+            while not snapshots.status()["ready"] and time.monotonic() < deadline:
+                time.sleep(.01)
+            self.assertTrue(snapshots.status()["ready"])
+            application = snapshots
             service = IntrinsicCalibrationService(output_file=str(self.root / "intrinsics.yaml"),
                 camera_name="camera", board_size=(7, 5), square=.2, media_source="camera")
             service.attach_metadata_application(application)

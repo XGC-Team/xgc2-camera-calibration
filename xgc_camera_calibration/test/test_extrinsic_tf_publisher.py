@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import MagicMock, patch
 
+from xgc_camera_calibration import ros_lifecycle
 from xgc_camera_calibration import transforms
 assert transforms is not None  # Load native extensions before ROS stubs.
 

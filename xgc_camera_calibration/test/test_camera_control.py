@@ -2,6 +2,7 @@
 import copy
 import sys
 import tempfile
+import time
 import types
 import unittest
 from pathlib import Path
@@ -13,9 +14,13 @@ from xgc_camera_calibration import camera_control
 
 
 class NativeWorld:
+    def __init__(self, path=None, instance="world-1"):
+        self.provided_path = path
+        self.instance = instance
+
     def __enter__(self):
         self.directory = tempfile.TemporaryDirectory()
-        self.path = str(Path(self.directory.name) / "world.sock")
+        self.path = self.provided_path or str(Path(self.directory.name) / "world.sock")
         self.runtime = Runtime()
         self.calls = []
         self.completed = 0
@@ -25,7 +30,7 @@ class NativeWorld:
         self.operation_state = "succeeded"
         self.pending = None
         ref = {"target_id": "test-target", "service": "xgc2.simulation", "api_version": "v1",
-               "instance_id": "world-1", "profile": "http.v1",
+               "instance_id": self.instance, "profile": "http.v1",
                "endpoint": {"kind": "unix", "address": self.path}}
         def entity(identity):
             if identity not in self.models:
@@ -49,7 +54,7 @@ class NativeWorld:
                 elif kind == "create": self.models[identity] = {"id": identity, "generation": 1}
                 self.completed += 1
             return {"id": "op-1", "state": self.operation_state, "error": None}
-        routes = {("GET", "/v1/describe"): lambda c, r: {"service_ref": ref},
+        routes = {("GET", "/v1/describe"): lambda c, r: {"ready": True, "service_ref": ref},
                   ("GET", "/v1/entities"): lambda c, r: {"entities": [entity(i) for i in self.models]},
                   ("GET", "/v1/entities/camera"): query,
                   ("POST", "/v1/entities/camera/state"): lambda c, r: mutation("pose", "camera", r),
@@ -57,13 +62,21 @@ class NativeWorld:
         for identity in ("intrinsic_aprilgrid",) + tuple(p.gazebo_instance_name for p in PROFILES.values()):
             routes[("DELETE", "/v1/entities/" + identity)] = lambda c, r, identity=identity: mutation("delete", identity, r)
         routes[("POST", "/v1/entities")] = lambda c, r: mutation("create", r["entity"]["id"], r)
-        self.host = Host(self.path, routes, runtime=self.runtime, instance_id="world-1",
+        self.host = Host(self.path, routes, runtime=self.runtime, instance_id=self.instance,
                          discovery_routes=("/v1/describe",)).start()
         return self
 
     def control(self):
-        return camera_control.GazeboCameraControl("camera", (2., 0., 2.),
+        control = camera_control.GazeboCameraControl("camera", (2., 0., 2.),
             endpoint=self.path, local_target="test-target")
+        control.world.peer.activate()
+        deadline = time.monotonic() + 3
+        while not control.available() and time.monotonic() < deadline:
+            time.sleep(.01)
+        if not control.available():
+            control.close()
+            raise AssertionError("fake world discovery did not complete")
+        return control
 
     def __exit__(self, *args):
         self.host.close()
@@ -124,12 +137,20 @@ class NativeCameraControlTest(unittest.TestCase):
             rospkg = types.ModuleType("rospkg")
             rospkg.RosPack = lambda: types.SimpleNamespace(get_path=lambda _: str(root))
             with mock.patch.dict(sys.modules, {"rospkg": rospkg}):
-                for _ in range(2):
-                    camera_control.select_gazebo_board_profile(profile, (2., 0., 2.2),
-                        endpoint=world.path, local_target="test-target")
+                control = camera_control.GazeboCameraControl("camera", (2., 0., 2.2),
+                    endpoint=world.path, local_target="test-target", board_profile=profile)
+                try:
+                    control.world.peer.activate()
+                    deadline = time.monotonic() + 3
+                    while not control.available() and time.monotonic() < deadline:
+                        time.sleep(.01)
+                    self.assertTrue(control.available())
+                    control.world.peer.activate()
+                finally:
+                    control.close()
             self.assertNotIn("intrinsic_aprilgrid", world.models)
             self.assertIn(profile.gazebo_instance_name, world.models)
-            self.assertEqual([c[0] for c in world.calls], ["delete", "wait", "create", "wait"])
+            self.assertEqual([c[0] for c in world.calls], ["delete", "wait", "create", "wait", "query"])
             self.assertEqual(world.calls[0][1]["generation"], 3)
             entity = world.calls[2][1]["entity"]
             self.assertEqual(entity["pose"]["position"], [2., 0., 2.2])
@@ -138,7 +159,7 @@ class NativeCameraControlTest(unittest.TestCase):
     def test_endpoint_is_required_and_http_is_rejected(self):
         with self.assertRaises(TypeError): camera_control.GazeboCameraControl("camera", (0., 0., 0.))
         with self.assertRaises(ValueError):
-            camera_control.GazeboCameraControl("camera", (0., 0., 0.), endpoint="http://localhost:8080")
+            camera_control.GazeboCameraControl("camera", (0., 0., 0.), endpoint="http://localhost:8080", local_target="test-target")
 
 
 if __name__ == "__main__": unittest.main()

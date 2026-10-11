@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional, Sequence, Tuple
 from urllib.parse import quote
 from xgc2_xrpc import Client, Endpoint, Fault, Limits, Runtime, ServiceRef, TransportError
+from xgc_camera_calibration.peer_connection import PeerUnavailable, UnixPeer
 
 import cv2
 import numpy as np
@@ -152,9 +153,8 @@ class MediaSnapshotClient:
             raise ValueError("snapshot timeout must be positive")
         if not isinstance(local_target, str) or not local_target:
             raise ValueError("an explicit local target binding is required")
-        discovery = ServiceRef(local_target, "media-edge", "v1", "", "http.v1",
-                               Endpoint("unix", str(rpc_socket)))
-        discovery.validate(discovery=True)
+        ServiceRef(local_target, "media-edge", "v1", "", "http.v1",
+                   Endpoint("unix", str(rpc_socket))).validate(discovery=True)
         self.source_id = str(source_id).strip()
         self.timeout_seconds = float(timeout_seconds)
         self.runtime = runtime or Runtime(blocking_workers=4)
@@ -162,31 +162,39 @@ class MediaSnapshotClient:
         self._closed = False
         self.last_cleanup_error = None
         self.local_target = local_target
-        self.limits = Limits(connections=2, in_flight=4,
+        self.limits = Limits(connections=2, in_flight=4, call_timeout=35.0,
             response_bytes=_MAX_JPEG_BYTES + _MAX_RGB_BYTES + (128 << 10))
+        self.peer = UnixPeer(rpc_socket, "media-edge", "v1", runtime=self.runtime,
+                            local_target=local_target, limits=self.limits)
+        self._metadata_client = None
+        self._metadata_instance = None
+        self._source_metadata = {}
+        self._source_instance = None
+        self._source_available = False
+        self._capture_error = None
+
+    @property
+    def client(self):
         try:
-            with Client.from_service(discovery, runtime=self.runtime,
-                                     local_target=self.local_target, discovery=True,
-                                     limits=self.limits) as client:
-                document = client.json("/v1/describe", method="GET", timeout=self.timeout_seconds)
-            if not isinstance(document, dict) or not isinstance(document.get("service_ref"), dict):
-                raise ValueError("media edge discovery omitted service_ref")
-            service = ServiceRef.from_dict(document["service_ref"])
-            service.validate()
-            if (service.service != "media-edge" or service.api_version != "v1"
-                    or service.target_id != self.local_target or service.endpoint != discovery.endpoint):
-                raise ValueError("media edge discovery identity does not match the granted endpoint")
-            self.client = Client.from_service(service, runtime=self.runtime,
-                                             local_target=self.local_target, limits=self.limits)
-        except BaseException:
-            if self._owns_runtime:
-                self.runtime.close()
-            raise
+            return self.peer.require_client()
+        except PeerUnavailable as error:
+            raise MediaSnapshotError(str(error)) from error
+
+    def status(self):
+        value = self.peer.status()
+        source = self._source_metadata if self._source_instance == value["instance_id"] and value["ready"] else {}
+        return {**value, "source_id": self.source_id,
+                "source_available": bool(value["ready"] and self._source_available and source),
+                "capture_error": self._capture_error,
+                "camera_info_received": bool(source.get("camera_info_received")),
+                "width": source.get("width"), "height": source.get("height")}
 
     def close(self):
         if self._closed:
             return
-        self.client.close()
+        if self._metadata_client is not None:
+            self._metadata_client.close()
+        self.peer.close()
         if self._owns_runtime:
             self.runtime.close()
         self._closed = True
@@ -195,6 +203,7 @@ class MediaSnapshotClient:
         try:
             payload = self.client.json("/v1/health", method="GET", timeout=self.timeout_seconds)
         except (Fault, TransportError, OSError, TimeoutError) as error:
+            self.peer.invalidate(error)
             raise MediaSnapshotError("media edge health is unavailable") from error
         sources = payload.get("sources") if isinstance(payload, dict) else None
         if not isinstance(sources, list) or not any(
@@ -206,7 +215,7 @@ class MediaSnapshotClient:
     def capture(self):
         return self._capture(include_rgb=True, maximum_pixels=None)
 
-    def camera_metadata_client(self):
+    def _camera_metadata_client(self):
         """Use the source owner's observed ref, never construct its endpoint."""
         value = self.client.json("/v1/media/sources/{}/ref".format(quote(self.source_id, safe="")),
             method="GET", timeout=self.timeout_seconds)
@@ -215,6 +224,27 @@ class MediaSnapshotClient:
         reference = ServiceRef.from_dict(value.get("service_ref"))
         return CameraMetadataClient(reference, self.source_id, runtime=self.runtime,
             local_target=self.local_target, timeout_seconds=self.timeout_seconds)
+
+    def state(self):
+        """The granted application is lazy; the source validates it on apply."""
+        return {"available": self.peer.status()["ready"], "scope": "calibration-metadata",
+                "source_id": self.source_id}
+
+    def apply(self, calibration):
+        # Explicit user mutation only. A failed apply is never retried/replayed.
+        instance = self.peer.status()["instance_id"]
+        if self._metadata_client is None or instance != self._metadata_instance:
+            if self._metadata_client is not None:
+                self._metadata_client.close()
+                self._metadata_client = None
+            self._metadata_client = self._camera_metadata_client()
+            self._metadata_instance = instance
+        try:
+            return self._metadata_client.apply(calibration)
+        except (TransportError, OSError, TimeoutError):
+            self._metadata_client.close()
+            self._metadata_client = None
+            raise
 
     def capture_detection(self, maximum_pixels=640 * 480):
         if not isinstance(maximum_pixels, int) or isinstance(maximum_pixels, bool) or maximum_pixels < 4096:
@@ -269,8 +299,9 @@ class MediaSnapshotClient:
 
     def _capture(self, include_rgb, maximum_pixels):
         cleanup_id = None
+        client = self.client
         try:
-            response = self.client.call("/v1/media/sources/{}/capture".format(quote(self.source_id, safe="")),
+            response = client.call("/v1/media/sources/{}/capture".format(quote(self.source_id, safe="")),
                 {"includeRgb": include_rgb, "requireFresh": True, "requestKeyframe": False},
                 method="POST", request_id=uuid.uuid4().hex, timeout=self.timeout_seconds)
             metadata, jpeg, raw = self._parts(response, include_rgb)
@@ -287,6 +318,13 @@ class MediaSnapshotClient:
             else:
                 bgr = self._decode_detection_jpeg(jpeg, parsed["width"], parsed["height"],
                     maximum_pixels or parsed["width"] * parsed["height"])
+            peer = self.peer.status()
+            if not peer["ready"] or peer["instance_id"] != client.instance_id:
+                raise MediaSnapshotError("media peer changed during capture")
+            self._source_metadata = {"width": parsed["width"], "height": parsed["height"],
+                                     "camera_info_received": parsed["camera_matrix"] is not None}
+            self._source_instance = client.instance_id
+            self._source_available, self._capture_error = True, None
             return MediaSnapshot(id=parsed["id"], source_id=parsed["source_id"], frame_id=parsed["frame_id"],
                 timestamp_nanoseconds=parsed["timestamp_nanoseconds"], width=parsed["width"],
                 height=parsed["height"], camera_matrix=None if parsed["camera_matrix"] is None else
@@ -298,11 +336,17 @@ class MediaSnapshotClient:
         except (Fault, TransportError, OSError, TimeoutError) as error:
             # No mutation replay. In particular outcome_unknown remains a
             # transport cause, not a claim that capture never happened.
+            if not isinstance(error, Fault):
+                self.peer.invalidate(error)
+            self._source_available, self._capture_error = False, str(error)
             raise MediaSnapshotError("media edge capture is unavailable") from error
+        except MediaSnapshotError as error:
+            self._source_available, self._capture_error = False, str(error)
+            raise
         finally:
             if cleanup_id is not None:
                 try:
-                    self.client.call("/v1/media/snapshots/" + cleanup_id, method="DELETE",
+                    client.call("/v1/media/snapshots/" + cleanup_id, method="DELETE",
                                      timeout=min(2.0, self.timeout_seconds))
                     self.last_cleanup_error = None
                 except (Fault, TransportError, OSError, TimeoutError) as error:

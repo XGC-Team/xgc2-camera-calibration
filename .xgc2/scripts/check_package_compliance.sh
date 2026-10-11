@@ -114,8 +114,11 @@ if grep -R -E 'intrinsic-validation\.v1|generate_intrinsic_validation|validate_i
 fi
 grep -q 'CompressedImage' xgc_camera_calibration/scripts/extrinsic_calibrator_web.py
 grep -q 'CameraInfo' xgc_camera_calibration/scripts/extrinsic_calibrator_web.py
-grep -q 'wait_for_message' xgc_camera_calibration/scripts/extrinsic_calibrator_web.py
-if grep -q 'Subscriber(.*self.image_topic' \
+if grep -q 'wait_for_message\|get_published_topics' xgc_camera_calibration/scripts/extrinsic_calibrator_web.py; then
+  echo "extrinsic inputs must use ROS subscriber updates" >&2
+  exit 1
+fi
+if grep -q 'Subscriber(.* Image,' \
   xgc_camera_calibration/scripts/extrinsic_calibrator_web.py; then
   echo "extrinsic calibrator must not retain a steady-state raw image subscription" >&2
   exit 1

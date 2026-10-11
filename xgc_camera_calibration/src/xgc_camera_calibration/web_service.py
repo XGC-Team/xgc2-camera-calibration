@@ -14,6 +14,7 @@ from dataclasses import asdict, dataclass, field, replace
 from http import HTTPStatus
 from aiohttp import web
 from xgc2_xrpc import AppRouter, Endpoint, Fault, Host, Limits, RawStreamResponse, Response, Runtime, ServiceRef, iter_body
+from xgc_camera_calibration.peer_connection import PeerUnavailable
 from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
 from urllib.parse import parse_qs
@@ -434,7 +435,7 @@ class CalibrationHttpServer:
     def __init__(self, address, service, web_root, *, frame_ancestors,
                  allowed_origins=(), logger=None, intrinsic_service=None,
                  runtime=None, limits=None, upload_timeout=30.0, rpc_socket=None, target_id=None,
-                 validation_workers=2):
+                 validation_workers=2, lifecycle=None, peer_status=None, activate_peers=None):
         if service is None and intrinsic_service is None:
             raise ValueError("at least one of service / intrinsic_service is required")
         root = Path(web_root).resolve()
@@ -444,6 +445,9 @@ class CalibrationHttpServer:
         if "\r" in frame_ancestors or "\n" in frame_ancestors:
             raise ValueError("frame_ancestors must not contain newlines")
         self.service, self.intrinsic_service = service, intrinsic_service
+        self.lifecycle = lifecycle
+        self.peer_status = peer_status or (lambda: {})
+        self.activate_peers = activate_peers or (lambda: None)
         self.web_root = root
         self.frame_ancestors = frame_ancestors.strip() or "'self'"
         self.allowed_origins = frozenset(allowed_origins)
@@ -537,14 +541,16 @@ class CalibrationHttpServer:
                         or int(wait[0]) > 30000):
                     raise Fault("invalid_argument", "wait_ready_ms must be in [0, 30000]", 400)
                 wait_ms = int(wait[0])
-            ready = await self.runtime.blocking(self.private_host, domain.wait_ready, wait_ms / 1000.0)
+            ready = await self.runtime.blocking(self.private_host,
+                (self.lifecycle or domain).wait_ready, wait_ms / 1000.0)
             capabilities = {"intrinsic": self.intrinsic_service is not None, "extrinsic": self.service is not None}
             return {"service": self.service_ref.service, "api_version": self.service_ref.api_version,
                 "instance_id": self.service_ref.instance_id, "ready": ready,
                 "facts": {"capabilities": capabilities, "camera_id": domain.camera_name,
                           "calibration_mode": domain.calibration_mode, "result_path": "/v1/result",
                           "result_kind": kind, "commit_owner": "core",
-                          "ros_master_uri": os.environ.get("ROS_MASTER_URI", "")},
+                          "ros_master_uri": os.environ.get("ROS_MASTER_URI", ""),
+                          "peers": self.peer_status()},
                 "service_ref": asdict(self.service_ref), "capabilities": capabilities,
                 "routes": [{"method": method, "path": path} for method, path in sorted(routes)]}
         routes[("GET", "/v1/describe")] = describe
@@ -573,6 +579,8 @@ class CalibrationHttpServer:
             return
         self._stopping = True
         if self.private_host is not None:
+            if self.lifecycle is not None:
+                self.lifecycle.stop_readiness()
             (self.intrinsic_service or self.service).stop_readiness()
         # Host retains its resources if domain work has not really quiesced.
         self.host.close()
@@ -656,6 +664,9 @@ class CalibrationHttpServer:
 
     async def _events(self, request):
         intrinsic = self.intrinsic_service
+        self.activate_peers()
+        if intrinsic is not None and getattr(intrinsic, "live_capture_interval", None) is not None:
+            await self._domain(intrinsic.start_auto_capture, intrinsic.live_capture_interval)
         response = RawStreamResponse(max_bytes=self.limits.response_bytes, headers={**self._headers(request),
                                                "Content-Type": "text/event-stream"})
         await response.prepare(request)
@@ -665,7 +676,7 @@ class CalibrationHttpServer:
             return response
         previous, event_id = b"", 0
         while True:
-            state = await self._domain(intrinsic.state) if intrinsic is not None else {}
+            state = await self._domain(self._state, intrinsic or self.service)
             payload = json.dumps(state, separators=(",", ":"), allow_nan=False).encode()
             if payload != previous:
                 event_id += 1
@@ -673,6 +684,13 @@ class CalibrationHttpServer:
                                      + payload + b"\n\n")
                 previous = payload
             await asyncio.sleep(0.1)
+
+    def _state(self, domain):
+        state = domain.state()
+        state["peers"] = self.peer_status()
+        if self.lifecycle is not None:
+            state["ready"] = self.lifecycle.wait_ready(0)
+        return state
 
     async def _file(self, request, path, filename):
         if Path(filename).name != filename or not filename:
@@ -737,7 +755,7 @@ class CalibrationHttpServer:
                     payload["camera_control"] = bool(state.get("camera_control"))
                 return self._json(request, payload)
             if path == "/api/v1/state":
-                return self._json(request, await self._domain(self._extrinsic().state))
+                return self._json(request, await self._domain(self._state, self._extrinsic()))
             if path == "/api/v1/image.jpg":
                 return self._bytes(request, await self._domain(self._extrinsic().image_jpeg), "image/jpeg")
             if path in ("/api/v1/intrinsic/events", "/api/v1/events"):
@@ -751,7 +769,8 @@ class CalibrationHttpServer:
             }
             if path in reads:
                 method, mime = reads[path]
-                payload = await self._domain(getattr(self._intrinsic(), method))
+                payload = (await self._domain(self._state, self._intrinsic()) if method == "state"
+                           else await self._domain(getattr(self._intrinsic(), method)))
                 return self._json(request, payload) if mime == "json" else self._bytes(request, payload, mime)
             if path == "/api/v1/intrinsic/evidence.zip":
                 filename, evidence_path = await self._domain(self._intrinsic().evidence_bundle)
@@ -854,6 +873,8 @@ class CalibrationHttpServer:
     async def _handle(self, request):
         try:
             return await self._dispatch(request)
+        except PeerUnavailable as error:
+            return self._json(request, {"error": str(error)}, 503)
         except (ApiError, Fault) as error:
             if request.get(_RESPONSE_STARTED):
                 if request.transport:

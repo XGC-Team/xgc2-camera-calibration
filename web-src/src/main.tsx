@@ -188,6 +188,12 @@ function IntrinsicPage() {
           )}
           secondary={(
             <ScrollRegion className="calibration-side" fill>
+              <Panel title="Peer status">
+                <LegacyStatus id="ros-peer" initial="ROS master waiting" />
+                <LegacyStatus id="media-peer" initial="Media source waiting" />
+                <LegacyStatus id="info-peer" initial="CameraInfo waiting" />
+                <LegacyStatus id="world-peer" initial="World pose waiting" />
+              </Panel>
               <Panel title="Board detection" actions={<LegacyStatus id="detection-status" initial="waiting" sourceClassName="pill pill-off" />}>
                 <div className="calibration-detection-summary">
                   <strong id="detection-corners">No detection result yet</strong>
@@ -263,7 +269,11 @@ function ExtrinsicPage() {
               actions={(
                 <div className="calibration-health">
                   <LegacyStatus id="mode-chip" initial="Connecting" sourceClassName="chip" />
-                  <LegacyStatus id="input-chip" initial="Waiting for ROS" sourceClassName="chip muted" />
+                  <LegacyStatus id="input-chip" initial="Waiting for poses" sourceClassName="chip muted" />
+                  <LegacyStatus id="ros-peer" initial="ROS master waiting" />
+                  <LegacyStatus id="media-peer" initial="Media source waiting" />
+                  <LegacyStatus id="info-peer" initial="CameraInfo waiting" />
+                  <LegacyStatus id="world-peer" initial="World pose waiting" />
                 </div>
               )}
             >

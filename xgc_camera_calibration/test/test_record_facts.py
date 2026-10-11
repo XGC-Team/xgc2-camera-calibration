@@ -86,7 +86,7 @@ class PublisherSeamTest(unittest.TestCase):
             return NS(header=NS(frame_id='',stamp=None),child_frame_id='',
                 transform=NS(translation=NS(x=0,y=0,z=0),rotation=NS(x=0,y=0,z=0,w=1)))
         params={'~calibration_root':'/not-read','~calibration_mode':'phy','~camera_name':'camera',
-                '~parent_frame':'world','~optical_frame':'optical','~camera_link_frame':'link','~static':True}
+                '~socket_path':'/private/test-tf.sock','~target_id':'test-target','~parent_frame':'world','~optical_frame':'optical','~camera_link_frame':'link','~static':True}
         def metadata(*args,**kwargs):
             if fail_metadata: raise OSError('metadata unavailable')
             return NS(publish=lambda message: (order.append('fact'),sent.append(json.loads(message.data))))
@@ -120,9 +120,16 @@ class PublisherSeamTest(unittest.TestCase):
             'xgc_camera_calibration.extrinsic_application':app,'xgc_camera_calibration.transforms':transforms,
             'xgc_camera_calibration.extrinsic_resolver':resolver,
             'xgc_camera_calibration.record_facts':FACTS}
+        lifecycle=types.ModuleType('xgc_camera_calibration.ros_lifecycle')
+        lifecycle.NodeParameters=lambda _:NS(get=ros.get_param)
+        lifecycle.RosMasterBinding=lambda _:NS(initialize=lambda:True,mark_ready=lambda:None,
+            stop_readiness=lambda:None,close=lambda:None,uri='http://127.0.0.1:20000')
+        modules['xgc_camera_calibration.ros_lifecycle']=lifecycle
         module_patch=patch.dict(sys.modules,modules)
         module_patch.start(); self.addCleanup(module_patch.stop)
         publisher=load('tf_publisher_under_test',ROOT/'scripts/extrinsic_tf_publisher.py')
+        publisher.Runtime=lambda **_:NS(close=lambda:None)
+        publisher.Host=lambda *args,**kwargs:NS(start=lambda:NS(close=lambda:None))
         return publisher,sent,order,stamps,stamp
 
     def test_actual_publisher_reports_the_supplied_frozen_pose(self):

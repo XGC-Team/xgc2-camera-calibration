@@ -1,4 +1,6 @@
 <launch>
+  <arg name="socket_path" />
+  <arg name="target_id" />
   <arg name="resolved_extrinsic_json" />
   <arg name="frame_roles_json" />
   <arg name="calibration_mode" />
@@ -17,6 +19,8 @@
         name="xgc_camera_extrinsic_tf"
         output="screen"
         args="--resolved-extrinsic-json '$(arg resolved_extrinsic_json)' --frame-roles-json '$(arg frame_roles_json)'">
+    <param name="socket_path" value="$(arg socket_path)" />
+    <param name="target_id" value="$(arg target_id)" />
     <param name="calibration_mode" value="$(arg calibration_mode)" />
     <param name="camera_name" value="$(arg camera_name)" />
     <param name="parent_frame" value="$(arg parent_frame)" />

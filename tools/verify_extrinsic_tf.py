@@ -23,7 +23,7 @@ def main():
     parser.add_argument('--static', choices=('true', 'false'), default='true')
     args = parser.parse_args()
     output = args.output.resolve()
-    output.mkdir(parents=True, exist_ok=False)
+    output.mkdir(mode=0o700, parents=True, exist_ok=False)
     roles = {'parentFrame': 'world', 'opticalFrames': {'sim': 'acceptance_optical', 'phy': 'acceptance_optical'}}
     choice = {'mode': 'pose', 'pose': {'convention': 'world_T_camera_optical',
         'translation': [1., 2., 3.], 'quaternionXyzw': [0., 0., 0., 1.],
@@ -80,6 +80,7 @@ def main():
         subscriber = rospy.Subscriber('/tf_static' if args.static == 'true' else '/tf', TFMessage, observe, queue_size=20)
         publisher = spawn([sys.executable, str(args.publisher), '--resolved-extrinsic-json', frozen,
             '--frame-roles-json', json.dumps(roles), '__name:=frozen_camera_subject',
+            '_socket_path:=' + str(output / 'tf.sock'), '_target_id:=acceptance',
             '_calibration_mode:=phy', '_camera_name:=acceptance', '_parent_frame:=world',
             '_optical_frame:=acceptance_optical', '_camera_link_frame:=acceptance_link', '_static:=' + args.static], 'publisher.log')
         with condition:

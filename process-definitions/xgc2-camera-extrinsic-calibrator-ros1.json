@@ -73,7 +73,7 @@
           "trackers": {
             "type": "string",
             "default": "",
-            "description": "Comma-separated UAV/UGV names allowed as pose markers; empty discovers all markers under posePrefix."
+            "description": "Comma-separated tracker names under posePrefix; ROS subscriptions pick up late and restarted publishers."
           },
           "calibrationMode": {
             "type": "string",
@@ -208,7 +208,8 @@
           "_allowed_origins:=${allowedOrigins}",
           "_socket_path:=${socketPath}",
           "_target_id:=${targetId}",
-          "_camera_info_topic:=${cameraInfoTopic}"
+          "_camera_info_topic:=${cameraInfoTopic}",
+          "_trackers:=${trackers}"
         ],
         "env": {
           "ROS_MASTER_URI": "${rosMasterUri}",

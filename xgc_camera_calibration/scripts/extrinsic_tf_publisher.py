@@ -3,6 +3,11 @@
 import sys
 import math
 import uuid
+from dataclasses import asdict
+from urllib.parse import parse_qs
+
+from xgc2_xrpc import Endpoint, Fault, Host, Runtime, ServiceRef
+from xgc_camera_calibration.ros_lifecycle import NodeParameters, RosMasterBinding
 
 import rospy
 import tf2_ros
@@ -85,17 +90,20 @@ def publish_chain(transforms, broadcaster, optical_broadcaster=None):
 
 def main():
     args = application_arguments(rospy.myargv()[1:])
-    rospy.init_node("xgc_camera_extrinsic_tf")
+    parameters = NodeParameters("xgc_camera_extrinsic_tf")
+    binding = RosMasterBinding("xgc_camera_extrinsic_tf")
+    runtime = host = facts = None
+    publication = {"published": False, "revision": 1}
     try:
-        mode = str(rospy.get_param("~calibration_mode")).strip()
-        camera_name = str(rospy.get_param("~camera_name")).strip()
+        mode = str(parameters.get("~calibration_mode")).strip()
+        camera_name = str(parameters.get("~camera_name")).strip()
         roles = parse_frame_roles(args.frame_roles_json)
-        parent = str(rospy.get_param("~parent_frame"))
-        optical = str(rospy.get_param("~optical_frame"))
-        link = str(rospy.get_param("~camera_link_frame"))
+        parent = str(parameters.get("~parent_frame"))
+        optical = str(parameters.get("~optical_frame"))
+        link = str(parameters.get("~camera_link_frame"))
         if mode not in ("sim", "phy") or parent != roles["parentFrame"] or optical != roles["opticalFrames"][mode]:
             raise ValueError("output frames do not match the controlled camera roles")
-        link_offset = tuple(float(rospy.get_param("~link_to_optical_" + axis, 0.0)) for axis in ("x", "y", "z"))
+        link_offset = tuple(float(parameters.get("~link_to_optical_" + axis, 0.0)) for axis in ("x", "y", "z"))
         if not all(math.isfinite(value) for value in link_offset):
             raise ValueError("camera link offset must be finite")
         frozen = decode_frozen(args.resolved_extrinsic_json, camera_name, roles)
@@ -109,10 +117,38 @@ def main():
             rospy.logwarn("Publishing default camera extrinsic; no applied calibration exists")
         else:
             transforms = frozen_transform_chain(frozen, parent, link, optical, link_offset)
-        static = bool(rospy.get_param("~static", True))
-        rate = float(rospy.get_param("~publish_rate", 10.0))
+        static = bool(parameters.get("~static", True))
+        rate = float(parameters.get("~publish_rate", 10.0))
         if not math.isfinite(rate) or rate <= 0:
             raise ValueError("camera publication rate must be finite and positive")
+        reference = ServiceRef(str(parameters.get("~target_id")), "xgc2.calibration.v1.ExtrinsicTf", "1",
+            instance_id, "http.v1", Endpoint("unix", str(parameters.get("~socket_path")))).validate()
+        runtime = Runtime(blocking_workers=2, max_calls=8, max_connections=8)
+        async def describe(context, value):
+            if value not in (None, {}):
+                raise Fault("invalid_argument", "Describe requires an empty body", 400)
+            wait_ms = 0
+            if context.query:
+                query = parse_qs(context.query, keep_blank_values=True)
+                wait = query.get("wait_ready_ms", [])
+                if (set(query) != {"wait_ready_ms"} or len(wait) != 1 or len(wait[0]) > 5
+                        or not wait[0].isascii() or not wait[0].isdigit() or int(wait[0]) > 30000):
+                    raise Fault("invalid_argument", "wait_ready_ms must be in [0, 30000]", 400)
+                wait_ms = int(wait[0])
+            ready = await runtime.blocking(host, binding.wait_ready, wait_ms / 1000.)
+            return {"service": reference.service, "api_version": reference.api_version,
+                "instance_id": reference.instance_id, "ready": ready, "service_ref": asdict(reference),
+                "facts": {"camera_id": camera_name, "ros_master_uri": binding.uri,
+                          "peers": {"ros_master": binding.status(),
+                                    "media": {"reason": "not_consumed", "ready": False},
+                                    "camera_info": {"reason": "not_consumed", "received": False},
+                                    "world": {"reason": "frozen_resolution", "pose_available": True}},
+                          "publication": dict(publication),
+                          "resolution_id": frozen["resolutionId"]}}
+        host = Host(reference.endpoint.address, {("GET", "/v1/describe"): describe},
+                    runtime=runtime, instance_id=instance_id, discovery_routes=("/v1/describe",)).start()
+        if not binding.initialize():
+            return 0
         broadcaster = tf2_ros.StaticTransformBroadcaster() if static else tf2_ros.TransformBroadcaster()
         optical_broadcaster = None if static else tf2_ros.StaticTransformBroadcaster()
         # Publication evidence records this process and the supplied resolution.
@@ -130,11 +166,8 @@ def main():
         stamp = publish_chain(transforms, broadcaster, optical_broadcaster)
         facts.applied(transform_values(transforms), frozen, stamp.to_nsec())
         rospy.set_param("~extrinsic_ready", True)
-    except Exception as error:
-        rospy.logfatal("Could not start frozen camera extrinsic publisher: %s", error)
-        return 2
-
-    try:
+        publication["published"] = True
+        binding.mark_ready()
         while not rospy.is_shutdown():
             if not static:
                 stamp = publish_chain(transforms, broadcaster, optical_broadcaster)
@@ -144,10 +177,24 @@ def main():
                 rospy.spin()
                 break
             rospy.rostime.wallsleep(1.0 / rate)
+        return 0
+    except Exception as error:
+        rospy.logfatal("Could not start frozen camera extrinsic publisher: %s", error)
+        return 2
     finally:
-        facts.stop(rospy.Time.now().to_nsec())
-        rospy.set_param("~extrinsic_ready", False)
-    return 0
+        binding.stop_readiness()
+        if facts is not None:
+            facts.stop(rospy.Time.now().to_nsec())
+        if publication["published"]:
+            try:
+                rospy.set_param("~extrinsic_ready", False)
+            except Exception:
+                pass
+        if host is not None:
+            host.close()
+        binding.close()
+        if runtime is not None:
+            runtime.close()
 
 
 if __name__ == "__main__":

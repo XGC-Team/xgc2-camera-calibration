@@ -138,7 +138,7 @@
           "simulationEndpoint": {
             "type": "string",
             "default": "",
-            "description": "Unix endpoint from the ready Session world ServiceRef; required when cameraControl is enabled."
+            "description": "Pre-allocated Unix endpoint from the Session world ServiceRef; required when cameraControl is enabled."
           },
           "targetId": {
             "type": "string",

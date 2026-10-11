@@ -91,6 +91,16 @@
           "frameRolesJson": {
             "type": "string",
             "description": "Exact parent and optical frame roles from the camera fragment."
+          },
+          "socketPath": {
+            "type": "string",
+            "fixedOnly": true,
+            "description": "Private TF readiness endpoint allocated by Core."
+          },
+          "targetId": {
+            "type": "string",
+            "fixedOnly": true,
+            "description": "Core target identity for local service discovery."
           }
         },
         "required": [
@@ -98,7 +108,9 @@
           "parentFrame",
           "opticalFrame",
           "cameraLinkFrame",
-          "frameRolesJson"
+          "frameRolesJson",
+          "socketPath",
+          "targetId"
         ]
       },
       "command": {
@@ -118,7 +130,9 @@
           "_link_to_optical_y:=${linkToOpticalY}",
           "_link_to_optical_z:=${linkToOpticalZ}",
           "_static:=${static}",
-          "_publish_rate:=${publishRate}"
+          "_publish_rate:=${publishRate}",
+          "_socket_path:=${socketPath}",
+          "_target_id:=${targetId}"
         ],
         "env": {
           "ROS_MASTER_URI": "${rosMasterUri}",
@@ -129,7 +143,9 @@
         "/opt/ros/noetic/setup.bash"
       ],
       "readiness": {
-        "kind": "none"
+        "kind": "describe",
+        "startGraceMs": 30000,
+        "timeoutMs": 30000
       },
       "stop": {
         "graceMs": 5000
@@ -137,7 +153,15 @@
       "logs": {
         "maxBytes": 1048576,
         "files": 3
-      }
+      },
+      "services": [
+        {
+          "service": "xgc2.calibration.v1.ExtrinsicTf",
+          "api_version": "1",
+          "profile": "http.v1",
+          "endpointParameter": "socketPath"
+        }
+      ]
     }
   ]
 }

@@ -1,6 +1,7 @@
 """Instance-fenced native multipart capture; no legacy browser snapshot routes."""
 import json
 import tempfile
+import time
 import unittest
 import uuid
 from dataclasses import asdict
@@ -8,12 +9,14 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from xgc2_xrpc import Host, Limits, Response, Runtime, multipart
+from xgc2_xrpc import Fault, Host, Limits, Response, Runtime, multipart
 from xgc_camera_calibration.media_snapshot import MediaSnapshotClient, MediaSnapshotError
 
 
 class FakeMediaEdge:
-    def __init__(self):
+    def __init__(self, path=None, instance="edge-1"):
+        self.provided_path = path
+        self.instance = instance
         self.requests, self.deleted, self.snapshot_ids = [], [], []
         self.sources = [{"id": "usb_cam"}]
         self.image = np.full((216, 384, 3), (10, 20, 30), dtype=np.uint8)
@@ -31,10 +34,10 @@ class FakeMediaEdge:
 
     def __enter__(self):
         self.directory = tempfile.TemporaryDirectory()
-        self.path = str(Path(self.directory.name) / "edge.sock")
+        self.path = self.provided_path or str(Path(self.directory.name) / "edge.sock")
         self.runtime = Runtime()
         ref = {"target_id": "test-target", "service": "media-edge", "api_version": "v1",
-               "instance_id": "edge-1", "profile": "http.v1",
+               "instance_id": self.instance, "profile": "http.v1",
                "endpoint": {"kind": "unix", "address": self.path}}
         def capture(context, value, snapshot_id):
             self.requests.append((context.request_id, value))
@@ -54,12 +57,19 @@ class FakeMediaEdge:
                 return Response(b"", 204)
             self.host.routes[("DELETE", "/v1/media/snapshots/" + snapshot_id)] = release
             return capture(context, value, snapshot_id)
-        routes = {("GET", "/v1/describe"): lambda c, r: {"service_ref": ref, "sources": self.sources},
+        routes = {("GET", "/v1/describe"): lambda c, r: {"ready": True, "service_ref": ref, "sources": self.sources},
                   ("GET", "/v1/health"): lambda c, r: {"sources": self.sources},
                   ("POST", "/v1/media/sources/usb_cam/capture"): capture_with_release}
-        self.host = Host(self.path, routes, runtime=self.runtime, instance_id="edge-1",
+        self.host = Host(self.path, routes, runtime=self.runtime, instance_id=self.instance,
                          discovery_routes=("/v1/describe",), limits=Limits(response_bytes=40 << 20)).start()
         self.client = MediaSnapshotClient(self.path, "usb_cam", local_target="test-target")
+        self.client.peer.activate()
+        deadline = time.monotonic() + 3
+        while not self.client.status()["ready"] and time.monotonic() < deadline:
+            time.sleep(.01)
+        if not self.client.status()["ready"]:
+            self.__exit__()
+            raise AssertionError("fake media discovery did not complete")
         return self
 
     def __exit__(self, *args):
@@ -70,6 +80,23 @@ class FakeMediaEdge:
 
 
 class MediaSnapshotClientTest(unittest.TestCase):
+    def test_source_failure_is_status_without_invalidating_media_service(self):
+        with FakeMediaEdge() as edge:
+            edge.client.capture()
+            self.assertTrue(edge.client.status()["source_available"])
+            def absent(_value):
+                raise Fault("unavailable", "camera source is absent", 503)
+            edge.custom_capture = absent
+            with self.assertRaises(MediaSnapshotError):
+                edge.client.capture()
+            self.assertTrue(edge.client.status()["ready"])
+            self.assertFalse(edge.client.status()["source_available"])
+            self.assertIn("camera source is absent", edge.client.status()["capture_error"])
+            edge.custom_capture = None
+            edge.client.capture()
+            self.assertTrue(edge.client.status()["source_available"])
+            self.assertEqual(edge.client.status()["connect_attempts"], 1)
+
     def test_health_and_capture_consume_one_immutable_native_frame(self):
         with FakeMediaEdge() as edge:
             self.assertEqual(edge.client.health()["sources"], edge.sources)
@@ -129,9 +156,9 @@ class MediaSnapshotClientTest(unittest.TestCase):
             edge.sources.clear()
             with self.assertRaises(MediaSnapshotError): edge.client.health()
         for address in ("http://localhost:18090", "relative.sock"):
-            with self.assertRaises(ValueError): MediaSnapshotClient(address, "usb_cam")
-        with self.assertRaises(ValueError): MediaSnapshotClient("/private/edge.sock", "bad source")
-        with self.assertRaises(ValueError): MediaSnapshotClient("/private/edge.sock", "usb_cam", float("inf"))
+            with self.assertRaises(ValueError): MediaSnapshotClient(address, "usb_cam", local_target="test-target")
+        with self.assertRaises(ValueError): MediaSnapshotClient("/private/edge.sock", "bad source", local_target="test-target")
+        with self.assertRaises(ValueError): MediaSnapshotClient("/private/edge.sock", "usb_cam", float("inf"), local_target="test-target")
 
     def test_extra_or_encoded_mime_parts_are_rejected(self):
         with FakeMediaEdge() as edge:

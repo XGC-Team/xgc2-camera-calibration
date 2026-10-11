@@ -11,7 +11,7 @@ const red=Buffer.from(fixture.red,'base64'),blue=Buffer.from(fixture.blue,'base6
 const state={sampling_session_id:'a'.repeat(32),dataset_revision:0,samples:[],mode:'live',generation:0,
  result:null,parent_frame:'world',child_frame:'camera',frame:null,
  source:{source_id:'camera',image_ready:true,intrinsic_ready:true,marker_count:1,marker_names:['one-body'],
- image_topic:'image',intrinsic_file:'',intrinsic_source:'camera-info',pose_prefix:'pose'}};
+ latest_image_stamp_sec:1,image_topic:'image',intrinsic_file:'',intrinsic_source:'camera-info',pose_prefix:'pose'}};
 const pending=new Map(),images=new Map(),requests=[],failures=[];
 let identity=0,imageReads=0,heldImage,rejectCommit=false,resolveHeld;
 const heldReady=new Promise(resolve=>{resolveHeld=resolve;});
@@ -19,6 +19,16 @@ let heldDeadline;
 const browser=await chromium.launch({headless:true,executablePath:process.env.CHROME_BIN||'/usr/bin/google-chrome'});
 try {
  const page=await browser.newPage({viewport:{width:1000,height:1000}});
+ await page.addInitScript(()=>{
+  window.sampleEvents=[];
+  window.EventSource=class {
+   constructor(){this.listeners={};window.sampleEvents.push(this);}
+   addEventListener(name,callback){this.listeners[name]=callback;}
+   close(){this.closed=true;}
+  };
+  window.emitSampleState=value=>window.sampleEvents.filter(event=>!event.closed)
+    .forEach(event=>event.listeners.state({data:JSON.stringify(value)}));
+ });
  page.on('pageerror',error=>failures.push(String(error)));
  await page.route('http://fixture.test/**',async route=>{
   try {
@@ -60,7 +70,11 @@ try {
   } catch(error){failures.push(String(error));await route.fulfill({status:500,json:{error:String(error)}});}
  });
  await page.goto('http://fixture.test/');await page.addScriptTag({type:'module',content:fixture.source});
+ await page.waitForFunction(()=>window.sampleEvents.length===1);
+ await page.evaluate(value=>window.emitSampleState(value),state);
  await page.waitForFunction(()=>document.getElementById('camera-canvas').getContext('2d').getImageData(0,0,1,1).data[0]===255);
+ state.source.latest_image_stamp_sec=2;
+ await page.evaluate(value=>window.emitSampleState(value),state);
  // Actual second request is the boundary; no sleep-based readiness claim.
  try { await Promise.race([heldReady,new Promise((_,reject)=>{heldDeadline=setTimeout(()=>reject(Error('second preview request absent')),10000);})]); } finally {clearTimeout(heldDeadline);}
  assert(heldImage);

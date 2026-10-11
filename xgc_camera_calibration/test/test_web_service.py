@@ -492,7 +492,7 @@ class WebCalibrationServiceTest(unittest.TestCase):
             "rospy": SimpleNamespace(Time=SimpleNamespace(now=lambda:SimpleNamespace(to_sec=lambda:12.34)))}
         exec(compile(ast.Module(body=methods,type_ignores=[]),str(source_path),"exec"),namespace)
         source = SimpleNamespace(lock=threading.RLock(),marker_latest={},marker_receipts={},
-            source_size=(640,480),snapshot_client=object(),snapshot_available=True,pose_max_age=2.,
+            source_size=(640,480),snapshot_client=SimpleNamespace(status=lambda: {"ready": True}),pose_max_age=2.,
             use_camera_info=False,intrinsic_matrix=self.intrinsic,intrinsic_distortion=self.distortion,
             intrinsic_size=(640,480),intrinsic_provenance={},pose_coordinate_source="raw-vrpn",pose_world_offset=(10.,-5.,2.))
         source._observation_context=MethodType(namespace["_observation_context"],source)

@@ -4,6 +4,7 @@
 const el = (id) => document.getElementById(id);
 let autoRunning = false;
 let pollInFlight = false;
+let events = null, retryTimer = null, retryCeiling = 250, disposed = false;
 let displayedImageSequence = 0;
 let pendingImageSequence = 0;
 let imageRefreshInFlight = false;
@@ -113,6 +114,13 @@ function renderDetection(detection, board) {
 }
 
 function applyState(s) {
+  const peers = s.peers || {};
+  el("ros-peer").textContent = peers.ros_master?.available ? "ROS master connected" : "ROS master waiting";
+  el("media-peer").textContent = peers.media?.source_available ? "Media source connected"
+    : peers.media?.ready ? "Media service connected; source waiting" : "Media source waiting";
+  el("info-peer").textContent = peers.camera_info?.received ? "CameraInfo received" : "CameraInfo waiting";
+  el("world-peer").textContent = peers.world?.pose_available ? "World pose available"
+    : peers.world?.reason === "not_configured" ? "World control disabled" : "World pose waiting";
   const wasAutoRunning = autoRunning;
   const action = s.action || null;
   const solveJob = s.solve_job || null;
@@ -166,6 +174,7 @@ async function poll() {
   pollInFlight = true;
   try {
     const res = await fetch("api/v1/intrinsic/state", { cache: "no-store" });
+    if (!res.ok) throw new Error("Calibration service unavailable");
     applyState(await res.json());
   } catch (err) {
     el("conn").textContent = "disconnected";
@@ -401,9 +410,34 @@ function initScene() {
   window.addEventListener("resize", drawScene);
 }
 
+function connectEvents() {
+  if (disposed) return;
+  const connection = new EventSource("api/v1/intrinsic/events");
+  events = connection;
+  connection.addEventListener("state", (event) => {
+    retryCeiling = 250;
+    applyState(JSON.parse(event.data));
+  });
+  connection.onerror = () => {
+    if (events !== connection) return;
+    events = null;
+    connection.close();
+    el("conn").textContent = "disconnected";
+    el("conn").className = "legacy-state-source pill pill-off";
+    retryTimer = setTimeout(connectEvents, Math.random() * retryCeiling);
+    retryCeiling = Math.min(30000, retryCeiling * 2);
+  };
+}
+
 wireButtons();
 initScene();
 poll();
-setInterval(poll, 200);
+connectEvents();
+window.addEventListener("pagehide", () => {
+  disposed = true;
+  events?.close();
+  clearTimeout(retryTimer);
+  if (displayedImageUrl) URL.revokeObjectURL(displayedImageUrl);
+});
 
 export {}
