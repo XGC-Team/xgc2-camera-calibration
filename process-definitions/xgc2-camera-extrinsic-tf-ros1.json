@@ -23,6 +23,7 @@
             "collapsed": true,
             "parameters": [
               "rosMasterUri",
+              "rosIp",
               "rosLogDir"
             ]
           }
@@ -78,6 +79,11 @@
           "rosMasterUri": {
             "type": "string",
             "default": "http://127.0.0.1:11311",
+            "output": true
+          },
+          "rosIp": {
+            "type": "string",
+            "default": "",
             "output": true
           },
           "rosLogDir": {
@@ -136,6 +142,7 @@
         ],
         "env": {
           "ROS_MASTER_URI": "${rosMasterUri}",
+          "ROS_IP": "${rosIp}",
           "ROS_LOG_DIR": "${rosLogDir}"
         }
       },

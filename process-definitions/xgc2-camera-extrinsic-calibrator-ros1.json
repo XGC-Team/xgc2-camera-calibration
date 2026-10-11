@@ -23,6 +23,7 @@
             "collapsed": true,
             "parameters": [
               "rosMasterUri",
+              "rosIp",
               "rosLogDir"
             ]
           }
@@ -136,6 +137,11 @@
             "default": "http://127.0.0.1:11311",
             "output": true
           },
+          "rosIp": {
+            "type": "string",
+            "default": "",
+            "output": true
+          },
           "rosLogDir": {
             "type": "string",
             "default": "/tmp/xgc2/ros/log/camera-calibration"
@@ -212,6 +218,7 @@
         ],
         "env": {
           "ROS_MASTER_URI": "${rosMasterUri}",
+          "ROS_IP": "${rosIp}",
           "ROS_LOG_DIR": "${rosLogDir}"
         }
       },

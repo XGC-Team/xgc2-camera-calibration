@@ -40,6 +40,8 @@ class ProcessContractTest(unittest.TestCase):
                 required = definition['parameters']['required']
                 self.assertLessEqual(set(required), set(properties))
                 self.assertNotIn('calibrationRoot', properties)
+                self.assertEqual(properties['rosIp']['default'], '')
+                self.assertEqual(definition['command']['env']['ROS_IP'], '${rosIp}')
                 for group in definition['parameters']['groups']:
                     self.assertLessEqual(set(group['parameters']), set(properties))
                 args = definition['command']['args']
