@@ -18,7 +18,6 @@ const ui = {
   remove: document.getElementById("remove-button"),
   clear: document.getElementById("clear-button"),
   solve: document.getElementById("solve-button"),
-  save: document.getElementById("save-button"),
   imageTopic: document.getElementById("image-topic"),
   intrinsicFile: document.getElementById("intrinsic-file"),
   posePrefix: document.getElementById("pose-prefix"),
@@ -65,7 +64,7 @@ function renderState(server) {
   ui.modeChip.textContent=state.reviewId ? "Sample review" : server.mode==="frozen" ? "Paused" : "Live";
   ui.inputChip.textContent=`${server.source.marker_count} pose markers`;
   ui.imageTopic.textContent=server.source.image_topic;ui.posePrefix.textContent=server.source.pose_prefix;
-  ui.outputFile.textContent=server.output_file || "—";
+  ui.outputFile.textContent="Core";
   const model=server.result?.camera_model || server.frame?.camera_model || server.source;
   ui.intrinsicFile.textContent=model.intrinsic_source==="ideal-pinhole"
     ? `Ideal pinhole · HFOV ${model.ideal_horizontal_fov_degrees}° · assumed, not measured`
@@ -87,7 +86,7 @@ function renderControls() {
   ui.freeze.disabled=state.busy || !state.server?.source.image_ready;
   ui.live.disabled=state.busy || (!state.reviewId && !state.replaceId && state.server?.mode==="live");
   ui.remove.disabled=state.busy || !state.points.length;ui.clear.disabled=state.busy || !state.points.length;
-  ui.solve.disabled=state.busy || state.points.length<4;ui.save.disabled=state.busy || !state.candidate || state.candidate.saved;
+  ui.solve.disabled=state.busy || state.points.length<4;
   ui.pointsBody.replaceChildren();
   const errors=new Map((state.candidate?.points || []).map(point=>[point.sample_id,point]));
   for (const [index,point] of state.points.entries()) {
@@ -180,11 +179,7 @@ async function mutate(operation,fields={}) { await action(async()=>{
 }); }
 async function solve() { await action(async()=>{
   const result=await post("api/v1/solve",revision());renderState({...state.server,result});
-  showBanner(ui.success,"Extrinsic candidate ready; save it explicitly after review.");
-}); }
-async function save() { if (!state.candidate || state.candidate.saved) return;await action(async()=>{
-  const result=await post("api/v1/save",{candidate_id:state.candidate.candidate_id});
-  renderState({...state.server,result,output_file:result.output_file});showBanner(ui.success,"Calibration saved.");
+  showBanner(ui.success,"Extrinsic candidate ready for review in Core.");
 }); }
 function formatResult(result,server) {
   return [`${server.parent_frame} → ${server.child_frame}`,
@@ -227,7 +222,7 @@ ui.canvas.addEventListener("click",(event)=>{
 });
 ui.freeze.addEventListener("click",freezeFrame);ui.live.addEventListener("click",liveFrame);
 ui.remove.addEventListener("click",()=>{const point=state.points.at(-1);if(point) void mutate("remove",{sample_id:point.sample_id});});
-ui.clear.addEventListener("click",()=>mutate("clear"));ui.solve.addEventListener("click",solve);ui.save.addEventListener("click",save);
+ui.clear.addEventListener("click",()=>mutate("clear"));ui.solve.addEventListener("click",solve);
 window.addEventListener("resize",fitCanvas);
 void refreshState();
 const stateTimer=window.setInterval(refreshState,1000);

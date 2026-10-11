@@ -93,27 +93,16 @@ class PublisherSeamTest(unittest.TestCase):
         ros=types.ModuleType('rospy')
         ros.myargv=lambda:['publisher']; ros.init_node=lambda *_:None
         ros.get_param=lambda name,*default:params[name] if name in params else default[0]
-        ros.set_param=lambda key,value:state.update({key:value})
+        ros.set_param=lambda key,value:(state.update({key:value}), order.append("ready") if key=="~extrinsic_ready" and value else None)
         ros.Time=NS(now=lambda:stamp); ros.is_shutdown=lambda:ticked[0]
+        ros.spin=lambda:ticked.__setitem__(0,True)
         ros.Publisher=metadata
         ros.logwarn=ros.logwarn_throttle=ros.logfatal=lambda *_:None
-        class Application:
-            def __init__(self,*args):
-                self.frozen=copy.deepcopy(FROZEN)
-                self.producer={'instanceEpoch':'epoch','resolutionId':'frozen-resolution'}
-                self.ready=False; self.project=args[-1]
-            def initial_published(self): self.ready=True; order.append('initial-ready')
-            def tick(self,apply):
-                ticked[0]=True
-                next_value=copy.deepcopy(FROZEN); next_value['resolvedOpticalPose']['translation'][0]=9
-                apply(next_value)
-                order.append('confirm')
-                if confirmation_error: raise RuntimeError('selection CAS conflict')
-            def state(self): return {'ready':self.ready}
         app=types.ModuleType('xgc_camera_calibration.extrinsic_application')
-        app.ExtrinsicApplication=Application
         app.application_arguments=lambda _:NS(frame_roles_json='roles',resolved_extrinsic_json='frozen')
         app.parse_frame_roles=lambda _:{'parentFrame':'world','opticalFrames':{'phy':'optical','sim':'sim_optical'}}
+        resolver=types.ModuleType('xgc_camera_calibration.extrinsic_resolver')
+        resolver.decode_frozen=lambda *args:copy.deepcopy(FROZEN)
         transforms=types.ModuleType('xgc_camera_calibration.transforms')
         transforms.split_parent_to_optical_pose=lambda t,q,offset:{'parent_t_link':t,'parent_q_link_xyzw':q,
             'link_t_optical':offset,'link_q_optical_xyzw':[0,0,0,1]}
@@ -129,36 +118,34 @@ class PublisherSeamTest(unittest.TestCase):
             'std_msgs':types.ModuleType('std_msgs'),'std_msgs.msg':messages,
             'xgc_camera_calibration':types.ModuleType('xgc_camera_calibration'),
             'xgc_camera_calibration.extrinsic_application':app,'xgc_camera_calibration.transforms':transforms,
+            'xgc_camera_calibration.extrinsic_resolver':resolver,
             'xgc_camera_calibration.record_facts':FACTS}
         module_patch=patch.dict(sys.modules,modules)
         module_patch.start(); self.addCleanup(module_patch.stop)
         publisher=load('tf_publisher_under_test',ROOT/'scripts/extrinsic_tf_publisher.py')
-        publisher.time=NS(sleep=lambda _:None)
         return publisher,sent,order,stamps,stamp
 
-    def test_actual_publisher_keeps_published_update_after_confirmation_failure(self):
-        publisher,sent,order,stamps,stamp=self.install(confirmation_error=True)
+    def test_actual_publisher_reports_the_supplied_frozen_pose(self):
+        publisher,sent,order,stamps,stamp=self.install()
         self.assertEqual(publisher.main(),0)
-        self.assertEqual([entry['event'] for entry in sent],['applied','applied','stopped'])
-        self.assertEqual(sent[1]['values']['transforms'][0]['translation'][0],9)
+        self.assertEqual([entry['event'] for entry in sent],['applied','stopped'])
         self.assertLess(order.index('tf'),order.index('fact'))
-        self.assertEqual(order[:3],['tf','fact','initial-ready'])
-        self.assertEqual(order[3:6],['tf','fact','confirm'])
+        self.assertEqual(order[:3],['tf','fact','ready'])
         self.assertTrue(all(value is stamp for value in stamps))
-        self.assertEqual(sent[0]['source']['instanceId'],'epoch')
+        self.assertRegex(sent[0]['source']['instanceId'], r'^[0-9a-f]{32}$')
 
     def test_failed_tf_does_not_emit_applied_fact(self):
         publisher,sent,order,_,_=self.install(fail_tf=True)
         self.assertEqual(publisher.main(),2)
         self.assertEqual(sent,[])
-        self.assertNotIn('initial-ready',order)
+        self.assertNotIn('ready',order)
 
     def test_failed_metadata_does_not_reject_tf_or_selection(self):
         publisher,sent,order,_,_=self.install(fail_metadata=True)
         self.assertEqual(publisher.main(),0)
         self.assertEqual(sent,[])
-        self.assertIn('initial-ready',order)
-        self.assertIn('confirm',order)
+        self.assertIn('ready',order)
+        self.assertNotIn('confirm',order)
 
 
 if __name__ == '__main__': unittest.main()

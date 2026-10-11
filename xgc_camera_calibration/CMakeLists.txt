@@ -28,9 +28,6 @@ install(DIRECTORY ../process-definitions
 install(DIRECTORY web
   DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}
 )
-install(FILES ../contracts/storage-manifest.json
-  DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}/contracts
-)
 
 if(CATKIN_ENABLE_TESTING)
   catkin_add_nosetests(test/test_asset_document.py)
@@ -46,7 +43,7 @@ if(CATKIN_ENABLE_TESTING)
   catkin_add_nosetests(test/test_web_service.py)
   catkin_add_nosetests(test/test_native_web_transport.py)
   catkin_add_nosetests(test/test_native_process_endpoint.py)
-  catkin_add_nosetests(test/test_preferences.py)
+  catkin_add_nosetests(test/test_process_contract.py)
   catkin_add_nosetests(test/test_extrinsic_file_watcher.py)
   catkin_add_nosetests(test/test_extrinsic_tf_publisher.py)
   catkin_add_nosetests(test/test_record_facts.py)

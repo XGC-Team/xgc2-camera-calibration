@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Replay a preserved capture through real candidate/status/save HTTP endpoints.
+"""Replay a preserved capture through real candidate/status/result HTTP endpoints.
 
 Writes only to a NEW output directory. Never modifies the capture or activates
 its result in a robot/experiment. Requires the calibration package dependencies.
@@ -18,6 +18,7 @@ PACKAGE = Path(__file__).resolve().parents[1] / 'xgc_camera_calibration'
 sys.path.insert(0, str(PACKAGE / 'src'))
 from xgc_camera_calibration.intrinsic_service import IntrinsicCalibrationService
 from xgc_camera_calibration.web_service import CalibrationHttpServer
+from xgc2_xrpc import Client
 
 
 def main():
@@ -66,7 +67,8 @@ def main():
         service._evidence_samples.append(normalized)
     service._save_checkpoint_locked()
     server = CalibrationHttpServer(('127.0.0.1', 0), None, PACKAGE / 'web/intrinsic',
-        frame_ancestors="'self'", intrinsic_service=service).start()
+        frame_ancestors="'self'", intrinsic_service=service,
+        rpc_socket=str(output / "calibration.sock"), target_id="capture-acceptance").start()
     base = f'http://127.0.0.1:{server.server_address[1]}/api/v1/intrinsic/'
     latencies = []
     def request(path, body=None):
@@ -103,15 +105,18 @@ def main():
         assert job['status'] == 'succeeded', job
         candidate = state['candidate']
         assert candidate['quality']['status'] == 'save_ready', candidate['quality']
-        _, saved = request('save', {'candidate_id': candidate['candidate_id']})
-        assert saved['saved']
-        assert request('save', {'candidate_id': candidate['candidate_id']})[1] == saved
-        assert request('state')[1]['phase'] == 'saved'
-        report = {'passed': True, 'scope': 'real HTTP candidate/status/save; replayed original observations',
-                  'sample_count': len(entries), 'selected_count': saved['sample_count'],
-                  'rms_px': saved['rms_reprojection_error_px'], 'quality': candidate['quality'],
+        with Client.from_service(server.service_ref, runtime=server.runtime, local_target='capture-acceptance') as client:
+            result = client.json('/v1/result', method='GET')
+            assert client.json('/v1/result', method='GET') == result
+        assert result['result']['candidate_id'] == candidate['candidate_id']
+        document = result['result']['document']
+        assert not list(output.glob('intrinsics*.yaml'))
+        assert request('state')[1]['phase'] == 'candidate_ready'
+        report = {'passed': True, 'scope': 'real HTTP candidate/status/result; replayed original observations',
+                  'sample_count': len(entries), 'selected_count': document['sample_count'],
+                  'rms_px': document['rms_reprojection_error_px'], 'quality': candidate['quality'],
                   'elapsed_seconds': time.monotonic() - started,
-                  'max_http_seconds': max(latencies), 'result': saved}
+                  'max_http_seconds': max(latencies), 'result': result}
         (output / 'acceptance.json').write_text(json.dumps(report, indent=2))
         print(json.dumps(report), flush=True)
     finally:

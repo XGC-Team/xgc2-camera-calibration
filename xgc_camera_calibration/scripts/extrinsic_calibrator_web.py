@@ -11,12 +11,12 @@ from dataclasses import replace
 from pathlib import Path
 
 import cv2
+import numpy as np
 import rospkg
 import rospy
-from xgc2_xrpc import Runtime, load_bootstrap_input
-from xgc_camera_calibration.preferences import create_preferences
+from xgc2_xrpc import Runtime
 from geometry_msgs.msg import PoseStamped
-from sensor_msgs.msg import CompressedImage, Image
+from sensor_msgs.msg import CameraInfo, CompressedImage
 
 from xgc_camera_calibration.pose_freshness import pose_is_fresh
 from xgc_camera_calibration.extrinsic_application import application_arguments, parse_frame_roles
@@ -29,15 +29,12 @@ from xgc_camera_calibration.web_service import (
     CalibrationService,
     FrameSnapshot,
     MarkerObservation,
-    image_message_to_bgr,
 )
 from xgc_camera_calibration.intrinsic_solver import load_intrinsic
 from xgc_camera_calibration.intrinsic_validation import (
-    ideal_intrinsic_parameters,
     intrinsic_parameters,
 )
 from xgc_camera_calibration.media_snapshot import MediaSnapshotClient, MediaSnapshotError
-from xgc_camera_calibration.solver import optional_selected_intrinsic_path
 from xgc_camera_calibration.extrinsic_coordinates import coordinate_provenance
 
 
@@ -52,7 +49,6 @@ class RosCalibrationSource:
     def __init__(
         self,
         intrinsic_file,
-        calibration_root,
         calibration_mode,
         camera_name,
         snapshot_client=None,
@@ -66,25 +62,25 @@ class RosCalibrationSource:
             raise ValueError("calibration source requires its frozen camera context")
         self.pose_world_offset = tuple(frozen_extrinsic["targetCoordinates"]["worldOffset"])
         self.lock = threading.RLock()
+        self.ready_condition = threading.Condition(self.lock)
+        self.camera_info = None
+        self.optical_frame = str(rospy.get_param("~child_frame"))
+        self._readiness_stopping = False
+        self.camera_info_topic = normalize_topic(rospy.get_param("~camera_info_topic", "/usb_cam/camera_info"))
+        self.info_subscriber = rospy.Subscriber(self.camera_info_topic, CameraInfo, self._camera_info_callback, queue_size=1)
         self.snapshot_client = snapshot_client
         self.snapshot_available = bool(snapshot_available)
         self.source_size = None
-        selected = optional_selected_intrinsic_path(
-            calibration_root, calibration_mode, camera_name, intrinsic_file
-        )
-        self.use_ideal_intrinsics = selected is None
-        self.ideal_horizontal_fov_degrees = float(
-            rospy.get_param("~ideal_horizontal_fov_degrees", 110.0)
-        )
-        ideal_intrinsic_parameters(1, 1, self.ideal_horizontal_fov_degrees)
+        selected = Path(str(intrinsic_file).strip()) if str(intrinsic_file).strip() else None
+        if selected is not None and (not selected.is_absolute() or not selected.is_file()):
+            raise ValueError("intrinsic_file must be an explicit absolute input file")
+        self.use_camera_info = selected is None
         if selected is None:
             self.intrinsic_file = ""
             self.intrinsic_matrix = None
             self.intrinsic_distortion = None
             self.intrinsic_size = None
-            self.intrinsic_provenance = {"intrinsic_source": "ideal-pinhole", "distortion_model": "plumb_bob",
-                                         "ideal_horizontal_fov_degrees": self.ideal_horizontal_fov_degrees,
-                                         "assumption": "Assumed ideal pinhole; not measured camera intrinsics.", "intrinsic_file": ""}
+            self.intrinsic_provenance = {"intrinsic_source": "camera-info", "distortion_model": "plumb_bob"}
         else:
             self.intrinsic_file = selected
             intrinsic_document = load_intrinsic(self.intrinsic_file)
@@ -103,7 +99,7 @@ class RosCalibrationSource:
                 self.intrinsic_distortion,
                 self.intrinsic_size,
             ) = intrinsic_parameters(intrinsic_document)
-        self.image_topic = normalize_topic(rospy.get_param("~image_topic", "/usb_cam/image_raw"))
+        self.image_topic = normalize_topic(rospy.get_param("~image_topic", "/usb_cam/image_raw/compressed"))
         self.preview_image_topic = normalize_topic(
             rospy.get_param(
                 "~preview_image_topic", "/usb_cam/image_raw/compressed"
@@ -167,6 +163,7 @@ class RosCalibrationSource:
             self.snapshot_available = available
             if available:
                 self.source_size = size
+            self.ready_condition.notify_all()
 
     def _preview_callback(self, message):
         image_format = str(message.format).strip().lower()
@@ -193,6 +190,7 @@ class RosCalibrationSource:
             except ApiError:
                 self.source_size = None
             self.preview_stamp_sec = stamp_sec
+            self.ready_condition.notify_all()
 
     def _refresh_markers(self, _event):
         pattern = re.compile(r"^" + re.escape(self.pose_prefix) + r"/([^/]+)/pose$")
@@ -242,12 +240,6 @@ class RosCalibrationSource:
 
         return callback
 
-    def _convert_image(self, message):
-        try:
-            return image_message_to_bgr(message)
-        except (TypeError, ValueError, cv2.error) as error:
-            raise ApiError(409, "Could not convert camera image: {}".format(error)) from error
-
     @property
     def source_id(self):
         return self.snapshot_client.source_id if self.snapshot_client is not None else "ros:" + self.image_topic
@@ -272,12 +264,13 @@ class RosCalibrationSource:
                 "preview_image_topic": self.preview_image_topic,
                 "intrinsic_file": str(self.intrinsic_file),
                 "intrinsic_source": (
-                    "ideal-pinhole" if self.use_ideal_intrinsics else "selected-file"
+                    "camera-info" if self.use_camera_info else "selected-file"
                 ),
                 "pose_prefix": self.pose_prefix,
                 "image_ready": preview_ready,
                 "preview_ready": preview_ready,
-                "intrinsic_ready": True,
+                "intrinsic_ready": not self.use_camera_info or self.camera_info is not None,
+                "camera_info_topic": self.camera_info_topic,
                 "marker_count": len(marker_names),
                 "marker_names": marker_names,
                 "latest_image_stamp_sec": self.preview_stamp_sec,
@@ -303,29 +296,43 @@ class RosCalibrationSource:
                 parent_frame,
             )
         try:
-            image_message = rospy.wait_for_message(
-                self.image_topic,
-                Image,
-                timeout=self.freeze_image_timeout,
-            )
+            image_message = rospy.wait_for_message(self.image_topic, CompressedImage,
+                                                  timeout=self.freeze_image_timeout)
         except rospy.ROSException as error:
-            raise ApiError(
-                503,
-                "No raw camera image arrived within {:.3f}s".format(
-                    self.freeze_image_timeout
-                ),
-            ) from error
-        image_stamp = image_message.header.stamp
-        if image_stamp.is_zero():
-            image_stamp = rospy.Time.now()
-        stamp_sec = float(image_stamp.to_sec())
-        image = self._convert_image(image_message)
-        return self._frame_snapshot(
-            image,
-            stamp_sec,
-            image_message.header.frame_id,
-            parent_frame,
-        )
+            raise ApiError(503, "No compressed camera image arrived within {:.3f}s".format(
+                self.freeze_image_timeout)) from error
+        image = cv2.imdecode(np.frombuffer(bytes(image_message.data), dtype=np.uint8), cv2.IMREAD_COLOR)
+        if image is None:
+            raise ApiError(409, "Could not decode compressed camera image")
+        return self._frame_snapshot(image, float(image_message.header.stamp.to_sec()),
+                                    image_message.header.frame_id, parent_frame)
+
+    def _camera_info_callback(self, message):
+        matrix = np.asarray(message.K, dtype=np.float64).reshape(3, 3)
+        distortion = np.asarray(message.D, dtype=np.float64)
+        if (message.width <= 0 or message.height <= 0 or not message.header.frame_id
+                or message.header.frame_id != self.optical_frame
+                or message.distortion_model != "plumb_bob" or distortion.size < 4
+                or not np.all(np.isfinite(matrix)) or not np.all(np.isfinite(distortion))
+                or matrix[0, 0] <= 0 or matrix[1, 1] <= 0):
+            return
+        with self.ready_condition:
+            self.camera_info = (matrix, distortion, (message.width, message.height), message.header.frame_id)
+            self.ready_condition.notify_all()
+
+    def wait_ready(self, timeout):
+        with self.ready_condition:
+            self.ready_condition.wait_for(lambda: self._readiness_stopping or
+                ((self.snapshot_available or self.preview_jpeg is not None)
+                 and (not self.use_camera_info or self.camera_info is not None)), timeout)
+            return (not self._readiness_stopping
+                    and (self.snapshot_available or self.preview_jpeg is not None)
+                    and (not self.use_camera_info or self.camera_info is not None))
+
+    def stop_readiness(self):
+        with self.ready_condition:
+            self._readiness_stopping = True
+            self.ready_condition.notify_all()
 
     def _frame_snapshot(
         self,
@@ -335,6 +342,8 @@ class RosCalibrationSource:
         parent_frame,
     ):
         context = self._observation_context(int(image.shape[1]), int(image.shape[0]), parent_frame)
+        if frame_id != self.optical_frame:
+            raise ApiError(409, "Image and CameraInfo optical frames differ")
         return FrameSnapshot(image=image, stamp_sec=stamp_sec, frame_id=frame_id,
                              camera_matrix=context["camera_matrix"], distortion=context["distortion"],
                              markers=context["markers"], camera_model=context["camera_model"],
@@ -359,30 +368,23 @@ class RosCalibrationSource:
 
     def _observation_context(self, width, height, parent_frame, selected_marker=None):
         image_size = (width, height)
-        if self.use_ideal_intrinsics:
-            (
-                intrinsic_matrix,
-                intrinsic_distortion,
-                intrinsic_size,
-            ) = ideal_intrinsic_parameters(
-                image_size[0],
-                image_size[1],
-                self.ideal_horizontal_fov_degrees,
-            )
+        if self.use_camera_info:
+            with self.lock:
+                info = self.camera_info
+            if info is None:
+                raise ApiError(409, "No calibrated CameraInfo has arrived")
+            intrinsic_matrix, intrinsic_distortion, intrinsic_size, optical_frame = info
+            intrinsic_matrix, intrinsic_distortion = intrinsic_matrix.copy(), intrinsic_distortion.copy()
+            provenance_model = {"intrinsic_source": "camera-info", "distortion_model": "plumb_bob",
+                                "camera_info_topic": self.camera_info_topic, "frame_id": optical_frame}
         else:
             intrinsic_matrix = self.intrinsic_matrix.copy()
             intrinsic_distortion = self.intrinsic_distortion.copy()
             intrinsic_size = self.intrinsic_size
-        if not self.use_ideal_intrinsics and image_size != intrinsic_size:
-            raise ApiError(
-                409,
-                "Camera intrinsics are {}x{}, but the captured image is {}x{}".format(
-                    intrinsic_size[0],
-                    intrinsic_size[1],
-                    image_size[0],
-                    image_size[1],
-                ),
-            )
+            provenance_model = dict(self.intrinsic_provenance)
+        if image_size != intrinsic_size:
+            raise ApiError(409, "Camera intrinsics are {}x{}, but the captured image is {}x{}".format(
+                intrinsic_size[0], intrinsic_size[1], width, height))
         with self.lock:
             wall_now, ros_now = time.monotonic(), rospy.Time.now().to_sec()
             observations = {name: observation for name, observation in self.marker_latest.items()
@@ -414,7 +416,7 @@ class RosCalibrationSource:
                 ),
             )
         return {"camera_matrix": intrinsic_matrix, "distortion": intrinsic_distortion,
-                "markers": markers, "camera_model": dict(self.intrinsic_provenance),
+                "markers": markers, "camera_model": provenance_model,
                 "pose_coordinates": provenance}
 
 
@@ -425,17 +427,16 @@ def split_list_parameter(value):
 
 
 def main():
-    args = application_arguments(rospy.myargv()[1:], with_state_parameter=True)
+    args = application_arguments(rospy.myargv()[1:])
     rospy.init_node("xgc_camera_extrinsic_calibrator_web")
     runtime = None
     snapshot_client = None
-    preference_client = None
     source = None
     server = None
     try:
-        bootstrap = load_bootstrap_input(str(rospy.get_param("~bootstrap_input")), role="client")
+        target_id = str(rospy.get_param("~target_id"))
+        socket_path = str(rospy.get_param("~socket_path"))
         runtime = Runtime(blocking_workers=4, max_calls=16, max_connections=24)
-        preferences, preference_client = create_preferences(bootstrap, runtime=runtime)
         media_edge_rpc_socket = str(rospy.get_param("~media_edge_rpc_socket", "")).strip()
         snapshot_client = None
         if media_edge_rpc_socket:
@@ -444,7 +445,7 @@ def main():
                 rospy.get_param("~media_source_id", "usb_cam"),
                 float(rospy.get_param("~snapshot_timeout", 5.0)),
                 runtime=runtime,
-                local_target=bootstrap.binding.target_id,
+                local_target=target_id,
             )
             try:
                 snapshot_client.health()
@@ -458,12 +459,10 @@ def main():
                 )
         else:
             snapshot_available = False
-        calibration_root = str(rospy.get_param("~calibration_root")).strip()
         calibration_mode = str(rospy.get_param("~calibration_mode")).strip()
         camera_name = str(rospy.get_param("~camera_name")).strip()
         source = RosCalibrationSource(
             rospy.get_param("~intrinsic_file", ""),
-            calibration_root,
             calibration_mode,
             camera_name,
             snapshot_client=snapshot_client,
@@ -475,11 +474,10 @@ def main():
         web_root = Path(rospy.get_param("~web_root", str(package_root / "web" / "extrinsic")))
         service = CalibrationService(
             source,
-            calibration_root=calibration_root,
             calibration_mode=calibration_mode,
             camera_name=camera_name,
-            parent_frame=rospy.get_param("~parent_frame", "map"),
-            child_frame=rospy.get_param("~child_frame", "usb_cam_optical_frame"),
+            parent_frame=rospy.get_param("~parent_frame"),
+            child_frame=rospy.get_param("~child_frame"),
             ransac_threshold_px=float(rospy.get_param("~ransac_threshold_px", 3.0)),
             maximum_inlier_error_px=float(
                 rospy.get_param("~maximum_inlier_error_px", 10.0)
@@ -487,13 +485,10 @@ def main():
             jpeg_quality=int(rospy.get_param("~jpeg_quality", 80)),
             resolved_extrinsic_json=args.resolved_extrinsic_json,
             frame_roles_json=args.frame_roles_json,
-            application_state_reader=lambda: rospy.get_param(args.application_state_param, None),
         )
         frozen_offset = service.frozen_extrinsic["targetCoordinates"]["worldOffset"]
         if source.pose_coordinate_source == "unspecified" or list(source.pose_world_offset) != frozen_offset:
             raise ValueError("calibration sample coordinates must match the frozen camera context")
-        if not args.application_state_param.startswith("/"):
-            raise ValueError("application state parameter must be an absolute controlled name")
         bind_address = str(rospy.get_param("~bind_address", "127.0.0.1"))
         http_port = int(rospy.get_param("~http_port", 8765))
         if not 1 <= http_port <= 65535:
@@ -513,14 +508,14 @@ def main():
             ),
             logger=lambda message: rospy.logdebug("Web calibrator: %s", message),
             runtime=runtime,
-            binding=bootstrap.binding,
-            rpc_socket=rospy.get_param("~socket_path", None),
-            preferences=preferences,
+            target_id=target_id,
+            rpc_socket=socket_path,
         )
         server.start()
     except Exception as error:
         rospy.logfatal("Could not start camera extrinsic WebUI: %s", error)
         if source is not None:
+            source.info_subscriber.unregister()
             source.discovery_timer.shutdown()
             if source.snapshot_health_timer is not None:
                 source.snapshot_health_timer.shutdown()
@@ -528,8 +523,6 @@ def main():
             server.close()
         if snapshot_client is not None:
             snapshot_client.close()
-        if preference_client is not None:
-            preference_client.close()
         if runtime is not None:
             runtime.close()
         return 1
@@ -551,27 +544,18 @@ def main():
             source.intrinsic_file,
         )
     else:
-        rospy.loginfo(
-            "Camera extrinsic calibration uses a %.3f-degree ideal pinhole at "
-            "the captured image geometry until a timestamped intrinsic YAML is selected",
-            source.ideal_horizontal_fov_degrees,
-        )
-    rospy.loginfo(
-        "Camera extrinsic results will be saved under %s (%s/%s)",
-        calibration_root,
-        calibration_mode,
-        camera_name,
-    )
+        rospy.loginfo("Camera extrinsic calibration consumes CameraInfo on %s", source.camera_info_topic)
+    rospy.loginfo("Camera extrinsic results are available to Core at /v1/result for %s", camera_name)
     try:
         rospy.spin()
     finally:
+        source.info_subscriber.unregister()
         source.discovery_timer.shutdown()
         if source.snapshot_health_timer is not None:
             source.snapshot_health_timer.shutdown()
         server.close()
         if snapshot_client is not None:
             snapshot_client.close()
-        preference_client.close()
         runtime.close()
     return 0
 

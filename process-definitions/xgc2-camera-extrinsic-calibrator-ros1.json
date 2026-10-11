@@ -5,15 +5,14 @@
       "id": "xgc2-camera-extrinsic-calibrator-ros1",
       "version": "3.0.0",
       "label": "XGC2 camera extrinsic calibration WebUI",
-      "description": "Use the explicitly selected intrinsic YAML with one immutable camera frame and the latest poses of static markers, solve robust PnP, and persist parent_T_camera_optical.",
+      "description": "Consume compressed ROS images or capture and CameraInfo or an explicit intrinsic YAML, solve robust PnP, and expose parent_T_camera_optical with residuals at GET /v1/result for Core to commit.",
       "parameters": {
         "groups": [
           {
-            "id": "calibration-storage",
-            "label": "Calibration Storage",
+            "id": "camera-context",
+            "label": "Camera context",
             "collapsed": true,
             "parameters": [
-              "calibrationRoot",
               "calibrationMode",
               "cameraName"
             ]
@@ -31,7 +30,8 @@
         "properties": {
           "imageTopic": {
             "type": "string",
-            "default": "/usb_cam/image_raw"
+            "default": "/usb_cam/image_raw/compressed",
+            "description": "CompressedImage topic from camera:<id>; capture or this topic supplies immutable frames."
           },
           "previewImageTopic": {
             "type": "string",
@@ -48,7 +48,8 @@
           },
           "mediaSourceId": {
             "type": "string",
-            "default": "usb_cam"
+            "default": "usb_cam",
+            "description": "Source identity from the per-camera media:<id> facts; capture consumes this source."
           },
           "snapshotTimeout": {
             "type": "number",
@@ -74,11 +75,6 @@
             "default": "",
             "description": "Comma-separated UAV/UGV names allowed as pose markers; empty discovers all markers under posePrefix."
           },
-          "calibrationRoot": {
-            "type": "string",
-            "description": "Absolute storage root. Results are stored under <root>/<sim|phy>/<cameraName>/.",
-            "x-xgc-path-kind": "directory"
-          },
           "calibrationMode": {
             "type": "string",
             "default": "sim",
@@ -86,20 +82,20 @@
               "sim",
               "phy"
             ],
-            "description": "Explicit persistence partition selected by the Experiment run mode."
+            "description": "Camera calibration origin supplied by the Experiment run mode."
           },
           "cameraName": {
             "type": "string",
             "default": "usb_cam",
-            "description": "Stable camera identity and directory name; independent from the Media Edge source ID."
+            "description": "Stable camera identity from camera:<id>; independent of ROS frame names."
           },
           "parentFrame": {
             "type": "string",
-            "default": "map"
+            "description": "Exact frame id from camera:<id> in the session registry."
           },
           "opticalFrame": {
             "type": "string",
-            "default": "usb_cam_optical_frame"
+            "description": "Exact frame id from camera:<id> in the session registry."
           },
           "maximumErrorPx": {
             "type": "number",
@@ -150,42 +146,41 @@
           },
           "frameRolesJson": {
             "type": "string",
-            "default": "{\"parentFrame\":\"world\",\"opticalFrames\":{\"sim\":\"xgc_world_camera_optical_frame\",\"phy\":\"usb_cam_optical_frame\"}}"
-          },
-          "applicationStateParam": {
-            "type": "string",
-            "description": "Exact TF publisher state parameter for this owned camera provider."
+            "description": "Exact parent and optical frame roles from the camera fragment."
           },
           "mediaEdgeRPCSocket": {
             "type": "string",
-            "description": "Unix endpoint from the ready target-local Media Edge ServiceRef.",
+            "description": "Private Unix endpoint from media:<id> in the session registry.",
             "default": ""
-          },
-          "bootstrapInput": {
-            "type": "string",
-            "fixedOnly": true,
-            "sensitive": true,
-            "x-xgc-path-kind": "file",
-            "description": "Private deployment BootstrapInput bound to the ready preferences storage."
           },
           "socketPath": {
             "type": "string",
             "fixedOnly": true,
-            "description": "Deployment-owned private calibration RPC endpoint."
+            "description": "Product-owned private calibration endpoint allocated by Core; GET /v1/result exposes the computed candidate."
+          },
+          "targetId": {
+            "type": "string",
+            "fixedOnly": true,
+            "description": "Core target identity for local service discovery; supplied by the registry."
+          },
+          "cameraInfoTopic": {
+            "type": "string",
+            "default": "/usb_cam/camera_info",
+            "description": "CameraInfo topic from camera:<id>; used when intrinsicFile is empty."
           }
         },
         "required": [
           "resolvedExtrinsicJson",
-          "applicationStateParam",
-          "bootstrapInput",
-          "socketPath"
+          "socketPath",
+          "targetId",
+          "parentFrame",
+          "opticalFrame",
+          "frameRolesJson"
         ]
       },
       "command": {
         "executable": "/opt/ros/noetic/lib/xgc_camera_calibration/extrinsic_calibrator_web.py",
         "args": [
-          "--application-state-param",
-          "${applicationStateParam}",
           "--resolved-extrinsic-json",
           "${resolvedExtrinsicJson}",
           "--frame-roles-json",
@@ -200,7 +195,6 @@
           "_pose_prefix:=${posePrefix}",
           "_pose_coordinate_source:=${poseCoordinateSource}",
           "_trackers:=${trackers}",
-          "_calibration_root:=${calibrationRoot}",
           "_calibration_mode:=${calibrationMode}",
           "_camera_name:=${cameraName}",
           "_parent_frame:=${parentFrame}",
@@ -213,7 +207,8 @@
           "_frame_ancestors:=${frameAncestors}",
           "_allowed_origins:=${allowedOrigins}",
           "_socket_path:=${socketPath}",
-          "_bootstrap_input:=${bootstrapInput}"
+          "_target_id:=${targetId}",
+          "_camera_info_topic:=${cameraInfoTopic}"
         ],
         "env": {
           "ROS_MASTER_URI": "${rosMasterUri}",

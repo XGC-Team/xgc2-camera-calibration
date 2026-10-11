@@ -8,8 +8,7 @@ let displayedImageSequence = 0;
 let pendingImageSequence = 0;
 let imageRefreshInFlight = false;
 let displayedImageUrl = "";
-let currentCandidateId = "";
-let savedCandidateId = "";
+let reviewedCandidateId = "";
 
 async function postJSON(path, body) {
   try {
@@ -68,8 +67,6 @@ function renderResult(result, phase) {
     lines.push(quality.status === "save_ready"
       ? "candidate: independent stability checks passed"
       : `candidate: ${quality.status || "review required"}`);
-  } else if (phase === "saved") {
-    lines.push(`saved: ${result.output_file}`);
   }
   box.textContent = lines.join("\n");
   box.hidden = false;
@@ -129,8 +126,7 @@ function applyState(s) {
   if (solveJob && solveJob.status === "failed") setStatus(solveJob.error || "Calibration failed; samples retained.");
   const phase = s.phase;
   const candidate = phase === "candidate_ready" ? s.candidate : null;
-  currentCandidateId = candidate && candidate.candidate_id || "";
-  savedCandidateId = phase === "saved" ? s.saved_candidate_id || "" : "";
+  reviewedCandidateId = candidate?.candidate_id || "";
   el("conn").textContent = "connected";
   el("conn").className = "legacy-state-source pill pill-on";
   el("samples").textContent = solveJob && solveJob.status === "running"
@@ -139,19 +135,18 @@ function applyState(s) {
 
   const poolCount = Number(s.candidate_pool && s.candidate_pool.count) || 0;
   el("btn-candidate").disabled = autoRunning || phase !== "collecting" || poolCount < 3;
-  el("btn-save").disabled = autoRunning || phase !== "candidate_ready"
-    || !candidate || !candidate.quality || candidate.quality.status !== "save_ready";
   el("btn-continue").disabled = autoRunning || phase !== "candidate_ready";
   el("btn-reset").disabled = autoRunning;
   const application = s.metadata_application || {};
-  el("btn-apply-metadata").disabled = autoRunning || !savedCandidateId || !application.available
-    || application.attempted_candidate_id === savedCandidateId;
+  el("btn-apply-metadata").disabled = autoRunning || !reviewedCandidateId
+    || candidate?.quality?.status !== "save_ready" || !application.available
+    || application.attempted_candidate_id === reviewedCandidateId;
   el("metadata-application").textContent = application.receipt
     ? `CameraInfo estimates published · revision ${application.receipt.published_calibration_revision}`
     : application.available
-      ? "Apply saved estimates to CameraInfo. Native optical/capture truth remains source-owned."
+      ? "Apply reviewed estimates to CameraInfo. Native optical/capture truth remains source-owned."
       : "Source-owned CameraInfo metadata application is unavailable.";
-  renderResult(phase === "saved" ? s.result : candidate, phase);
+  renderResult(candidate, phase);
   renderPose(s.pose);
   renderDetection(s.detection, s.board);
   queueImageRefresh(s.detection, s.image_ready);
@@ -224,17 +219,10 @@ function wireButtons() {
         : "Candidate needs more diverse observations.");
     poll();
   });
-  el("btn-save").addEventListener("click", async () => {
-    if (!currentCandidateId) return;
-    setStatus("Saving the validated candidate…");
-    const r = await postJSON("api/v1/intrinsic/save", { candidate_id: currentCandidateId });
-    setStatus(r.ok === false ? (r.error || "Save failed.") : "Calibration saved.");
-    poll();
-  });
   el("btn-apply-metadata").addEventListener("click", async () => {
-    if (!savedCandidateId) return;
+    if (!reviewedCandidateId) return;
     el("btn-apply-metadata").disabled = true;
-    const r = await postJSON("api/v1/intrinsic/apply-metadata", { candidate_id: savedCandidateId });
+    const r = await postJSON("api/v1/intrinsic/apply-metadata", { candidate_id: reviewedCandidateId });
     setStatus(r.ok === false ? r.error || "CameraInfo publication was not confirmed."
       : `CameraInfo estimates published · revision ${r.published_calibration_revision}`);
     poll();

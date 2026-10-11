@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import mimetypes
+import os
 import threading
 import uuid
 from dataclasses import asdict, dataclass, field, replace
@@ -23,17 +24,14 @@ import numpy as np
 from xgc_camera_calibration.solver import (
     CalibrationError,
     ExtrinsicResult,
-    extrinsic_calibration_directory,
-    save_extrinsic,
+    result_document,
     solve_extrinsic,
-    versioned_extrinsic_path,
 )
 
 
 from xgc_camera_calibration.extrinsic_samples import ApiError, SampleCollection, IMAGE_BYTES, IMAGE_PATH
-from xgc_camera_calibration.extrinsic_application import SavedExtrinsicApplication, parse_frame_roles
+from xgc_camera_calibration.extrinsic_application import parse_frame_roles
 from xgc_camera_calibration.extrinsic_resolver import decode_frozen
-from xgc_camera_calibration.extrinsic_selection import SelectionConflict, read_version
 
 
 @dataclass(frozen=True)
@@ -173,7 +171,6 @@ class CalibrationService:
         self,
         source: Any,
         *,
-        calibration_root: str,
         calibration_mode: str,
         camera_name: str,
         parent_frame: str,
@@ -183,7 +180,6 @@ class CalibrationService:
         jpeg_quality: int = 80,
         resolved_extrinsic_json: Optional[str] = None,
         frame_roles_json: Optional[str] = None,
-        application_state_reader: Optional[Callable] = None,
     ):
         if not parent_frame or not child_frame:
             raise ValueError("parent_frame and child_frame must not be empty")
@@ -192,26 +188,14 @@ class CalibrationService:
         self.source = source
         self.frozen_extrinsic = None
         self.frame_roles = None
-        self.application = None
-        self._application_factory = None
         if resolved_extrinsic_json is not None:
             self.frame_roles = parse_frame_roles(frame_roles_json)
             self.frozen_extrinsic = decode_frozen(resolved_extrinsic_json, camera_name, self.frame_roles)
             if (parent_frame != self.frame_roles["parentFrame"]
                     or child_frame != self.frame_roles["opticalFrames"].get(calibration_mode)):
                 raise ValueError("calibrator frames do not match the controlled camera roles")
-            if application_state_reader is None:
-                raise ValueError("the exact camera publisher state reader is required")
-            self._application_factory = lambda: SavedExtrinsicApplication(
-                calibration_root, camera_name, resolved_extrinsic_json, self.frame_roles,
-                application_state_reader)
-            self.application = self._application_factory()
-        self.output_directory = extrinsic_calibration_directory(
-            calibration_root, calibration_mode, camera_name
-        )
         self.calibration_mode = str(calibration_mode).strip()
         self.camera_name = str(camera_name).strip()
-        self.output_file: Optional[str] = None
         self.parent_frame = parent_frame
         self.child_frame = child_frame
         self.ransac_threshold_px = float(ransac_threshold_px)
@@ -224,30 +208,16 @@ class CalibrationService:
         self.result: Optional[ExtrinsicResult] = None
         self.result_payload: Optional[Dict[str, Any]] = None
         self.candidate_id: Optional[str] = None
-        self.saved_candidate_id: Optional[str] = None
         self.candidate_points: Optional[Sequence[Dict[str, Any]]] = None
-        self.result_restored = False
-        self._pending_output_file: Optional[Tuple[str, Path]] = None
-        self.recovery_error: Optional[str] = None
         self.candidate_metadata = None
         self.samples = SampleCollection(source, parent_frame, self.lock, self._samples_changed)
-        try:
-            self._restore_selected_result()
-        except Exception as error:
-            self.recovery_error = str(error)
 
     def _samples_changed(self) -> None:
         self.result = None
         self.result_payload = None
         self.candidate_id = None
-        self.saved_candidate_id = None
         self.candidate_points = None
         self.candidate_metadata = None
-        self.result_restored = False
-        self._pending_output_file = None
-        self.recovery_error = None
-        self.output_file = None
-        self.application = self._application_factory() if self._application_factory else None
 
     def begin_sample(self, request):
         return self.samples.begin(request)
@@ -260,61 +230,24 @@ class CalibrationService:
         self.samples.mutate(action, request)
         return self.state()
 
-    def _restore_selected_result(self) -> None:
-        # Restore the exact frozen version only. A new global application or an
-        # old mode-specific pointer cannot retarget this running calibration UI.
-        if self.frozen_extrinsic is None or "result" not in self.frozen_extrinsic:
-            return
-        ref = self.frozen_extrinsic["result"]
-        document = read_version(str(self.output_directory.parents[1]), self.camera_name,
-                                ref, self.frame_roles)
-        output_file = self.output_directory.parents[1] / ref["sourceMode"] / self.camera_name / ref["fileName"]
-        metadata = document.get("metadata", {})
-        if not isinstance(metadata, Mapping):
-            raise CalibrationError("selected extrinsic metadata must be an object")
-        points = document.get("points", [])
-        if not isinstance(points, list):
-            raise CalibrationError("selected extrinsic points must be an array")
-        inliers = document.get("inlier_indices", [])
-        warnings = document.get("warnings", [])
-        if not isinstance(inliers, list) or not isinstance(warnings, list):
-            raise CalibrationError("selected extrinsic diagnostics are invalid")
-        candidate_id = str(metadata.get("candidate_id", ""))
-        if not candidate_id:
-            raise CalibrationError("selected result has no calibration candidate identity")
-        self.output_file = str(output_file)
-        self.candidate_id = candidate_id
-        self.saved_candidate_id = candidate_id
-        self.candidate_points = list(points)
-        self.result_payload = {
-            "candidate_id": candidate_id,
-            "saved": True,
-            "translation": list(self.frozen_extrinsic["resolvedOpticalPose"]["translation"]),
-            "quaternion_xyzw": [
-                float(value) for value in document["quaternion_xyzw_array"]
-            ],
-            "mean_reprojection_error_px": float(
-                document.get("mean_reprojection_error_px", 0.0)
-            ),
-            "max_reprojection_error_px": float(
-                document.get("max_reprojection_error_px", 0.0)
-            ),
-            "inlier_indices": [int(value) for value in inliers],
-            "warnings": [str(value) for value in warnings],
-            "projections": [],
-            "points": list(points),
-            "camera_model": metadata.get("camera_model"),
-            "output_file": str(output_file),
-            "save_blocked": None,
-            "selection_file": str(
-                self.output_directory.parents[1]
-                / "selections" / self.camera_name
-                / "extrinsic.json"
-            ),
-        }
-        if metadata.get("candidate_id") != candidate_id:
-            raise CalibrationError("selected extrinsic candidate identity is invalid")
-        self.result_restored = True
+    def wait_ready(self, timeout):
+        return self.source.wait_ready(timeout)
+
+    def stop_readiness(self):
+        self.source.stop_readiness()
+
+    def read_result(self):
+        with self.lock:
+            if self.result is None:
+                return None
+            document = result_document(self.result, calibration_mode=self.calibration_mode,
+                camera_name=self.camera_name, parent_frame=self.parent_frame, child_frame=self.child_frame,
+                points=self.candidate_points, metadata={**self.candidate_metadata, "candidate_id": self.candidate_id})
+            document.pop("created_at")
+            document.update(sample_count=len(self.candidate_points),
+                            inlier_count=len(self.result.inlier_indices),
+                            reprojection_errors_px=self.result.reprojection_errors_px.tolist())
+            return json.loads(json.dumps({"candidate_id": self.candidate_id, "document": document}, allow_nan=False))
 
     def _encode_jpeg(self, image: np.ndarray) -> bytes:
         ok, encoded = cv2.imencode(
@@ -329,23 +262,14 @@ class CalibrationService:
         with self.lock:
             frozen = self.frozen
             result = self.result_payload
-            if result is not None and self.application is not None and self.application.request is not None:
-                try:
-                    result = {**result, "application": self.application.status()}
-                except (OSError, ValueError, CalibrationError) as error:
-                    result = {**result, "application": {"status": "unavailable", "error": str(error)}}
             payload: Dict[str, Any] = {
                 **self.samples.state(),
                 "mode": "frozen" if frozen is not None else "live",
                 "generation": self.generation,
-                "output_file": self.output_file,
-                "saved_candidate_id": self.saved_candidate_id,
                 "calibration_mode": self.calibration_mode,
                 "camera_name": self.camera_name,
                 "parent_frame": self.parent_frame,
                 "child_frame": self.child_frame,
-                "result_restored": self.result_restored,
-                "recovery_error": self.recovery_error,
                 "source": {**source_state, "source_id": self.source.source_id},
                 "result": result,
             }
@@ -390,8 +314,8 @@ class CalibrationService:
                 HTTPStatus.CONFLICT,
                 "No pose marker is available",
             )
-        # Copy mutable source buffers and capture model identity once. Save and
-        # subsequent status changes cannot replace evidence of the frozen solve.
+        # Copy mutable source buffers and capture model identity once. Later
+        # status changes cannot replace evidence of the frozen solve.
         model = json.loads(json.dumps(dict(snapshot.camera_model), allow_nan=False))
         model.update({"camera_matrix": intrinsic.reshape(-1).tolist(),
                       "distortion": np.asarray(snapshot.distortion).reshape(-1).tolist(),
@@ -451,7 +375,7 @@ class CalibrationService:
                 raise ApiError(HTTPStatus.UNPROCESSABLE_ENTITY, str(error)) from error
 
             inliers = set(map(int, result.inlier_indices))
-            persisted_points = [dict(point, inlier=index in inliers,
+            observed_points = [dict(point, inlier=index in inliers,
                 reprojection_error_px=float(result.reprojection_errors_px[index]))
                 for index, point in enumerate(points)]
             payload = _result_payload(result, [point["sample_id"] for point in points],
@@ -460,14 +384,14 @@ class CalibrationService:
             for projection in payload["projections"]:
                 identity = projection.pop("marker")
                 projection.update(sample_id=identity, marker=by_id[identity]["marker"])
-            payload.update(points=persisted_points, camera_model=model, pose_coordinates=coordinates,
+            payload.update(points=observed_points, camera_model=model, pose_coordinates=coordinates,
                            dataset_revision=self.samples.revision)
             candidate_document = {
                 "sampling_session_id": self.samples.session_id,
                 "dataset_revision": self.samples.revision,
                 "camera_model": model,
                 "pose_coordinates": coordinates,
-                "points": persisted_points,
+                "points": observed_points,
                 "translation": payload["translation"],
                 "quaternion_xyzw": payload["quaternion_xyzw"],
                 "parent_frame": self.parent_frame,
@@ -478,115 +402,17 @@ class CalibrationService:
             ).encode("utf-8")
             candidate_id = "extrinsic-candidate-{}".format(hashlib.sha256(encoded).hexdigest())
             payload["candidate_id"] = candidate_id
-            payload["saved"] = False
-            payload["output_file"] = None
-            payload["save_blocked"] = "explicit_save_required"
-            self.output_file = None
+            payload["commit_owner"] = "core"
             self.result = result
             self.result_payload = payload
             self.candidate_id = candidate_id
-            self.saved_candidate_id = None
-            self.candidate_points = persisted_points
+            self.candidate_points = observed_points
             self.candidate_metadata = json.loads(json.dumps({
                 "camera_model": model, "pose_coordinates": coordinates,
                 "sampling_session_id": self.samples.session_id, "dataset_revision": self.samples.revision,
                 "image_topic": self.source.image_topic, "pose_prefix": self.source.pose_prefix,
             }, allow_nan=False))
-            if (
-                self._pending_output_file is not None
-                and self._pending_output_file[0] != candidate_id
-            ):
-                self._pending_output_file = None
             return payload
-
-    def save(self, candidate_id: str) -> Dict[str, Any]:
-        identity = str(candidate_id).strip()
-        if not identity:
-            raise ApiError(HTTPStatus.BAD_REQUEST, "candidate_id must not be empty")
-        with self.lock:
-            if self.saved_candidate_id is not None:
-                if identity == self.saved_candidate_id and self.result_payload is not None:
-                    if not self.result_restored:
-                        self._stage_saved_result(identity)
-                    return dict(self.result_payload)
-                raise ApiError(HTTPStatus.CONFLICT, "A different extrinsic candidate is already saved")
-            if self.result is None or self.result_payload is None or self.candidate_points is None:
-                raise ApiError(HTTPStatus.CONFLICT, "No extrinsic candidate is ready")
-            if identity != self.candidate_id:
-                raise ApiError(
-                    HTTPStatus.CONFLICT,
-                    "Extrinsic candidate changed; solve the current samples again",
-                    details={"expected_candidate_id": self.candidate_id},
-                )
-            metadata = self.candidate_metadata
-            if metadata is None or metadata["dataset_revision"] != self.samples.revision:
-                raise ApiError(HTTPStatus.CONFLICT, "Candidate samples are unavailable")
-            if self.frozen_extrinsic is not None:
-                coordinates = metadata.get("pose_coordinates", {})
-                target = self.frozen_extrinsic["targetCoordinates"]
-                if (coordinates.get("kind") != "experiment-world"
-                        or coordinates.get("frame") != target["frame"]
-                        or list(coordinates.get("world_offset", [])) != target["worldOffset"]):
-                    raise ApiError(HTTPStatus.CONFLICT, "Sample coordinates do not match the frozen camera context")
-            try:
-                pending = self._pending_output_file
-                output_file = pending[1] if pending is not None and pending[0] == identity else None
-                if output_file is None:
-                    output_file = versioned_extrinsic_path(self.output_directory)
-                    save_extrinsic(
-                        output_file,
-                        self.result,
-                        calibration_mode=self.calibration_mode,
-                        camera_name=self.camera_name,
-                        parent_frame=self.parent_frame,
-                        child_frame=self.child_frame,
-                        points=self.candidate_points,
-                        metadata={
-                            **metadata,
-                            "candidate_id": identity,
-                            "intrinsic_file": metadata["camera_model"].get("intrinsic_file", ""),
-                            "image_width": metadata["camera_model"]["image_width"],
-                            "image_height": metadata["camera_model"]["image_height"],
-                            "web_calibrator": True,
-                        },
-                    )
-                    self._pending_output_file = (identity, output_file)
-            except (OSError, ValueError, CalibrationError) as error:
-                raise ApiError(
-                    HTTPStatus.INTERNAL_SERVER_ERROR,
-                    "Could not save calibration result: {}".format(error),
-                ) from error
-            self.output_file = str(output_file)
-            self.saved_candidate_id = identity
-            self.result_payload = {
-                **self.result_payload,
-                "saved": True,
-                "output_file": self.output_file,
-                "selection_file": str(self.output_directory.parents[1] / "selections" / self.camera_name / "extrinsic.json") if self.application else None,
-                "save_blocked": None,
-            }
-            self.result_restored = False
-            self._pending_output_file = None
-            self.recovery_error = None
-            self._stage_saved_result(identity)
-            return dict(self.result_payload)
-
-    def _stage_saved_result(self, identity):
-        if self.application is None:
-            # Library-only capture sessions may save immutable results, but
-            # cannot claim that any producer has applied them.
-            self.result_payload["application"] = {"status": "unavailable"}
-            return
-        try:
-            self.result_payload["application"] = self.application.stage(
-                Path(self.output_file), self.calibration_mode, identity)
-        except SelectionConflict as error:
-            self.result_payload["application"] = {"status": "conflict"}
-            raise ApiError(HTTPStatus.CONFLICT, "Camera application was superseded") from error
-        except (OSError, ValueError, CalibrationError) as error:
-            self.result_payload["application"] = {"status": "unavailable"}
-            raise ApiError(HTTPStatus.SERVICE_UNAVAILABLE,
-                "Calibration is saved; application is unavailable: {}".format(error)) from error
 
 
 _RESPONSE_STARTED = "calibration.response_started"
@@ -595,7 +421,7 @@ _RESPONSE_STARTED = "calibration.response_started"
 class CalibrationHttpServer:
     """Public aiohttp adapter owned by one explicit XRPC runtime.
 
-    ROS, locks, codecs, solver and persistence run in the runtime's fixed
+    ROS, locks, codecs, solver and evidence I/O run in the runtime's fixed
     blocking pool. Disconnecting a caller never releases a still-running job.
     """
 
@@ -608,7 +434,7 @@ class CalibrationHttpServer:
     def __init__(self, address, service, web_root, *, frame_ancestors,
                  allowed_origins=(), logger=None, intrinsic_service=None,
                  runtime=None, limits=None, upload_timeout=30.0, rpc_socket=None, target_id=None,
-                 validation_workers=2, preferences=None, binding=None):
+                 validation_workers=2):
         if service is None and intrinsic_service is None:
             raise ValueError("at least one of service / intrinsic_service is required")
         root = Path(web_root).resolve()
@@ -618,7 +444,6 @@ class CalibrationHttpServer:
         if "\r" in frame_ancestors or "\n" in frame_ancestors:
             raise ValueError("frame_ancestors must not contain newlines")
         self.service, self.intrinsic_service = service, intrinsic_service
-        self.preferences = preferences
         self.web_root = root
         self.frame_ancestors = frame_ancestors.strip() or "'self'"
         self.allowed_origins = frozenset(allowed_origins)
@@ -629,21 +454,9 @@ class CalibrationHttpServer:
         self.limits = limits or Limits(connections=16, in_flight=8,
             body_bytes=IMAGE_BYTES, response_bytes=1 << 30, call_timeout=3600.0)
         private_reference = None
-        if binding is not None:
-            if target_id is not None:
-                raise ValueError("Bootstrap binding supplies the calibration target identity")
-            private_reference = binding.service_ref(uuid.uuid4().hex)
-            if (private_reference.service != "xgc2.calibration.v1.Calibration"
-                    or private_reference.api_version != "1" or private_reference.profile != "http.v1"
-                    or private_reference.endpoint.kind != "unix"):
-                raise ValueError("A private calibration service binding is required")
-            if rpc_socket is not None:
-                if str(rpc_socket) == "/" or str(rpc_socket).startswith("//") or "\x00" in str(rpc_socket):
-                    raise ValueError("A private canonical Unix socket path is required")
-                private_reference = replace(private_reference,
-                    endpoint=Endpoint("unix", str(rpc_socket))).validate()
-            rpc_socket = private_reference.endpoint.address
-        elif rpc_socket is not None:
+        if rpc_socket is not None:
+            if str(rpc_socket) == "/" or str(rpc_socket).startswith("//") or "\x00" in str(rpc_socket):
+                raise ValueError("A private canonical Unix socket path is required")
             private_reference = ServiceRef(target_id, "xgc2.calibration.v1.Calibration", "1",
                 uuid.uuid4().hex, "http.v1", Endpoint("unix", str(rpc_socket))).validate()
         self.runtime = runtime or Runtime(blocking_workers=4, max_calls=8,
@@ -663,7 +476,7 @@ class CalibrationHttpServer:
             self.private_host = Host(str(rpc_socket), routes, runtime=self.runtime,
                 instance_id=self.service_ref.instance_id, discovery_routes=("/v1/describe",),
                 limits=Limits(connections=8, in_flight=4, body_bytes=128 * 1024,
-                              response_bytes=8 << 20, call_timeout=30.0))
+                              response_bytes=8 << 20, call_timeout=35.0))
         if intrinsic_service is not None and hasattr(intrinsic_service, "attach_work_runtime"):
             intrinsic_service.attach_work_runtime(self.runtime, self.host, validation_workers=validation_workers)
 
@@ -690,24 +503,32 @@ class CalibrationHttpServer:
             if value not in ({}, None):
                 raise ApiError(400, "State/action request must be an empty object")
             return ()
-        def candidate(value):
-            if not isinstance(value, dict) or set(value) != {"candidate_id"} or not isinstance(value["candidate_id"], str) or not value["candidate_id"].strip():
-                raise ApiError(400, "Save requires only a non-empty candidate_id")
-            return (value["candidate_id"].strip(),)
         if self.service is not None:
             routes[("GET", "/api/v1/state")] = adapt(self.service.state, empty)
             routes[("POST", "/api/v1/solve")] = adapt(self.service.solve, lambda value: (value,))
-            routes[("POST", "/api/v1/save")] = adapt(self.service.save, candidate)
         if self.intrinsic_service is not None:
             routes[("GET", "/api/v1/intrinsic/state")] = adapt(self.intrinsic_service.state, empty)
-            for path, method, status in (("candidate", "start_candidate", 202), ("save", "save", 200)):
-                if hasattr(self.intrinsic_service, method):
-                    routes[("POST", "/api/v1/intrinsic/" + path)] = adapt(
-                        getattr(self.intrinsic_service, method), candidate if path == "save" else empty, status)
-        def describe(context, value):
+            routes[("POST", "/api/v1/intrinsic/candidate")] = adapt(self.intrinsic_service.start_candidate, empty, 202)
+        domain = self.intrinsic_service or self.service
+        kind = "intrinsic" if self.intrinsic_service is not None else "extrinsic"
+        def read_result(context, value):
+            if self._stopping:
+                raise Fault("unavailable", "Calibration application is draining", 503)
+            if value not in ({}, None):
+                raise Fault("invalid_argument", "Result reads require an empty body", 400)
+            if context.query:
+                raise Fault("invalid_argument", "Result reads do not accept query arguments", 400)
+            result = domain.read_result()
+            revision = hashlib.sha256(json.dumps(result, sort_keys=True, separators=(",", ":"),
+                                                 allow_nan=False).encode()).hexdigest()
+            return {"kind": kind, "camera_id": domain.camera_name,
+                    "calibration_mode": domain.calibration_mode, "revision": revision, "result": result}
+        routes[("GET", "/v1/result")] = read_result
+        async def describe(context, value):
             if self._stopping:
                 raise Fault("unavailable", "Calibration application is draining", 503)
             empty(value)
+            wait_ms = 0
             if context.query:
                 query = parse_qs(context.query, keep_blank_values=True)
                 wait = query.get("wait_ready_ms", [])
@@ -715,12 +536,16 @@ class CalibrationHttpServer:
                         or len(wait[0]) > 5 or not wait[0].isascii() or not wait[0].isdigit()
                         or int(wait[0]) > 30000):
                     raise Fault("invalid_argument", "wait_ready_ms must be in [0, 30000]", 400)
+                wait_ms = int(wait[0])
+            ready = await self.runtime.blocking(self.private_host, domain.wait_ready, wait_ms / 1000.0)
             capabilities = {"intrinsic": self.intrinsic_service is not None, "extrinsic": self.service is not None}
-            # Admission starts after domain initialization, so readiness waits can complete immediately.
             return {"service": self.service_ref.service, "api_version": self.service_ref.api_version,
-                "instance_id": self.service_ref.instance_id, "ready": True,
-                "facts": {"capabilities": capabilities}, "service_ref": asdict(self.service_ref),
-                "capabilities": capabilities,
+                "instance_id": self.service_ref.instance_id, "ready": ready,
+                "facts": {"capabilities": capabilities, "camera_id": domain.camera_name,
+                          "calibration_mode": domain.calibration_mode, "result_path": "/v1/result",
+                          "result_kind": kind, "commit_owner": "core",
+                          "ros_master_uri": os.environ.get("ROS_MASTER_URI", "")},
+                "service_ref": asdict(self.service_ref), "capabilities": capabilities,
                 "routes": [{"method": method, "path": path} for method, path in sorted(routes)]}
         routes[("GET", "/v1/describe")] = describe
         return routes
@@ -747,6 +572,8 @@ class CalibrationHttpServer:
         if self._closed:
             return
         self._stopping = True
+        if self.private_host is not None:
+            (self.intrinsic_service or self.service).stop_readiness()
         # Host retains its resources if domain work has not really quiesced.
         self.host.close()
         if self.private_host is not None:
@@ -757,14 +584,6 @@ class CalibrationHttpServer:
 
     async def _domain(self, function, *args):
         return await self.runtime.blocking(self.host, function, *args)
-
-    async def _preference_domain(self, function, *args):
-        from xgc_camera_calibration.preferences import PreferenceError
-        try:
-            return await self._domain(function, *args)
-        except PreferenceError as error:
-            raise ApiError(error.status, str(error), details={"code": error.code,
-                "outcome": error.outcome, "request_id": error.request_id}) from error
 
     def _headers(self, request):
         result = {
@@ -847,11 +666,6 @@ class CalibrationHttpServer:
         previous, event_id = b"", 0
         while True:
             state = await self._domain(intrinsic.state) if intrinsic is not None else {}
-            if self.preferences is not None:
-                state["preferences"] = await self._domain(self.preferences.event_state)
-            else:
-                state["preferences"] = {"available": False, "snapshot": None,
-                    "error": {"code": "unavailable", "message": "Preference storage was not granted"}}
             payload = json.dumps(state, separators=(",", ":"), allow_nan=False).encode()
             if payload != previous:
                 event_id += 1
@@ -905,21 +719,6 @@ class CalibrationHttpServer:
                 headers.update({"Access-Control-Allow-Methods": "GET, HEAD, POST, PUT, OPTIONS",
                                 "Access-Control-Allow-Headers": "Content-Type"})
             return web.Response(status=204, headers=headers)
-        if path == "/api/v1/preferences":
-            if self.preferences is None:
-                raise ApiError(503, "Preference storage was not granted")
-            if request.method in ("GET", "HEAD"):
-                if set(request.query) - {"request_id"} or len(request.query.getall("request_id", [])) > 1:
-                    raise ApiError(400, "Unknown preference query")
-                identity = request.query.get("request_id")
-                value = (await self._preference_domain(self.preferences.resolve, identity) if identity is not None
-                         else await self._preference_domain(self.preferences.get))
-                return self._json(request, value)
-            if request.method == "PUT":
-                if request.query:
-                    raise ApiError(400, "Preference writes do not accept query arguments")
-                return self._json(request, await self._preference_domain(self.preferences.put, await self._request_json(request)))
-            raise ApiError(405, "Preference method not allowed")
         if request.method in ("GET", "HEAD"):
             image_match = IMAGE_PATH.fullmatch(path)
             if image_match:
@@ -958,8 +757,8 @@ class CalibrationHttpServer:
                 filename, evidence_path = await self._domain(self._intrinsic().evidence_bundle)
                 return await self._file(request, evidence_path, filename)
             if path.startswith("/api/v1/intrinsic/validation/image/"):
-                token = path[len("/api/v1/intrinsic/validation/image/"):]
-                if not token.endswith(".jpg"):
+                image_id = path[len("/api/v1/intrinsic/validation/image/"):]
+                if not image_id.endswith(".jpg"):
                     raise ApiError(404, "Intrinsic validation image must be JPEG")
                 values = request.query.getall("generation", [])
                 generation = None
@@ -972,7 +771,7 @@ class CalibrationHttpServer:
                             raise ValueError()
                     except ValueError as error:
                         raise ApiError(400, "Intrinsic validation generation must be a positive integer") from error
-                payload = await self._domain(self._intrinsic().validation_image, token[:-4], generation)
+                payload = await self._domain(self._intrinsic().validation_image, image_id[:-4], generation)
                 return self._bytes(request, payload, "image/jpeg")
             if path.startswith("/api/v1/intrinsic/ref/"):
                 try:
@@ -1009,15 +808,10 @@ class CalibrationHttpServer:
                                                         path.rsplit("/", 1)[1], value))
         if path == "/api/v1/solve":
             return self._json(request, await self._domain(self._extrinsic().solve, value))
-        if path in ("/api/v1/save", "/api/v1/intrinsic/save", "/api/v1/intrinsic/apply-metadata"):
-            if not isinstance(value, dict) or set(value) != {"candidate_id"}:
-                raise ApiError(400, "Save/apply requires only candidate_id")
-            identity = value["candidate_id"]
-            if not isinstance(identity, str) or not identity.strip():
-                raise ApiError(400, "Save/apply candidate_id must be a non-empty string")
-            service = self._extrinsic() if path == "/api/v1/save" else self._intrinsic()
-            action = service.apply_metadata if path.endswith("apply-metadata") else service.save
-            return self._json(request, await self._domain(action, identity.strip()))
+        if path == "/api/v1/intrinsic/apply-metadata":
+            if not isinstance(value, dict) or set(value) != {"candidate_id"} or not isinstance(value["candidate_id"], str):
+                raise ApiError(400, "Apply requires only candidate_id")
+            return self._json(request, await self._domain(self._intrinsic().apply_metadata, value["candidate_id"]))
         if path == "/api/v1/intrinsic/goto":
             index = value.get("index") if isinstance(value, dict) else None
             if not isinstance(index, int) or isinstance(index, bool):

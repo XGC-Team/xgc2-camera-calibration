@@ -5,15 +5,14 @@
       "id": "xgc2-camera-intrinsic-calibrator-ros1",
       "version": "3.0.0",
       "label": "XGC2 camera intrinsic calibration WebUI",
-      "description": "Request bounded immutable snapshots from a co-located Media Edge, collect strict AprilGrid observations, analyze a robust held-out intrinsic candidate, and persist camera_matrix + distortion only after explicit Save while streaming a reproducibility evidence bundle.",
+      "description": "Collect AprilGrid observations through camera capture, expose a validated intrinsic candidate at GET /v1/result, and stream progress and evidence for Core-owned review and persistence.",
       "parameters": {
         "groups": [
           {
-            "id": "calibration-storage",
-            "label": "Calibration Storage",
+            "id": "camera-context",
+            "label": "Camera context",
             "collapsed": true,
             "parameters": [
-              "calibrationRoot",
               "calibrationMode",
               "cameraName"
             ]
@@ -31,18 +30,14 @@
         "properties": {
           "mediaSourceId": {
             "type": "string",
-            "default": "usb_cam"
+            "default": "usb_cam",
+            "description": "Source identity from the per-camera media:<id> facts; capture consumes this source."
           },
           "snapshotTimeout": {
             "type": "number",
             "default": 5.0,
             "minimum": 0.1,
             "maximum": 120.0
-          },
-          "calibrationRoot": {
-            "type": "string",
-            "description": "Absolute storage root. Results are stored under <root>/<sim|phy>/<cameraName>/.",
-            "x-xgc-path-kind": "directory"
           },
           "calibrationMode": {
             "type": "string",
@@ -51,12 +46,12 @@
               "sim",
               "phy"
             ],
-            "description": "Explicit persistence partition selected by the Experiment run mode."
+            "description": "Camera calibration origin supplied by the Experiment run mode."
           },
           "cameraName": {
             "type": "string",
             "default": "usb_cam",
-            "description": "Stable camera identity and directory name; independent from the Media Edge source ID."
+            "description": "Stable camera identity from camera:<id>; independent of ROS frame names."
           },
           "boardProfile": {
             "type": "string",
@@ -133,30 +128,28 @@
           },
           "mediaEdgeRPCSocket": {
             "type": "string",
-            "description": "Unix endpoint from the ready target-local Media Edge ServiceRef.",
-            "default": ""
-          },
-          "bootstrapInput": {
-            "type": "string",
-            "fixedOnly": true,
-            "sensitive": true,
-            "x-xgc-path-kind": "file",
-            "description": "Private deployment BootstrapInput bound to the ready preferences storage."
+            "description": "Private Unix endpoint from media:<id> in the session registry."
           },
           "socketPath": {
             "type": "string",
             "fixedOnly": true,
-            "description": "Deployment-owned private calibration RPC endpoint."
+            "description": "Product-owned private calibration endpoint allocated by Core; GET /v1/result exposes the computed candidate."
           },
           "simulationEndpoint": {
             "type": "string",
             "default": "",
             "description": "Unix endpoint from the ready Session world ServiceRef; required when cameraControl is enabled."
+          },
+          "targetId": {
+            "type": "string",
+            "fixedOnly": true,
+            "description": "Core target identity for local service discovery; supplied by the registry."
           }
         },
         "required": [
-          "bootstrapInput",
-          "socketPath"
+          "socketPath",
+          "targetId",
+          "mediaEdgeRPCSocket"
         ]
       },
       "command": {
@@ -166,7 +159,6 @@
           "_media_edge_rpc_socket:=${mediaEdgeRPCSocket}",
           "_media_source_id:=${mediaSourceId}",
           "_snapshot_timeout:=${snapshotTimeout}",
-          "_calibration_root:=${calibrationRoot}",
           "_calibration_mode:=${calibrationMode}",
           "_camera_name:=${cameraName}",
           "_board_profile:=${boardProfile}",
@@ -183,8 +175,8 @@
           "_frame_ancestors:=${frameAncestors}",
           "_allowed_origins:=${allowedOrigins}",
           "_socket_path:=${socketPath}",
-          "_bootstrap_input:=${bootstrapInput}",
-          "_simulation_endpoint:=${simulationEndpoint}"
+          "_simulation_endpoint:=${simulationEndpoint}",
+          "_target_id:=${targetId}"
         ],
         "env": {
           "ROS_MASTER_URI": "${rosMasterUri}",

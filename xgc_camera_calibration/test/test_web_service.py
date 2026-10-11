@@ -15,8 +15,6 @@ from unittest.mock import patch
 import cv2
 import numpy as np
 
-from xgc_camera_calibration.solver import load_extrinsic
-from xgc_camera_calibration.extrinsic_application import ExtrinsicApplication
 from xgc_camera_calibration.extrinsic_resolver import resolve_selection, encode_frozen
 from xgc_camera_calibration.extrinsic_coordinates import coordinate_provenance, optical_translation_in_world
 from xgc_camera_calibration.web_service import (
@@ -30,6 +28,12 @@ from xgc_camera_calibration.web_service import (
 
 
 class FakeSource:
+    def wait_ready(self, timeout):
+        return True
+
+    def stop_readiness(self):
+        pass
+
     source_id = "camera-source"
     image_topic = "/camera/image_raw"
     preview_image_topic = "/camera/image_raw/compressed"
@@ -76,30 +80,6 @@ class FakeSource:
 
 
 class WebCalibrationServiceTest(unittest.TestCase):
-    def test_ros_entrypoints_require_the_shared_storage_identity(self):
-        package = Path(__file__).resolve().parents[1]
-        calibrator = (package / "scripts" / "extrinsic_calibrator_web.py").read_text(
-            encoding="utf-8"
-        )
-        publisher = (package / "scripts" / "extrinsic_tf_publisher.py").read_text(
-            encoding="utf-8"
-        )
-        for source in (calibrator, publisher):
-            self.assertIn('rospy.get_param("~calibration_root")', source)
-            self.assertIn('rospy.get_param("~calibration_mode")', source)
-            self.assertIn('rospy.get_param("~camera_name")', source)
-        self.assertNotIn('rospy.get_param("~output_file"', calibrator)
-        self.assertNotIn('rospy.get_param("~extrinsic_file"', publisher)
-        self.assertIn("optional_selected_intrinsic_path", calibrator)
-        self.assertIn('rospy.get_param("~intrinsic_file", "")', calibrator)
-        self.assertIn("ideal_intrinsic_parameters", calibrator)
-        self.assertIn("ideal-pinhole", calibrator)
-        self.assertNotIn("Freeze/Solve stay closed", calibrator)
-        self.assertIn("snapshot_health_timer", calibrator)
-        self.assertIn("except MediaSnapshotError as error", calibrator)
-        self.assertIn("without failing the Experiment", calibrator)
-        self.assertIn("default_transform_chain", publisher)
-        self.assertIn("Publishing default camera extrinsic", publisher)
 
     def test_web_assets_use_proxy_safe_relative_urls(self):
         web_root = Path(__file__).resolve().parents[1] / "web" / "extrinsic"
@@ -165,7 +145,6 @@ class WebCalibrationServiceTest(unittest.TestCase):
         self.output_directory = self.calibration_root / "sim" / "usb_cam"
         self.service = CalibrationService(
             FakeSource(self.snapshot),
-            calibration_root=str(self.calibration_root),
             calibration_mode="sim",
             camera_name="usb_cam",
             parent_frame="world",
@@ -174,20 +153,11 @@ class WebCalibrationServiceTest(unittest.TestCase):
             **self.application_kwargs(),
         )
 
-    def application_kwargs(self, saved=None, offset=(0, 0, 0)):
+    def application_kwargs(self, offset=(0, 0, 0)):
         roles = {"parentFrame": "world", "opticalFrames": {"sim": "camera_optical_frame", "phy": "camera_optical_frame"}}
-        choice = {"mode": "auto"}
-        if saved:
-            path = Path(saved["output_file"])
-            choice = {"mode": "version", "result": {"sourceMode": path.parent.parent.name,
-                "fileName": path.name, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}}
-        frozen = encode_frozen(resolve_selection(str(self.calibration_root), "usb_cam", choice,
+        frozen = encode_frozen(resolve_selection(str(self.calibration_root), "usb_cam", {"mode": "auto"},
             {"frame": "world", "worldOffset": list(map(float, offset))}, roles))
-        owner = ExtrinsicApplication(str(self.calibration_root), "usb_cam", frozen, roles, lambda state: None)
-        owner.initial_published()
-        self.owner = owner
-        return {"resolved_extrinsic_json": frozen, "frame_roles_json": json.dumps(roles),
-                "application_state_reader": owner.state}
+        return {"resolved_extrinsic_json": frozen, "frame_roles_json": json.dumps(roles)}
 
     def tearDown(self):
         self.temporary.cleanup()
@@ -222,7 +192,7 @@ class WebCalibrationServiceTest(unittest.TestCase):
                 self.admit(marker, pixel, service)
         return self.current(service)
 
-    def test_actual_source_frame_model_matches_ideal_and_selected_inputs(self):
+    def test_actual_source_frame_model_matches_camera_info_and_selected_inputs(self):
         import ast
         import threading
         from types import SimpleNamespace
@@ -243,8 +213,11 @@ class WebCalibrationServiceTest(unittest.TestCase):
         exec(compile(ast.Module(body=methods, type_ignores=[]), str(source_path), "exec"), namespace)
         for ideal in (True, False):
             expected_k, expected_d, size = ideal_intrinsic_parameters(640, 480, 110.)
-            model = {"intrinsic_source": "ideal-pinhole" if ideal else "selected-file"}
-            source = SimpleNamespace(use_ideal_intrinsics=ideal, ideal_horizontal_fov_degrees=110.,
+            model = ({"intrinsic_source": "camera-info", "distortion_model": "plumb_bob",
+                      "camera_info_topic": "/camera/camera_info", "frame_id": "optical"}
+                     if ideal else {"intrinsic_source": "selected-file"})
+            source = SimpleNamespace(use_camera_info=ideal, camera_info=(expected_k, expected_d, size, "optical"),
+                camera_info_topic="/camera/camera_info", optical_frame="optical",
                 intrinsic_matrix=expected_k, intrinsic_distortion=expected_d, intrinsic_size=size,
                 intrinsic_provenance=model, lock=threading.RLock(), marker_latest=self.snapshot.markers,
                 pose_coordinate_source="raw-vrpn", pose_world_offset=(10., -5., 2.),
@@ -261,234 +234,73 @@ class WebCalibrationServiceTest(unittest.TestCase):
                 np.testing.assert_allclose(observation.position, np.asarray(self.snapshot.markers[name].position) + [10., -5., 2.])
                 self.assertEqual(observation.source_position, self.snapshot.markers[name].position)
 
-    def test_shifted_world_pose_is_saved_and_simulation_uses_it_directly(self):
-        offset = np.asarray([-8., 3., 1.])
-        provenance = coordinate_provenance("experiment-world", "world", offset)
-        provenance["input_kind"] = "raw-vrpn"
-        markers = {name: replace(marker, position=tuple(np.asarray(marker.position)+offset),
-                                 source_position=marker.position)
-                   for name, marker in self.snapshot.markers.items()}
-        self.service = CalibrationService(FakeSource(replace(self.snapshot, markers=markers, pose_coordinates=provenance)),
-            calibration_root=str(self.calibration_root), calibration_mode="sim", camera_name="usb_cam",
-            parent_frame="world", child_frame="camera_optical_frame", maximum_inlier_error_px=1.0,
-            **self.application_kwargs(offset=offset))
-        self.service.freeze()
-        request = self.point_request()
-        provenance["world_offset"][0] = 999.
-        candidate = self.service.solve(request)
-        saved = self.service.save(candidate["candidate_id"])
-        document = load_extrinsic(saved["output_file"])
-        raw_camera = -cv2.Rodrigues(self.rvec)[0].T.dot(self.tvec)
-        np.testing.assert_allclose(document["translation_array"], raw_camera + offset, atol=1e-5)
-        np.testing.assert_allclose(optical_translation_in_world(document, None), raw_camera + offset, atol=1e-5)
-        np.testing.assert_allclose(optical_translation_in_world(document, offset), raw_camera + offset, atol=1e-5)
-        np.testing.assert_allclose(optical_translation_in_world(document, [2., 4., 6.]), raw_camera + [2., 4., 6.], atol=1e-5)
-        self.assertEqual(document["metadata"]["pose_coordinates"]["world_offset"], offset.tolist())
-        for point in document["points"]:
-            np.testing.assert_allclose(point["world"], np.asarray(point["source_world"])+offset)
 
-    def test_frozen_model_survives_source_changes_save_and_restart(self):
-        for kind in ("ideal-pinhole", "selected-file"):
-            with self.subTest(kind=kind):
-                model = {"intrinsic_source": kind, "distortion_model": "plumb_bob"}
-                if kind == "ideal-pinhole":
-                    model.update(ideal_horizontal_fov_degrees=110., assumption="Assumed ideal pinhole", intrinsic_file="")
-                else:
-                    from xgc_camera_calibration.intrinsic_solver import load_intrinsic
-                    asset = Path(self.temporary.name) / "intrinsics.yaml"
-                    original = json.dumps({"schema": "xgc2.camera.intrinsic.v1", "camera_matrix": {"data": self.intrinsic.reshape(-1).tolist()}}).encode()
-                    asset.write_bytes(original)
-                    loaded = load_intrinsic(asset)
-                    self.assertEqual(loaded["source_sha256"], hashlib.sha256(original).hexdigest())
-                    model.update(intrinsic_file=str(asset), intrinsic_sha256=loaded["source_sha256"])
-                self.service.source.snapshot = replace(self.snapshot, camera_matrix=self.intrinsic.copy(), camera_model=model)
-                self.service.mutate_sample("clear", self.current())
-                self.service.freeze()
-                request = self.point_request()
-                expected = json.loads(json.dumps(next(iter(self.service.samples.active.values()))["model"]))
-                self.service.source.snapshot.camera_matrix[0, 0] *= 2
-                model["intrinsic_source"] = "changed-after-freeze"
-                candidate = self.service.solve(request)
-                if kind == "selected-file":
-                    asset.write_text("replaced after load and solve")
-                self.service.source.intrinsic_file = "/different.yaml"
-                saved = self.service.save(candidate["candidate_id"])
-                document = load_extrinsic(saved["output_file"])
-                self.assertEqual(document["metadata"]["camera_model"], expected)
-                self.assertEqual(saved["camera_model"], expected)
-                self.assertEqual(expected["camera_matrix"], self.intrinsic.reshape(-1).tolist())
-                self.assertNotIn("stamp_sec", expected)
-                self.assertEqual(saved["points"][0]["pose_observation"]["source_stamp_sec"], self.snapshot.stamp_sec)
-                restored = CalibrationService(self.service.source, calibration_root=str(self.calibration_root),
-                    calibration_mode="sim", camera_name="usb_cam", parent_frame="world", child_frame="camera_optical_frame",
-                    **self.application_kwargs(saved))
-                self.assertEqual(restored.state()["result"]["camera_model"], expected)
 
-    def test_freeze_solve_and_save_round_trip(self):
-        state = self.service.freeze()
-        self.assertEqual(state["mode"], "frozen")
-        self.assertEqual(len(state["markers"]), 6)
-        self.assertTrue(self.service.image_jpeg().startswith(b"\xff\xd8"))
-        result = self.service.solve(self.point_request())
-        self.assertLess(result["max_reprojection_error_px"], 1e-3)
-        self.assertEqual(len(result["projections"]), 6)
-        self.assertFalse(result["saved"])
-        self.assertIsNone(result["output_file"])
-        self.assertEqual(list(self.output_directory.glob("extrinsics-*.yaml")), [])
-        saved = self.service.save(result["candidate_id"])
-        output = Path(saved["output_file"])
-        self.assertEqual(output.parent, self.output_directory)
-        self.assertRegex(
-            output.name,
-            r"^extrinsics-\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}(?:-\d{2,4})?\.yaml$",
-        )
-        self.assertTrue(output.is_file())
-        self.assertFalse((self.output_directory / "extrinsics.yaml").exists())
-        self.assertEqual(self.service.state()["output_file"], str(output))
-        self.assertFalse(self.service.state()["result_restored"])
-        self.assertTrue(Path(saved["selection_file"]).is_file())
-        document = load_extrinsic(output)
-        self.assertEqual(document["calibration_mode"], "sim")
-        self.assertEqual(document["camera_name"], "usb_cam")
-        self.assertTrue(document["metadata"]["web_calibrator"])
-        self.assertEqual(document["metadata"]["candidate_id"], result["candidate_id"])
-        self.assertEqual(document["metadata"]["image_topic"], FakeSource.image_topic)
-        self.assertEqual(self.service.save(result["candidate_id"]), saved)
 
-    def test_arbitrary_bodies_recalibrate_and_publish_selection_without_restart(self):
-        names = ["calibration_stand", "ceiling_fixture", "desk_reference",
-                 "reference_bar", "tripod", "wall_target"]
-        snapshot = replace(self.snapshot, markers={
-            name: MarkerObservation(name=name, position=tuple(position), frame_id="world")
-            for name, position in zip(names, self.world)
-        })
-        source = FakeSource(snapshot)
-        service = CalibrationService(source, calibration_root=str(self.calibration_root),
-            calibration_mode="phy", camera_name="usb_cam", parent_frame="world",
-            child_frame="camera_optical_frame", maximum_inlier_error_px=1.0,
-            **self.application_kwargs())
-        paths = []
-        revisions = []
-        for translation in (self.tvec, self.tvec + np.array([0.2, 0.05, 0.1])):
-            service.mutate_sample("clear", self.current(service))
-            service.live()
-            state = service.freeze()
-            self.assertEqual([m["name"] for m in state["markers"]], names)
-            pixels, _ = cv2.projectPoints(self.world, self.rvec, translation,
-                                          self.intrinsic, self.distortion)
-            candidate = service.solve(self.point_request(service, names, pixels.reshape(-1, 2)))
-            before = self.owner.store.read()["applied"]
-            saved = service.save(candidate["candidate_id"])
-            self.assertEqual(self.owner.store.read()["applied"], before)
-            self.assertEqual(saved["application"]["status"], "pending")
-            published = []
-            self.owner.tick(published.append)
-            self.assertEqual(len(published), 1)
-            self.assertEqual(service.state()["result"]["application"]["status"], "applied")
-            paths.append(Path(saved["output_file"]))
-            revisions.append(load_extrinsic(saved["output_file"]))
-        self.assertNotEqual(paths[0], paths[1])
-        self.assertTrue(all(path.is_file() for path in paths))
-        self.assertNotEqual(revisions[0]["translation"], revisions[1]["translation"])
 
-    def test_restart_restores_only_the_exact_shared_selection(self):
-        self.service.freeze()
-        candidate = self.service.solve(self.point_request())
-        saved = self.service.save(candidate["candidate_id"])
 
-        restored = CalibrationService(
-            FakeSource(self.snapshot),
-            calibration_root=str(self.calibration_root),
-            calibration_mode="sim",
-            camera_name="usb_cam",
-            parent_frame="world",
-            child_frame="camera_optical_frame",
-            maximum_inlier_error_px=1.0,
-            **self.application_kwargs(saved),
-        )
-        before = self.owner.store.read()
-        restored.save(candidate["candidate_id"])
-        self.assertEqual(self.owner.store.read(), before, "restoring saved history must not promote")
-        state = restored.state()
-        self.assertEqual(state["mode"], "live")
-        self.assertTrue(state["result_restored"])
-        self.assertEqual(state["output_file"], saved["output_file"])
-        self.assertTrue(state["result"]["saved"])
-        self.assertEqual(state["result"]["candidate_id"], candidate["candidate_id"])
-        self.assertEqual(state["result"]["selection_file"], saved["selection_file"])
 
-        restored.freeze()
-        self.assertTrue(restored.state()["result_restored"])
-        self.assertEqual(restored.state()["result"]["candidate_id"], candidate["candidate_id"])
-        self.assertEqual(restored.state()["samples"], [])
-
-    def test_legacy_mode_selection_is_ignored_and_never_repaired(self):
-        pointer = self.calibration_root / "selections" / "usb_cam" / "sim-extrinsic.json"
-        pointer.parent.mkdir(parents=True)
-        pointer.write_text('{"schema":"broken"}\n', encoding="utf-8")
-        service = CalibrationService(
-            FakeSource(self.snapshot), calibration_root=str(self.calibration_root),
-            calibration_mode="sim", camera_name="usb_cam", parent_frame="world",
-            child_frame="camera_optical_frame", maximum_inlier_error_px=1.0,
-            **self.application_kwargs(),
-        )
-        self.assertFalse(service.state()["result_restored"])
-        self.assertIsNone(service.state()["recovery_error"])
-        service.freeze()
-        request = self.point_request(service)
-        candidate = service.solve(request)
-        saved = service.save(candidate["candidate_id"])
-        self.assertTrue(saved["saved"])
-        self.assertIsNone(service.state()["recovery_error"])
-        self.assertEqual(pointer.read_text(), '{"schema":"broken"}\n')
-
-    def test_saved_retry_rejects_a_superseding_shared_selection(self):
-        self.service.freeze()
-        candidate = self.service.solve(self.point_request())
-        self.service.save(candidate["candidate_id"])
-        original = dict(self.service.application.request)
-        self.owner.store.stage({**original, "applicationId": "newer-application"}, 1)
-        with self.assertRaisesRegex(ApiError, "superseded"):
-            self.service.save(candidate["candidate_id"])
 
     def test_state_has_no_fabricated_output_alias_before_solve(self):
         state = self.service.state()
-        self.assertIsNone(state["output_file"])
+        self.assertNotIn("output_file", state)
         self.assertEqual(state["calibration_mode"], "sim")
         self.assertEqual(state["camera_name"], "usb_cam")
 
-    def test_solve_is_a_fixed_point_and_save_is_the_only_writer(self):
-        self.service.freeze()
-        first = self.service.solve(self.point_request())
-        second = self.service.solve(self.point_request())
-        self.assertEqual(first["candidate_id"], second["candidate_id"])
-        self.assertEqual(len(list(self.output_directory.glob("extrinsics-*.yaml"))), 0)
-        with self.assertRaises(ApiError) as context:
-            self.service.save("extrinsic-candidate-stale")
-        self.assertEqual(context.exception.status, 409)
-        saved = self.service.save(first["candidate_id"])
-        self.assertTrue(saved["saved"])
-        self.assertEqual(len(list(self.output_directory.glob("extrinsics-*.yaml"))), 1)
 
-    def test_application_failure_retries_the_same_immutable_output(self):
+
+    def test_extrinsic_result_has_commit_data_and_never_writes_a_file(self):
+        self.assertIsNone(self.service.read_result())
         self.service.freeze()
         candidate = self.service.solve(self.point_request())
-        original_stage = self.service.application.store.stage
-        attempts = []
-        def flaky_stage(request, revision):
-            attempts.append((dict(request), revision))
-            if len(attempts) == 1:
-                raise OSError("selection unavailable")
-            return original_stage(request, revision)
-        with patch.object(self.service.application.store, "stage", side_effect=flaky_stage):
-            with self.assertRaisesRegex(ApiError, "application is unavailable"):
-                self.service.save(candidate["candidate_id"])
-            outputs = list(self.output_directory.glob("extrinsics-*.yaml"))
-            self.assertEqual(len(outputs), 1)
-            saved = self.service.save(candidate["candidate_id"])
-        self.assertEqual(attempts[0], attempts[1])
-        self.assertEqual(Path(saved["output_file"]), outputs[0])
-        self.assertEqual(len(list(self.output_directory.glob("extrinsics-*.yaml"))), 1)
+        result = self.service.read_result()
+        document = result["document"]
+        self.assertEqual(result["candidate_id"], candidate["candidate_id"])
+        self.assertEqual(document["camera_name"], "usb_cam")
+        self.assertEqual(document["parent_frame"], "world")
+        self.assertEqual(document["child_frame"], "camera_optical_frame")
+        self.assertEqual(document["sample_count"], 6)
+        self.assertEqual(document["inlier_count"], 6)
+        self.assertEqual(len(document["reprojection_errors_px"]), 6)
+        self.assertEqual(document["metadata"]["pose_coordinates"]["kind"], "experiment-world")
+        np.testing.assert_allclose(list(document["translation"].values()),
+            -cv2.Rodrigues(self.rvec)[0].T.dot(self.tvec), atol=1e-5)
+        result["document"]["translation"]["x"] = 1000
+        self.assertNotEqual(self.service.read_result()["document"]["translation"]["x"], 1000)
+        self.assertEqual(list(self.calibration_root.rglob("*.yaml")), [])
+        from xgc2_xrpc import Client
+        web_root = Path(__file__).parents[1] / "web/extrinsic"
+        server = CalibrationHttpServer(("127.0.0.1", 0), self.service, web_root, frame_ancestors="'self'",
+            rpc_socket=str(Path(self.temporary.name) / "result.sock"), target_id="test-target").start()
+        try:
+            with Client.from_service(server.service_ref, runtime=server.runtime, local_target="test-target") as client:
+                wire_result = client.json("/v1/result", method="GET")
+                self.assertEqual(wire_result["result"], self.service.read_result())
+                self.assertEqual(client.json("/v1/result", method="GET")["revision"], wire_result["revision"])
+                self.service.mutate_sample("clear", self.current())
+                changed = client.json("/v1/result", method="GET")
+                self.assertIsNone(changed["result"])
+                self.assertNotEqual(changed["revision"], wire_result["revision"])
+        finally:
+            server.close()
+        self.service.mutate_sample("clear", self.current())
+        self.assertIsNone(self.service.read_result())
+
+    def test_shifted_world_result_keeps_offset_and_source_observations(self):
+        offset = np.asarray([-8., 3., 1.])
+        provenance = coordinate_provenance("experiment-world", "world", offset)
+        markers = {name: replace(marker, position=tuple(np.asarray(marker.position) + offset),
+                                source_position=marker.position) for name, marker in self.snapshot.markers.items()}
+        self.service = CalibrationService(FakeSource(replace(self.snapshot, markers=markers, pose_coordinates=provenance)),
+            calibration_mode="sim", camera_name="usb_cam", parent_frame="world", child_frame="camera_optical_frame",
+            maximum_inlier_error_px=1., **self.application_kwargs(offset=offset))
+        self.service.solve(self.point_request())
+        document = self.service.read_result()["document"]
+        np.testing.assert_allclose(list(document["translation"].values()),
+            -cv2.Rodrigues(self.rvec)[0].T.dot(self.tvec) + offset, atol=1e-5)
+        self.assertEqual(document["metadata"]["pose_coordinates"]["world_offset"], offset.tolist())
+        for point in document["points"]:
+            np.testing.assert_allclose(point["world"], np.asarray(point["source_world"]) + offset)
 
     def test_live_preview_reuses_compressed_jpeg_without_reencoding(self):
         with patch.object(
@@ -535,9 +347,8 @@ class WebCalibrationServiceTest(unittest.TestCase):
         self.assertLess(result["max_reprojection_error_px"], 1e-3)
         self.assertEqual([p["sample_id"] for p in result["projections"]], identities)
         self.service.live()
-        saved = self.service.save(result["candidate_id"])
-        self.assertTrue(saved["saved"])
-        self.assertEqual(load_extrinsic(saved["output_file"])["points"][0]["sample_id"], identities[0])
+        document = self.service.read_result()["document"]
+        self.assertEqual(document["points"][0]["sample_id"], identities[0])
 
     def test_begin_fixes_pose_before_image_upload_and_exact_image_is_reviewable(self):
         request, pending = self.begin("marker_01", self.pixels[0])
@@ -596,8 +407,7 @@ class WebCalibrationServiceTest(unittest.TestCase):
         self.assertEqual(after[1:], before[1:])
         self.assertEqual(after[0]["pose_observation"], before[0]["pose_observation"])
         self.assertEqual(after[0]["image"], before[0]["image"])
-        with self.assertRaises(ApiError):
-            self.service.save(candidate["candidate_id"])
+        self.assertIsNone(self.service.read_result())
         with self.assertRaises(ApiError):
             self.service.mutate_sample("remove", {**unchanged, "sample_id": identity})
         self.service.mutate_sample("remove", {**self.current(), "sample_id": before[-1]["sample_id"]})
@@ -683,7 +493,7 @@ class WebCalibrationServiceTest(unittest.TestCase):
         exec(compile(ast.Module(body=methods,type_ignores=[]),str(source_path),"exec"),namespace)
         source = SimpleNamespace(lock=threading.RLock(),marker_latest={},marker_receipts={},
             source_size=(640,480),snapshot_client=object(),snapshot_available=True,pose_max_age=2.,
-            use_ideal_intrinsics=False,intrinsic_matrix=self.intrinsic,intrinsic_distortion=self.distortion,
+            use_camera_info=False,intrinsic_matrix=self.intrinsic,intrinsic_distortion=self.distortion,
             intrinsic_size=(640,480),intrinsic_provenance={},pose_coordinate_source="raw-vrpn",pose_world_offset=(10.,-5.,2.))
         source._observation_context=MethodType(namespace["_observation_context"],source)
         callback=namespace["_marker_callback"](source,"one")

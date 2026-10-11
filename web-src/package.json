@@ -6,7 +6,6 @@
   "scripts": {
     "build": "tsc --noEmit && vite build --mode intrinsic && node scripts/minify.mjs intrinsic && vite build --mode extrinsic && node scripts/minify.mjs extrinsic",
     "check:ui-policy": "xgc2-style-policy --root src",
-    "test:skin-store": "node scripts/check-managed-skin-store.mjs",
     "typecheck": "tsc --noEmit --pretty false"
   },
   "dependencies": {

@@ -9,10 +9,10 @@ const {chromium}=require('@playwright/test');
 const fixture=JSON.parse(fs.readFileSync(0,'utf8'));
 const red=Buffer.from(fixture.red,'base64'),blue=Buffer.from(fixture.blue,'base64');
 const state={sampling_session_id:'a'.repeat(32),dataset_revision:0,samples:[],mode:'live',generation:0,
- result:null,parent_frame:'world',child_frame:'camera',output_file:'',frame:null,
+ result:null,parent_frame:'world',child_frame:'camera',frame:null,
  source:{source_id:'camera',image_ready:true,intrinsic_ready:true,marker_count:1,marker_names:['one-body'],
- image_topic:'image',intrinsic_file:'',intrinsic_source:'ideal-pinhole',ideal_horizontal_fov_degrees:110,pose_prefix:'pose'}};
-const pending=new Map(),images=new Map(),saves=[],requests=[],failures=[];
+ image_topic:'image',intrinsic_file:'',intrinsic_source:'camera-info',pose_prefix:'pose'}};
+const pending=new Map(),images=new Map(),requests=[],failures=[];
 let identity=0,imageReads=0,heldImage,rejectCommit=false,resolveHeld;
 const heldReady=new Promise(resolve=>{resolveHeld=resolve;});
 let heldDeadline;
@@ -25,9 +25,7 @@ try {
    const request=route.request(),path=new URL(request.url()).pathname.slice(1);
    requests.push([request.method(),path]);
    if(request.method()==='GET') {
-    if(path==='api/v1/preferences')await route.fulfill({json:{skin:'dark',version:'0',token:{database_id:'fixture-db',schema:'camera-calibration.preferences.v1',revision:'0'}}});
-    else if(path==='api/v1/events')await route.fulfill({contentType:'text/event-stream',body:'event: state\ndata: '+JSON.stringify({preferences:{available:true,snapshot:{skin:'dark',version:'0',token:{database_id:'fixture-db',schema:'camera-calibration.preferences.v1',revision:'0'}}}})+'\n\n'});
-    else if(path==='api/v1/state')await route.fulfill({json:state});
+    if(path==='api/v1/state')await route.fulfill({json:state});
     else if(path==='api/v1/image.jpg'){imageReads++;if(imageReads===2){heldImage=route;resolveHeld();}else await route.fulfill({contentType:'image/png',body:imageReads===1?red:blue});}
     else if(images.has(path))await route.fulfill({contentType:'image/png',body:images.get(path)});
     else await route.fulfill({contentType:'text/html',body:fixture.html});
@@ -54,11 +52,9 @@ try {
     state.dataset_revision++;state.result=null;await route.fulfill({json:state});
    } else if(path==='api/v1/solve') {
     assert.deepEqual(Object.keys(body).sort(),['expected_revision','sampling_session_id']);assert.equal(body.expected_revision,state.dataset_revision);
-    state.result={candidate_id:'candidate-'+state.dataset_revision,saved:false,dataset_revision:state.dataset_revision,
+    state.result={candidate_id:'candidate-'+state.dataset_revision,commit_owner:'core',dataset_revision:state.dataset_revision,
      points:state.samples.map(p=>({...p,reprojection_error_px:.1})),projections:[],translation:[0,0,1],quaternion_xyzw:[0,0,0,1],
      mean_reprojection_error_px:.1,max_reprojection_error_px:.1};await route.fulfill({json:state.result});
-   } else if(path==='api/v1/save') {
-    assert.deepEqual(body,{candidate_id:state.result.candidate_id});saves.push(body);state.result={...state.result,saved:true,output_file:'/saved.yaml'};await route.fulfill({json:state.result});
    } else if(['api/v1/freeze','api/v1/live'].includes(path)){state.mode=path.endsWith('freeze')?'frozen':'live';await route.fulfill({json:state});}
    else throw Error('unexpected request '+path);
   } catch(error){failures.push(String(error));await route.fulfill({status:500,json:{error:String(error)}});}
@@ -77,12 +73,12 @@ try {
  for(let i=0;i<3;i++){await page.click('#camera-canvas',{position:{x:200+i*20,y:150}});await ready(i+2);}
  assert.deepEqual(state.samples[0].world,original.world);assert.equal(new Set(state.samples.map(p=>p.sample_id)).size,4);
  assert(!requests.some(([,path])=>path==='api/v1/freeze'));
- await page.click('#solve-button');await page.waitForFunction(()=>!document.getElementById('save-button').disabled);
+ await page.click('#solve-button');await page.waitForFunction(()=>document.getElementById('success-banner').textContent.includes('candidate ready'));
  const oldID=state.samples[0].sample_id,oldWorld=[...state.samples[0].world];
  await page.getByRole('button',{name:'View sample 1',exact:true}).click();
  await page.waitForFunction(()=>document.getElementById('coordinate-hint').textContent.includes('correct this sample'));
  await page.click('#camera-canvas',{position:{x:100,y:80}});
- await page.waitForFunction(()=>!document.getElementById('solve-button').disabled&&document.getElementById('save-button').disabled);
+ await page.waitForFunction(()=>!document.getElementById('solve-button').disabled);
  assert.equal(state.samples[0].sample_id,oldID);assert.deepEqual(state.samples[0].world,oldWorld);assert.notDeepEqual(state.samples[0].pixel,original.pixel);
  rejectCommit=true;await page.getByRole('button',{name:'Resample sample 1',exact:true}).click();await ready(4);
  await page.click('#camera-canvas',{position:{x:180,y:120}});
@@ -90,11 +86,11 @@ try {
  await ready(4);assert.equal(state.samples[0].sample_id,oldID);assert.equal(pending.size,0);
  rejectCommit=false;await page.click('#camera-canvas',{position:{x:180,y:120}});
  await page.waitForFunction(old=>document.querySelector('#points-body tr').dataset.sampleId!==old,oldID);await ready(4);
- await page.click('#solve-button');await page.waitForFunction(()=>!document.getElementById('save-button').disabled);
- await page.click('#save-button');await page.waitForFunction(()=>document.getElementById('success-banner').textContent.includes('saved'));
- assert.equal(saves.length,1);assert(await page.isDisabled('#save-button'));
+ await page.click('#solve-button');await page.waitForFunction(()=>document.getElementById('success-banner').textContent.includes('candidate ready'));
+ assert(!requests.some(([,path])=>path==='api/v1/save'));
+ assert.equal(await page.locator('#save-button').count(),0);
  await page.getByRole('button',{name:'Remove sample 2',exact:true}).click();await ready(3);
  await page.click('#remove-button');await ready(2);await page.click('#clear-button');await ready(0);
  assert.deepEqual(failures,[]);
- console.log('PASS: live repeated marker; displayed A retained across late B; independent edit/resample/remove/undo/clear; exact candidate Save; no pageerror');
+ console.log('PASS: live repeated marker; displayed A retained across late B; independent edit/resample/remove/undo/clear; candidate review through Core; no pageerror');
 } finally {await browser.close();}

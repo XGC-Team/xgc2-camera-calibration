@@ -51,7 +51,8 @@ APRILGRID_SEARCH_HOLD_FRAMES = 12
 DEFAULT_AUTO_CAPTURE_INTERVAL_SECONDS = 0.2
 INTRINSIC_VALIDATION_MIN_JPEG_QUALITY = 95
 CAMERA_NAME_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9._-]{0,63}$")
-_TARGET_CAPTURE_TOKEN_UNSET = object()
+INTRINSIC_QUALITY_CONTRACT = "xgc2.camera.intrinsic-quality.v2"
+_TARGET_CAPTURE_IDENTITY_UNSET = object()
 _SIM_TARGET_ANGLE_TOLERANCE_RAD = 0.04
 # A rendered optical frame may sit ahead of the Gazebo model origin.  Eight
 # centimetres covers a compact camera body while keeping a one-time coordinate
@@ -258,7 +259,6 @@ class IntrinsicCalibrationService:
         self.camera_name = str(camera_name).strip()
         self.calibration_mode = str(calibration_mode).strip()
         self.board_profile_id = str(board_profile_id).strip()
-        self.output_file = self.output_file_base
         self.checkpoint_file = self.output_file_base + ".session.npz"
         self.media_source = str(media_source).strip()
         self.jpeg_quality = int(jpeg_quality)
@@ -266,6 +266,7 @@ class IntrinsicCalibrationService:
         self.display_width = int(display_width)
         self.lock = threading.RLock()
         self._detection_condition = threading.Condition(self.lock)
+        self._readiness_stopping = False
         self._capture_lock = threading.Lock()
         self.samples: List[Tuple[float, float, float, float]] = []
         self.image_points: List[np.ndarray] = []
@@ -274,24 +275,18 @@ class IntrinsicCalibrationService:
         self.sample_snapshot_ids: List[str] = []
         self.image_size: Optional[Tuple[int, int]] = None
         self._display: Optional[np.ndarray] = None
-        self.result: Optional[intrinsic_solver.IntrinsicResult] = None
-        self.result_payload: Optional[Dict[str, Any]] = None
-        self.result_restored = False
         # ``calibrate`` now produces a diagnostic-only, immutable candidate.
-        # Persisting an intrinsic asset belongs to a later independent
-        # validation/commit transaction; a background capture must never
+        # Core reviews and commits intrinsic assets; a background capture must never
         # mutate the observations behind an already-produced candidate.
         self.candidate_result: Optional[intrinsic_solver.IntrinsicResult] = None
         self.candidate_payload: Optional[Dict[str, Any]] = None
         self._candidate_diagnostics_full: Optional[Dict[str, Any]] = None
         self._candidate_error: Optional[Dict[str, Any]] = None
-        self._saved_candidate_id: Optional[str] = None
         self._metadata_application = None
         self._metadata_receipt = None
         self._metadata_attempted_candidate = None
         self.session_revision = 1
         self.collection_revision = 0
-        self.restored_coverage: List[Dict[str, Any]] = []
         self._recovery_error: Optional[str] = None
         self._frame_sequence = 0
         expected_corners = self.board_size[0] * self.board_size[1]
@@ -413,12 +408,15 @@ class IntrinsicCalibrationService:
             self._metadata_application = application
 
     def apply_metadata(self, candidate_id: str) -> Dict[str, Any]:
-        """Apply one saved candidate as ephemeral CameraInfo estimates."""
+        """Apply one reviewed candidate as ephemeral CameraInfo estimates."""
         with self.lock:
             self._require_idle_locked()
-            if (self.result is None or not isinstance(candidate_id, str)
-                    or not candidate_id or candidate_id != self._saved_candidate_id):
-                raise ApiError(HTTPStatus.CONFLICT, "Apply requires the current saved candidate_id")
+            if (self.candidate_result is None or not isinstance(candidate_id, str)
+                    or not candidate_id or candidate_id != self.candidate_payload["candidate_id"]):
+                raise ApiError(HTTPStatus.CONFLICT, "Apply requires the current candidate_id")
+            _, reasons = self._candidate_save_assessment_locked()
+            if reasons:
+                raise ApiError(HTTPStatus.UNPROCESSABLE_ENTITY, "Candidate failed stability validation")
             if self._metadata_application is None:
                 raise ApiError(HTTPStatus.SERVICE_UNAVAILABLE, "CameraInfo metadata application was not granted")
             if self._metadata_receipt and self._metadata_receipt.get("candidate_id") == candidate_id:
@@ -429,7 +427,7 @@ class IntrinsicCalibrationService:
             # attempt fence and never turn a repeated browser request into a
             # second mutation. The source owner retains its authoritative receipt.
             self._metadata_attempted_candidate = candidate_id
-            result = self.result
+            result = self.candidate_result
             calibration = {"scope": "calibration-metadata", "model": "plumb_bob",
                 "width": result.image_size[0], "height": result.image_size[1],
                 "camera_matrix": [float(value) for value in result.camera_matrix.reshape(-1)],
@@ -508,10 +506,6 @@ class IntrinsicCalibrationService:
                 )
             self._auto_capture_requested = True
             self._auto_capture_interval = interval
-            if self.result_restored:
-                self._auto_capture_error = None
-                self._auto_capture_completed = True
-                return {"ok": True, "auto_capture": self._auto_capture_document_locked()}
             current = self._auto_capture_thread
             if current is not None and current.is_alive():
                 return {"ok": True, "auto_capture": self._auto_capture_document_locked()}
@@ -627,7 +621,7 @@ class IntrinsicCalibrationService:
         if (
             not isinstance(metadata, dict)
             or metadata.get("quality_contract")
-            != "xgc2.camera.intrinsic-quality.v2"
+            != INTRINSIC_QUALITY_CONTRACT
             or not isinstance(metadata.get("candidate_id"), str)
             or not str(metadata["candidate_id"]).strip()
             or not isinstance(metadata.get("stability_assessment"), dict)
@@ -665,8 +659,6 @@ class IntrinsicCalibrationService:
     def _result_document(
         self,
         result: intrinsic_solver.IntrinsicResult,
-        *,
-        saved: bool = True,
     ) -> Dict[str, Any]:
         matrix = result.camera_matrix
         return {
@@ -680,7 +672,6 @@ class IntrinsicCalibrationService:
             "image_height": result.image_size[1],
             "rms_reprojection_error_px": result.rms_reprojection_error_px,
             "sample_count": result.sample_count,
-            "output_file": self.output_file if saved else None,
         }
 
     @staticmethod
@@ -905,23 +896,9 @@ class IntrinsicCalibrationService:
         return compact
 
     def _phase_locked(self) -> str:
-        if self.result is not None:
-            return "saved"
         if self.candidate_result is not None:
             return "candidate_ready"
         return "collecting"
-
-    def _versioned_output_path(self) -> Path:
-        base = Path(self.output_file_base)
-        timestamp = datetime.now().astimezone().strftime("%Y-%m-%d_%H-%M-%S")
-        candidate = base.with_name("{}-{}{}".format(base.stem, timestamp, base.suffix))
-        sequence = 2
-        while candidate.exists():
-            candidate = base.with_name(
-                "{}-{}-{:02d}{}".format(base.stem, timestamp, sequence, base.suffix)
-            )
-            sequence += 1
-        return candidate
 
     def _saved_result_candidates(self) -> List[Path]:
         base = Path(self.output_file_base)
@@ -1160,83 +1137,6 @@ class IntrinsicCalibrationService:
                 pass
         return path.stat().st_mtime
 
-    def _load_saved_result(self) -> bool:
-        saved = []
-        load_error: Optional[Exception] = None
-        for path in self._saved_result_candidates():
-            try:
-                document = intrinsic_solver.load_intrinsic(path)
-            except (OSError, CalibrationError) as error:
-                load_error = error
-                continue
-            if self._saved_board_matches(document):
-                saved.append((self._saved_result_time(document, path), path.name, path, document))
-        if not saved:
-            if load_error is not None:
-                raise load_error
-            return False
-        _created_at, _name, path, document = max(saved, key=lambda item: (item[0], item[1]))
-        self.output_file = str(path)
-        distortion = document.get("distortion_coefficients", {})
-        distortion_values = distortion.get("data") if isinstance(distortion, dict) else None
-        image_size = (int(document["image_width"]), int(document["image_height"]))
-        if (
-            not isinstance(distortion_values, list)
-            or not distortion_values
-            or image_size[0] <= 0
-            or image_size[1] <= 0
-        ):
-            raise CalibrationError("saved intrinsic result is incomplete")
-        result = intrinsic_solver.IntrinsicResult(
-            camera_matrix=document["camera_matrix_array"],
-            distortion=np.asarray(distortion_values, dtype=np.float64),
-            image_size=image_size,
-            rms_reprojection_error_px=float(document["rms_reprojection_error_px"]),
-            sample_count=int(document["sample_count"]),
-        )
-        metadata = document.get("metadata")
-        raw_candidate_id = metadata.get("candidate_id") if isinstance(metadata, dict) else None
-        candidate_id = raw_candidate_id.strip() if isinstance(raw_candidate_id, str) else ""
-        if not candidate_id:
-            raise CalibrationError(
-                "saved intrinsic result has no validated candidate identity"
-            )
-        self.result = result
-        self.result_restored = True
-        self._auto_capture_completed = True
-        self.image_size = image_size
-        self._saved_candidate_id = candidate_id
-        self.collection_revision = (
-            int(metadata.get("collection_revision", result.sample_count))
-            if isinstance(metadata, dict) else result.sample_count
-        )
-        self.result_payload = {
-            **self._result_document(result),
-            "candidate_id": candidate_id,
-            "phase": "saved",
-            "session_revision": self.session_revision,
-            "collection_revision": self.collection_revision,
-            "saved": True,
-            "quality_contract": str(metadata.get("quality_contract", "")),
-            "board_profile": str(metadata.get("board_profile", "")),
-            "feature_model": str(metadata.get("feature_model", "")),
-            "algorithm": dict(metadata.get("algorithm", {}))
-            if isinstance(metadata.get("algorithm"), dict) else {},
-            "quality": {
-                "status": "save_ready",
-                "reasons": [],
-                "assessment": dict(metadata.get("stability_assessment", {})),
-            },
-        }
-        coverage = metadata.get("coverage") if isinstance(metadata, dict) else None
-        if isinstance(coverage, list):
-            self.restored_coverage = [
-                {"label": str(item["label"]), "progress": float(item["progress"])}
-                for item in coverage
-                if isinstance(item, dict) and "label" in item and "progress" in item
-            ]
-        return True
-
     def _load_checkpoint(self) -> bool:
         path = Path(self.checkpoint_file)
         if not path.is_file():
@@ -1329,24 +1229,14 @@ class IntrinsicCalibrationService:
         return bool(self.samples)
 
     def _load_recovery(self) -> None:
-        # An in-progress stage is newer operator intent than any previously
-        # saved versioned result. Successful calibration removes its
-        # checkpoint, so a valid checkpoint must win whenever both exist.
+        # Observation recovery is limited to this private working directory.
         try:
             if self._load_checkpoint():
                 return
         except Exception as error:
             self._recovery_error = str(error) or error.__class__.__name__
-        try:
-            self._load_saved_result()
-        # A damaged recovery artifact must never prevent the camera service
-        # from starting a fresh stage; expose the first problem through state.
-        except Exception as error:
-            if self._recovery_error is None:
-                self._recovery_error = str(error) or error.__class__.__name__
-
     def _save_checkpoint_locked(self) -> None:
-        if not self.samples or self.image_size is None or self.result is not None:
+        if not self.samples or self.image_size is None:
             return
         if len(self.sample_target_ids) != len(self.samples):
             raise CalibrationError("calibration sample target identities do not match")
@@ -1516,8 +1406,7 @@ class IntrinsicCalibrationService:
 
     def _evidence_document_locked(self) -> Dict[str, Any]:
         available = bool(
-            not self.result_restored
-            and self._evidence_samples
+            self._evidence_samples
             and len(self._evidence_samples) == len(self.image_points)
         )
         filename = ""
@@ -1543,18 +1432,9 @@ class IntrinsicCalibrationService:
                 )
             if self._evidence_bundle_path is not None and self._evidence_bundle_path.is_file():
                 return str(evidence["filename"]), self._evidence_bundle_path
-            result_path = Path(self.output_file) if self.result is not None else None
-            result_payload = result_path.read_bytes() if result_path is not None else None
-            result_document = (
-                intrinsic_solver.load_intrinsic(result_path)
-                if result_path is not None else None
-            )
             manifest = {
                 "schema": "xgc2.camera.intrinsic-evidence.v2",
-                "created_at": (
-                    str(result_document.get("created_at", ""))
-                    if result_document is not None else ""
-                ),
+                "created_at": self._capture_started_at,
                 "mode": self.calibration_mode,
                 "camera_name": self.camera_name,
                 "media_source": self.media_source,
@@ -1565,21 +1445,7 @@ class IntrinsicCalibrationService:
                 "algorithm": intrinsic_algorithm_provenance(
                     intrinsic_feature_model(self.board_type)
                 ),
-                "result": (
-                    {
-                        "path": "intrinsics.yaml",
-                        "original_filename": result_path.name,
-                        "sha256": hashlib.sha256(result_payload).hexdigest(),
-                        "image_width": int(self.result.image_size[0]),
-                        "image_height": int(self.result.image_size[1]),
-                        "rms_reprojection_error_px": float(
-                            self.result.rms_reprojection_error_px
-                        ),
-                        "sample_count": int(self.result.sample_count),
-                    }
-                    if result_path is not None and result_payload is not None
-                    else None
-                ),
+                "result": None,
                 "samples": [dict(sample) for sample in self._evidence_samples],
             }
             temporary = self._evidence_root / ".evidence.zip.tmp"
@@ -1587,8 +1453,6 @@ class IntrinsicCalibrationService:
             with zipfile.ZipFile(
                 str(temporary), "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6
             ) as archive:
-                if result_payload is not None:
-                    archive.writestr("intrinsics.yaml", result_payload)
                 archive.writestr(
                     "manifest.json",
                     (json.dumps(manifest, indent=2, sort_keys=True, allow_nan=False) + "\n")
@@ -1690,7 +1554,7 @@ class IntrinsicCalibrationService:
         self._target_pose_ack_enabled = False
         return True
 
-    def _active_target_capture_token_locked(self) -> Optional[Tuple[int, int]]:
+    def _active_target_capture_identity_locked(self) -> Optional[Tuple[int, int]]:
         index = self._explicit_target_index_locked()
         if (
             self._target_capture_phase != "awaiting_detection"
@@ -1705,14 +1569,14 @@ class IntrinsicCalibrationService:
         index: int,
         render_position: Optional[Sequence[float]],
         render_orientation: Optional[Sequence[float]],
-        capture_token: Optional[Tuple[int, int]],
+        capture_identity: Optional[Tuple[int, int]],
     ) -> bool:
         """Accept only a post-command, pose-bound frame for one sim target."""
         if (
             self._recording
             or self.camera is None
             or self._target_capture_phase != "awaiting_detection"
-            or capture_token != (self._target_capture_epoch, index)
+            or capture_identity != (self._target_capture_epoch, index)
             or self.target_done[index]
             or render_position is None
             or render_orientation is None
@@ -1724,7 +1588,7 @@ class IntrinsicCalibrationService:
             return True
         # Gazebo acknowledges the authored model origin, while snapshot
         # metadata describes the optical render frame.  Bind that fixed link
-        # offset only from a fresh, tokened transaction, and never use the
+        # offset only from a fresh capture transaction, and never use the
         # anchoring image as calibration evidence.
         self._anchor_target_render_pose_locked(render_position, render_orientation)
         return False
@@ -1849,17 +1713,17 @@ class IntrinsicCalibrationService:
         source_snapshot_id: str = "",
         source_frame_id: str = "",
         source_timestamp_nanoseconds: Optional[int] = None,
-        _target_capture_token: Any = _TARGET_CAPTURE_TOKEN_UNSET,
+        _target_capture_identity: Any = _TARGET_CAPTURE_IDENTITY_UNSET,
     ) -> None:
         """Ingest one decoded BGR frame: detect the board, auto-collect, annotate."""
-        if _target_capture_token is _TARGET_CAPTURE_TOKEN_UNSET:
+        if _target_capture_identity is _TARGET_CAPTURE_IDENTITY_UNSET:
             # Direct synchronous callers begin their capture at method entry.
-            # ``_capture_frame`` supplies the token recorded before its external
+            # ``_capture_frame`` supplies the identity recorded before its external
             # snapshot transaction, which is the race-sensitive production path.
             with self.lock:
-                capture_token = self._active_target_capture_token_locked()
+                capture_identity = self._active_target_capture_identity_locked()
         else:
-            capture_token = _target_capture_token
+            capture_identity = _target_capture_identity
         if bgr.ndim != 3 or bgr.shape[2] != 3:
             return
         height, width = bgr.shape[:2]
@@ -1973,7 +1837,7 @@ class IntrinsicCalibrationService:
                     if self._aprilgrid_search_hold_frames == 0:
                         self._aprilgrid_search_hold_width = 0
             # A frame that began while the camera was moving may acknowledge the
-            # new pose, but its missing capture token prevents that same frame
+            # new pose, but its missing capture identity prevents that same frame
             # from becoming solve evidence. Only the next transaction is fresh.
             self._acknowledge_target_pose_locked()
             accepted = False
@@ -2005,14 +1869,14 @@ class IntrinsicCalibrationService:
                         )
                 else:
                     cv2.drawChessboardCorners(display, self.board_size, scaled, True)
-                if self.result is None and self.candidate_result is None and not self._solve_running():
+                if self.candidate_result is None and not self._solve_running():
                     target_index = self._explicit_target_index_locked()
                     if target_index is not None:
                         accepted = self._target_frame_is_admissible_locked(
                             target_index,
                             render_position,
                             render_orientation,
-                            capture_token,
+                            capture_identity,
                         )
                     elif self.camera is not None:
                         # Simulation samples belong to authored target identity;
@@ -2312,11 +2176,6 @@ class IntrinsicCalibrationService:
     def state(self) -> Dict[str, Any]:
         with self.lock:
             bars, sample_goodenough = self._coverage_state_locked()
-            if not self.samples and self.restored_coverage:
-                bars = [dict(item) for item in self.restored_coverage]
-                sample_goodenough = bool(bars) and all(
-                    float(item["progress"]) >= 1.0 for item in bars
-                )
             guidance = intrinsic_solver.next_view_guidance(
                 self.samples,
                 coverage_bars=bars,
@@ -2336,9 +2195,7 @@ class IntrinsicCalibrationService:
                 "phase": phase,
                 "session_revision": self.session_revision,
                 "collection_revision": self.collection_revision,
-                "samples": len(self.samples) if self.samples else (
-                    self.result.sample_count if self.result is not None else 0
-                ),
+                "samples": len(self.samples),
                 "sample_target_ids": list(self.sample_target_ids),
                 "coverage": bars,
                 "guidance": guidance,
@@ -2360,7 +2217,6 @@ class IntrinsicCalibrationService:
                 "recovery": {
                     "checkpoint_file": self.checkpoint_file,
                     "checkpoint_available": Path(self.checkpoint_file).is_file(),
-                    "result_restored": self.result_restored,
                     "last_error": self._recovery_error,
                 },
                 "evidence": self._evidence_document_locked(),
@@ -2377,13 +2233,6 @@ class IntrinsicCalibrationService:
                     "solve_frozen": True,
                 }
                 document["candidate"] = dict(self.candidate_payload or {})
-            elif phase == "saved":
-                document.update({
-                    "result": dict(self.result_payload or {}),
-                    "output_file": self.output_file,
-                    "saved_candidate_id": self._saved_candidate_id,
-                    "result_restored": self.result_restored,
-                })
             else:
                 document["candidate_pool"] = {
                     "count": len(self.image_points),
@@ -2417,18 +2266,12 @@ class IntrinsicCalibrationService:
         self.sample_target_ids = []
         self.sample_snapshot_ids = []
         self.image_size = None
-        self.result = None
-        self.result_payload = None
-        self.result_restored = False
         self.candidate_result = None
         self.candidate_payload = None
         self._candidate_diagnostics_full = None
         self._candidate_error = None
-        self._saved_candidate_id = None
         self.session_revision += 1
         self.collection_revision = 0
-        self.restored_coverage = []
-        self.output_file = self.output_file_base
         self.refs = {}
         self.target_done = [False] * len(self.views)
         self._selected_target_index = None
@@ -2453,7 +2296,7 @@ class IntrinsicCalibrationService:
         with self._capture_lock:
             with self.lock:
                 capture = self.frame_capture
-                capture_token = self._active_target_capture_token_locked()
+                capture_identity = self._active_target_capture_identity_locked()
             if capture is None:
                 raise ApiError(
                     HTTPStatus.SERVICE_UNAVAILABLE,
@@ -2504,7 +2347,7 @@ class IntrinsicCalibrationService:
                     source_timestamp_nanoseconds
                     if isinstance(source_timestamp_nanoseconds, int) else None
                 ),
-                _target_capture_token=capture_token,
+                _target_capture_identity=capture_identity,
             )
         with self.lock:
             return {"ok": True, "samples": len(self.samples)}
@@ -2759,7 +2602,7 @@ class IntrinsicCalibrationService:
         with self.lock:
             if self._solve_running():
                 return {"accepted": True, "job": dict(self._solve_job)}
-            if self.candidate_result is not None or self.result is not None:
+            if self.candidate_result is not None:
                 return self._calibrate_locked()
             if not _auto_run:
                 self._require_idle_locked()
@@ -2858,11 +2701,6 @@ class IntrinsicCalibrationService:
         """Discard the current solve candidate while retaining observations."""
         with self.lock:
             self._require_idle_locked()
-            if self.result is not None:
-                raise ApiError(
-                    HTTPStatus.CONFLICT,
-                    "A saved calibration must be reset before collecting again",
-                )
             if self.candidate_result is None:
                 raise ApiError(
                     HTTPStatus.CONFLICT,
@@ -3008,145 +2846,59 @@ class IntrinsicCalibrationService:
         }
         return assessment, list(dict.fromkeys(reasons))
 
-    def save(self, candidate_id: str) -> Dict[str, Any]:
-        """CAS-commit one validated candidate to a versioned intrinsic YAML."""
-        identity = str(candidate_id).strip()
-        if not identity:
-            raise ApiError(HTTPStatus.BAD_REQUEST, "candidate_id must not be empty")
+    def wait_ready(self, timeout):
+        with self._detection_condition:
+            self._detection_condition.wait_for(lambda: self._display is not None or self._readiness_stopping, timeout)
+            return self._display is not None and not self._readiness_stopping
+
+    def stop_readiness(self):
+        with self._detection_condition:
+            self._readiness_stopping = True
+            self._detection_condition.notify_all()
+
+    def read_result(self):
+        """Return an immutable candidate and commit data for Core."""
         with self.lock:
-            self._require_idle_locked()
-            if self.result is not None:
-                if identity == self._saved_candidate_id:
-                    return self.result_payload  # type: ignore[return-value]
-                raise ApiError(
-                    HTTPStatus.CONFLICT,
-                    "A different intrinsic candidate is already saved",
-                )
-            current_id = (
-                str(self.candidate_payload.get("candidate_id"))
-                if self.candidate_payload is not None else ""
-            )
-            if not current_id:
-                raise ApiError(HTTPStatus.CONFLICT, "No intrinsic candidate is ready")
-            if identity != current_id:
-                raise ApiError(
-                    HTTPStatus.CONFLICT,
-                    "Intrinsic candidate changed; solve the current observation pool again",
-                    details={"expected_candidate_id": current_id},
-                )
-            assessment, reasons = self._candidate_save_assessment_locked()
-            if reasons:
-                raise ApiError(
-                    HTTPStatus.UNPROCESSABLE_ENTITY,
-                    "Intrinsic candidate failed independent stability validation",
-                    details={
-                        "code": "intrinsic_candidate_not_save_ready",
-                        "candidate_id": current_id,
-                        "quality_contract": "xgc2.camera.intrinsic-quality.v2",
-                        "board_profile": self.board_profile_id,
-                        "algorithm": intrinsic_algorithm_provenance(
-                            intrinsic_feature_model(self.board_type)
-                        ),
-                        "reasons": reasons,
-                        "assessment": assessment,
-                    },
-                )
             result = self.candidate_result
             if result is None:
-                raise ApiError(HTTPStatus.CONFLICT, "No intrinsic candidate is ready")
-            try:
-                output_file = self._versioned_output_path()
-                intrinsic_solver.save_intrinsic(
-                    output_file,
-                    result,
-                    calibration_mode=self.calibration_mode,
-                    camera_name=self.camera_name,
-                    board_size=self.board_size,
-                    square=self.square,
-                    metadata={
-                        "media_source": self.media_source,
-                        "camera_name": self.camera_name,
-                        "web_calibrator": True,
-                        "feature_model": (
-                            intrinsic_solver.APRILGRID_FEATURE_MODEL
-                            if self.board_type == "aprilgrid"
-                            else "checkerboard_corners_v1"
-                        ),
-                        "candidate_id": current_id,
-                        "quality_contract": "xgc2.camera.intrinsic-quality.v2",
-                        "board_profile": self.board_profile_id,
-                        "algorithm": intrinsic_algorithm_provenance(
-                            intrinsic_feature_model(self.board_type)
-                        ),
-                        "session_revision": self.session_revision,
-                        "collection_revision": self.collection_revision,
-                        "coverage": intrinsic_solver.coverage(self.samples)[0],
-                        "sample_target_ids": list(self.sample_target_ids),
-                        "solver_selection": {
-                            "pool_sample_count": self._candidate_diagnostics_full.get(
-                                "pool_sample_count"
-                            ),
-                            "selected_view_indices": list(
-                                self._candidate_diagnostics_full.get(
-                                    "selected_view_indices", []
-                                )
-                            ),
-                            "rejected_views": list(
-                                self._candidate_diagnostics_full.get(
-                                    "rejected_views", []
-                                )
-                            ),
-                        },
-                        "stability_assessment": assessment,
-                    },
-                    board=self._board_document(),
-                )
-            except OSError as error:
-                raise ApiError(
-                    HTTPStatus.INTERNAL_SERVER_ERROR,
-                    "Could not save calibration result: {}".format(error),
-                ) from error
-            self.output_file = str(output_file)
-            self.result = result
-            self.result_restored = False
-            self._saved_candidate_id = current_id
-            self.session_revision += 1
-            self.result_payload = {
-                **self._result_document(result),
-                "candidate_id": current_id,
-                "phase": "saved",
-                "session_revision": self.session_revision,
-                "collection_revision": self.collection_revision,
-                "saved": True,
-                "quality_contract": "xgc2.camera.intrinsic-quality.v2",
-                "board_profile": self.board_profile_id,
-                "feature_model": (
-                    intrinsic_solver.APRILGRID_FEATURE_MODEL
-                    if self.board_type == "aprilgrid" else "checkerboard_corners_v1"
-                ),
-                "algorithm": intrinsic_algorithm_provenance(
-                    intrinsic_feature_model(self.board_type)
-                ),
-                "quality": {
-                    "status": "save_ready",
-                    "reasons": [],
-                    "assessment": assessment,
-                },
-            }
-            self._evidence_bundle_path = None
-            self._remove_checkpoint_locked()
-            return self.result_payload
+                return None
+            payload = self.candidate_payload
+            document = intrinsic_solver.intrinsic_document(result,
+                camera_name=self.camera_name, board_size=self.board_size, square=self.square,
+                board=self._board_document(), metadata={
+                    "candidate_id": payload["candidate_id"],
+                    "media_source": self.media_source,
+                    "camera_name": self.camera_name,
+                    "web_calibrator": True,
+                    "quality_contract": INTRINSIC_QUALITY_CONTRACT,
+                    "board_profile": self.board_profile_id,
+                    "feature_model": intrinsic_feature_model(self.board_type),
+                    "algorithm": intrinsic_algorithm_provenance(intrinsic_feature_model(self.board_type)),
+                    "session_revision": self.session_revision,
+                    "collection_revision": self.collection_revision,
+                    "coverage": intrinsic_solver.coverage(self.samples)[0],
+                    "sample_target_ids": list(self.sample_target_ids),
+                    "sample_snapshot_ids": list(self.sample_snapshot_ids),
+                    "quality": payload.get("quality"),
+                    "stability_assessment": payload["quality"]["assessment"],
+                    "solver_selection": {key: self._candidate_diagnostics_full.get(key) for key in
+                        ("pool_sample_count", "selected_view_indices", "rejected_views")},
+                    "diagnostics": self._candidate_diagnostics_full,
+                    "frames": [{key: sample.get(key) for key in
+                        ("snapshot_id", "frame_id", "timestamp_nanoseconds")}
+                        for sample in self._evidence_samples],
+                })
+            document.pop("created_at")
+            document["calibration_mode"] = self.calibration_mode
+            return copy.deepcopy({"candidate_id": payload["candidate_id"],
+                                  "quality": payload.get("quality"), "document": document})
 
     def _calibrate_locked(self) -> Dict[str, Any]:
         """Produce one immutable diagnostic candidate from the current pool.
 
-        This endpoint deliberately does not persist a versioned intrinsic file.
-        Rank/LOO failures are rejected immediately; even a numerically complete
-        candidate remains blocked until an independent holdout-validation and
-        explicit commit API exists.
+        Rank/LOO failures are rejected immediately. Core reads the quality
+        assessment and full diagnostics through the result route before commit.
         """
-        if self.result is not None:
-            return self.result_payload  # type: ignore[return-value]
         if self.candidate_result is not None:
             if self._candidate_error is not None:
                 raise ApiError(
@@ -3190,12 +2942,12 @@ class IntrinsicCalibrationService:
         self.session_revision += 1
         candidate_id = self._candidate_id_locked(diagnostics)
         candidate = {
-            **self._result_document(result, saved=False),
+            **self._result_document(result),
             "candidate_id": candidate_id,
             "phase": "candidate_ready",
             "session_revision": self.session_revision,
             "collection_revision": self.collection_revision,
-            "saved": False,
+            "commit_owner": "core",
             "diagnostics": self._compact_diagnostics_document(diagnostics),
         }
         self.candidate_result = result
@@ -3209,7 +2961,7 @@ class IntrinsicCalibrationService:
             "assessment": assessment,
         }
         candidate["save_blocked"] = (
-            "explicit_save_required"
+            "core_commit_required"
             if not quality_reasons else "stability_validation_failed"
         )
 

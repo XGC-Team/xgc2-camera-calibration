@@ -22,7 +22,8 @@ PYTHONPYCACHEPREFIX="${TMPDIR:-/tmp}/xgc2-camera-pycache" python3 -m py_compile 
   xgc_camera_calibration/scripts/*.py \
   xgc_camera_calibration/src/xgc_camera_calibration/*.py \
   xgc_camera_calibration/test/*.py \
-  .xgc2/scripts/xgc2_artifact_manifest.py
+  .xgc2/scripts/xgc2_artifact_manifest.py \
+  .xgc2/scripts/check_python_xrpc.py
 
 MANIFEST_TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf "${MANIFEST_TEST_ROOT}"' EXIT
@@ -105,46 +106,14 @@ fi
 grep -q '<exec_depend>gazebo_msgs</exec_depend>' xgc_camera_calibration/package.xml
 grep -q '<exec_depend>tf</exec_depend>' xgc_camera_calibration/package.xml
 grep -q 'catkin_add_nosetests(test/test_media_snapshot.py)' xgc_camera_calibration/CMakeLists.txt
-grep -q 'load_bootstrap_input' xgc_camera_calibration/scripts/intrinsic_calibrator_web.py
-grep -q '<arg name="bootstrap_input" />' xgc_camera_calibration/launch/intrinsic_calibrator.launch
-grep -q '<arg name="media_edge_rpc_socket"' xgc_camera_calibration/launch/intrinsic_calibrator.launch
-grep -q '<arg name="media_source_id" default="usb_cam"' \
-  xgc_camera_calibration/launch/intrinsic_calibrator.launch
-grep -q '<arg name="snapshot_timeout" default="5.0"' \
-  xgc_camera_calibration/launch/intrinsic_calibrator.launch
-if grep -Eq '<arg name="(image_topic|camera_info_topic|intrinsic_rate)"' \
-  xgc_camera_calibration/launch/intrinsic_calibrator.launch; then
-  echo "intrinsic launch retained a retired ROS image polling parameter" >&2
-  exit 1
-fi
-if grep -Eq 'camera_info_topic|_camera_info_topic' \
-  xgc_camera_calibration/launch/extrinsic_calibrator.launch \
-  xgc_camera_calibration/scripts/extrinsic_calibrator_web.py \
-  .xgc2/scripts/check_installed_packages.sh; then
-  echo "extrinsic calibration retained the removed CameraInfo topic contract" >&2
-  exit 1
-fi
-if grep -Eq 'camera_info_(topic|ready)|CameraInfo|info-topic' \
-  web-src/src/extrinsic-legacy.ts \
-  xgc_camera_calibration/src/xgc_camera_calibration/web_service.py; then
-  echo "extrinsic WebUI retained the removed CameraInfo compatibility state" >&2
-  exit 1
-fi
-if grep -Eq '<arg name="(output_file|references_dir)"|<param name="(output_file|references_dir)"' \
-  xgc_camera_calibration/launch/intrinsic_calibrator.launch; then
-  echo "intrinsic launch retained ignored output/reference compatibility parameters" >&2
-  exit 1
-fi
-for required_arg in calibration_root calibration_mode camera_name; do
-  grep -q "<arg name=\"${required_arg}\" />" \
-    xgc_camera_calibration/launch/intrinsic_calibrator.launch
-done
+python3 -m unittest discover -s xgc_camera_calibration/test -p test_process_contract.py
 if grep -R -E 'intrinsic-validation\.v1|generate_intrinsic_validation|validate_intrinsic_comparison' \
   xgc_camera_calibration/src xgc_camera_calibration/scripts; then
   echo "intrinsic validation retained the removed v1 compatibility contract" >&2
   exit 1
 fi
 grep -q 'CompressedImage' xgc_camera_calibration/scripts/extrinsic_calibrator_web.py
+grep -q 'CameraInfo' xgc_camera_calibration/scripts/extrinsic_calibrator_web.py
 grep -q 'wait_for_message' xgc_camera_calibration/scripts/extrinsic_calibrator_web.py
 if grep -q 'Subscriber(.*self.image_topic' \
   xgc_camera_calibration/scripts/extrinsic_calibrator_web.py; then

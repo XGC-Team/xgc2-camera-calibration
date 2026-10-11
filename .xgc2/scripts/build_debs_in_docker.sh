@@ -34,16 +34,15 @@ docker run --rm \
     mkdir -p \
       /workspace/work/src/xgc_camera_calibration
     rsync -a --delete /workspace/repo/xgc_camera_calibration/ /workspace/work/src/xgc_camera_calibration/
-    rsync -a --delete /workspace/repo/contracts/ /workspace/work/src/contracts/
     rsync -a --delete /workspace/repo/process-definitions/ /workspace/work/src/process-definitions/
     cd /workspace/work
     source /opt/ros/noetic/setup.bash
     # The image supplies XRPC with path-only discovery and describe query support.
-    python3 -c "from importlib.metadata import version; assert version(\"xgc2-xrpc\") == \"0.2.0\", \"the build image must supply Python XRPC 0.2.0\""
-    catkin_make -DCMAKE_BUILD_TYPE=RelWithDebInfo
-    ROS_HOME=/workspace/work/ros-home ROS_LOG_DIR=/workspace/work/ros-log catkin_make run_tests
+    python3 /workspace/repo/.xgc2/scripts/check_python_xrpc.py
+    catkin_make -j1 -DCMAKE_BUILD_TYPE=RelWithDebInfo
+    ROS_HOME=/workspace/work/ros-home ROS_LOG_DIR=/workspace/work/ros-log catkin_make -j1 run_tests
     catkin_test_results --verbose
-    DESTDIR=/workspace/work/install-root catkin_make install -DCMAKE_INSTALL_PREFIX=/opt/ros/noetic -DCATKIN_ENABLE_TESTING=OFF
+    DESTDIR=/workspace/work/install-root catkin_make -j1 install -DCMAKE_INSTALL_PREFIX=/opt/ros/noetic -DCATKIN_ENABLE_TESTING=OFF
     /workspace/repo/.xgc2/scripts/package_debs.sh --install-root /workspace/work/install-root --output-dir /workspace/out
     if [[ "${INSTALL_CHECK}" == true ]]; then
       apt-get install -y /workspace/out/ros-noetic-xgc2-camera-calibration_*.deb

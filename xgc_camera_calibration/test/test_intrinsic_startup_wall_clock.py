@@ -57,7 +57,6 @@ class IntrinsicStartupWallClockTest(unittest.TestCase):
             "intrinsic_service": ("IntrinsicCalibrationService", "intrinsic_calibration_directory"),
             "board_profiles": ("FIELD_6X6_88MM_30PCT", "resolve_aprilgrid_profile"),
             "media_snapshot": ("MediaSnapshotClient",),
-            "preferences": ("create_preferences",),
             "web_service": ("CalibrationHttpServer",),
             "camera_control": (),
         }

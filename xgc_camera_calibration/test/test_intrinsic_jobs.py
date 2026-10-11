@@ -61,8 +61,10 @@ def test_http_job_remains_responsive_and_deduplicates_while_solver_is_blocked(tm
             assert state['solve_job']['status'] == 'succeeded'
             assert compute.call_count == 1
             candidate_id = state['candidate']['candidate_id']
-            saved = request('save', json.dumps({'candidate_id': candidate_id}).encode())[1]
-            assert saved['saved'] and saved['candidate_id'] == candidate_id
+            result = service.read_result()
+            assert result['candidate_id'] == candidate_id
+            assert result['document']['sample_count'] == 3
+            assert not hasattr(service, 'save')
     finally:
         release.set()
         server.close()

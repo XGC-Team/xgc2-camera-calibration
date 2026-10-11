@@ -9,6 +9,7 @@ import {
   DescriptionItem,
   DescriptionList,
   FormField,
+  createMemorySkinStore,
   initializeSkin,
   Notice,
   Panel,
@@ -25,11 +26,10 @@ import {
 } from '@xgc2/ui-react'
 import '@xgc2/ui-react/styles.css'
 import './styles.css'
-import { ManagedSkinStore } from './managed-skin-store'
 
 type StatusTone = 'neutral' | 'info' | 'success' | 'warning' | 'danger'
 
-const skinStore = new ManagedSkinStore()
+const skinStore = createMemorySkinStore('dark')
 
 function useLegacyMutation(ref: RefObject<HTMLElement | null>, sync: () => void) {
   useEffect(() => {
@@ -147,20 +147,14 @@ function LegacyCoverage() {
 
 function ThemeControl() {
   const [skin, setSkin] = useSkin({ store: skinStore })
-  const [issue, setIssue] = useState(skinStore.getIssue())
-  useEffect(() => skinStore.subscribe(() => setIssue(skinStore.getIssue())), [])
   return (
     <>
       <SegmentedControl
         ariaLabel="Appearance"
         value={skin}
         options={[{ label: 'Light', value: 'light' }, { label: 'Dark', value: 'dark' }]}
-        onValueChange={async (value) => {
-          try { await setSkin(value === 'light' ? 'light' : 'dark') }
-          catch { setIssue(skinStore.getIssue()) }
-        }}
+        onValueChange={(value) => { void setSkin(value === 'light' ? 'light' : 'dark') }}
       />
-      {issue ? <StatusText status="Appearance unavailable" tone="danger">{issue}</StatusText> : null}
     </>
   )
 }
@@ -210,13 +204,13 @@ function IntrinsicPage() {
               <Panel title="Calibration">
                 <div className="calibration-actions">
                   <Button id="btn-candidate" className="calibration-action" disabled>Analyze candidate</Button>
-                  <Button id="btn-save" className="calibration-action" tone="primary" appearance="solid" disabled>Save</Button>
                   <Button id="btn-apply-metadata" className="calibration-action" disabled>Apply CameraInfo estimates</Button>
                   <Button id="btn-continue" className="calibration-action" disabled>Continue collecting</Button>
                   <Button id="btn-reset" className="calibration-action">Reset</Button>
                 </div>
                 <LegacyStatus id="status" initial="" hideValues={['']} />
                 <p id="metadata-application" className="calibration-hint">Source-owned CameraInfo metadata application is unavailable.</p>
+                <p className="calibration-hint">Review this candidate and save it through the Core calibration panel.</p>
                 <LegacyCodeResult id="result" initiallyHidden />
               </Panel>
 
@@ -318,8 +312,8 @@ function ExtrinsicPage() {
                   <SectionHeader title="3. Solve" />
                   <div className="calibration-actions">
                     <Button id="solve-button" className="calibration-action" tone="primary" appearance="solid" disabled>Solve</Button>
-                    <Button id="save-button" className="calibration-action" tone="primary" appearance="solid" disabled>Save result</Button>
                   </div>
+                  <p className="calibration-hint">Review this candidate and save it through the Core calibration panel.</p>
                   <LegacyCodeResult id="result-box" initial="Collect at least four independent correspondences." />
                 </section>
 
@@ -329,7 +323,7 @@ function ExtrinsicPage() {
                     <DescriptionItem label="Image" value={<span id="image-topic">—</span>} />
                     <DescriptionItem label="Intrinsic file" value={<span id="intrinsic-file">—</span>} />
                     <DescriptionItem label="Pose prefix" value={<span id="pose-prefix">—</span>} />
-                    <DescriptionItem label="Output" value={<span id="output-file">—</span>} />
+                    <DescriptionItem label="Persistence" value={<span id="output-file">—</span>} />
                   </DescriptionList>
                 </details>
               </ScrollRegion>
@@ -346,18 +340,15 @@ if (!root) throw new Error('Camera calibration root is unavailable')
 const application = createRoot(root)
 async function startApplication() {
   try {
-    await skinStore.restore()
     initializeSkin({ store: skinStore })
-    skinStore.connectEvents()
     flushSync(() => application.render(__CALIBRATION_PAGE__ === 'intrinsic' ? <IntrinsicPage /> : <ExtrinsicPage />))
     if (__CALIBRATION_PAGE__ === 'intrinsic') await import('./intrinsic-legacy')
     else await import('./extrinsic-legacy')
   } catch (error) {
-    application.render(<Panel title="Appearance preferences unavailable">
+    application.render(<Panel title="Calibration page unavailable">
       <Notice role="alert" tone="danger">{(error as Error).message}</Notice>
       <Button onClick={() => { void startApplication() }}>Retry</Button>
     </Panel>)
   }
 }
-window.addEventListener('pagehide', () => skinStore.close())
 void startApplication()

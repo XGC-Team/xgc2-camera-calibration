@@ -1,391 +1,156 @@
 # XGC2 ROS1 Camera Calibration
 
-Public ROS Noetic camera-calibration tools. Camera capture and ROS driver
-adaptation deliberately live in separate products. Both calibration modes can
-ask a co-located XGC Media Edge for bounded immutable snapshots. Fixed-camera
-extrinsic calibration also retains its ROS image and camera-info contract for
-physical cameras while marker poses continue to arrive through ROS.
+This independent ROS Noetic product provides intrinsic and fixed-camera
+extrinsic calibration. Core owns Storage and commits calibration results.
+The calibrators compute candidates, serve them through their own private
+http.v1 service, and show collection and solve progress in their Web pages.
 
-The native Web entrypoints use the maintained Python `xgc2_xrpc` SDK on
-Focal's system `/usr/bin/python3` (3.8) and its image-owned aiohttp/httpx
-dependencies. The build and runtime images must supply the official Python
-XRPC 0.2.0 wheel, including unbound describe query support. The product does
-not bootstrap the SDK or its dependencies. The package's installed check
-verifies the SDK version; there is no Python SDK Debian package dependency. AprilGrid
-retains its OpenCV contrib 4.12 runtime gate.
+Each calibrator requires `socketPath` and `targetId` from Core. Its published
+service is `xgc2.calibration.v1.Calibration`, API version `1`, on the private
+Unix socket. No credentials or persistence service reference enter a product
+process. Appearance preferences in the standalone pages live in memory.
 
-Public browser HTTP uses native aiohttp on a process-owned Runtime. Media and
-simulation calls use explicit UDS bindings and instance-fenced ServiceRefs.
-The same process exposes the private service `xgc2.calibration.v1.Calibration`
-(API version `1`): discover `GET /v1/describe` at the explicit `rpc_socket`,
-then bind the returned ServiceRef. Core reads `/api/v1/intrinsic/state` or
-`/api/v1/state` there; it never uses an unfenced browser endpoint as fallback.
-The private and public hosts share the exact domain objects and Runtime.
-Core's `socketPath` is passed as the private ROS parameter `_socket_path`; the
-launch files expose `socket_path`. It selects the private listener while
-`bootstrapInput` retains the target identity and preferences grants.
-`applicationStateParam` remains the exact owned TF publisher's ROS state name.
-The listener admits calls after domain initialization and returns the Core
-readiness fields for unbound `GET /v1/describe?wait_ready_ms=N` immediately.
-The package installs its three strict definitions from `process-definitions/`
-under `/usr/share/xgc2/process-definitions/`. Gazebo camera entities retain
-their native lifecycle in the camera product's `native_camera_entity.py`;
-calibrators do not delete another process's camera model.
-Background solves and sweeps occupy the Runtime's fixed worker pool until real
-completion; disconnecting a request does not release ongoing work. Saved YAML
-and capture evidence use readable local-time names to the second, with short
-collision sequences. Precise source clocks and scientific timestamps remain in
-metadata. Saving a version never overwrites an existing result. Historical
-filename imports belong to an explicit migration, outside normal resolution.
+## Result and readiness contract
 
-## Calibration capabilities
+An unbound `GET /v1/describe?wait_ready_ms=N` accepts `N` from 0 through 30000.
+The SDK matches discovery by method and path. The service holds the request
+on a condition until camera inputs become ready or the wait expires; the
+response contains `service`, `api_version`, `instance_id`, `ready`, and
+`facts`. Intrinsic readiness requires a captured frame. Extrinsic readiness
+requires an image and a usable model from CameraInfo or an explicit intrinsic
+file. Marker selection and calibration quality remain separate solve state.
 
-### General intrinsic calibration
+Facts include `camera_id`, `calibration_mode`, `result_kind`,
+`result_path: "/v1/result"`, `commit_owner: "core"`, `ros_master_uri`, and
+intrinsic/extrinsic capabilities. Core pins later requests to the discovered
+instance. Describe remains unbound when it carries the readiness query.
 
-The intrinsic calibrator works with fixed, onboard, and vehicle-mounted
-cameras. It auto-collects geometrically diverse chessboard views, tracks
-X/Y/size/skew coverage, solves directly with OpenCV, and atomically writes a
-standard camera calibration YAML. It does not assume that the camera is fixed
-in a world frame.
+`GET /v1/result` returns:
+
+```json
+{
+  "kind": "intrinsic",
+  "camera_id": "front_camera",
+  "calibration_mode": "phy",
+  "revision": "<SHA-256 of the current result>",
+  "result": {
+    "candidate_id": "<computed candidate identity>",
+    "quality": {},
+    "document": {}
+  }
+}
+```
+
+Before a solve, `result` is null. Repeated reads of an unchanged result have
+an unchanged revision. A changed candidate or an invalidated result changes
+it. `document` is the intrinsic or extrinsic calibration document that Core
+needs to commit; Core supplies commit time and durable identity. Reads leave
+all computed and collection state unchanged.
+
+Intrinsic documents carry camera matrix, distortion, image dimensions,
+sample counts, board identity, sample identities, source frame identities,
+algorithm provenance, full residual and stability diagnostics, and the
+candidate quality assessment. Extrinsic documents carry parent and optical
+frame ids, translation, quaternion, sample/inlier counts, every residual,
+point observations, intrinsic model identity, and coordinate provenance.
+Core checks intrinsic quality and reviews the candidate before committing.
+
+The product pages analyze candidates and apply reviewed intrinsic estimates
+as ephemeral CameraInfo metadata when the source advertises that capability.
+Operator Save belongs to the Core calibration panel or workflow. There is
+no product Save route. Source metadata application does not persist a result
+or source configuration and never replays an uncertain mutation.
+
+## Native camera inputs
+
+One `xgc.system.camera` fragment per camera publishes `camera:<id>` and
+`media:<id>`. The workflow supplies topic names, frame roles, source identity,
+private endpoints, and ROS master from these registry entries. Panels bind
+by instance id and those service names. Calibration never opens a device or
+starts another camera producer.
+
+Intrinsic calibration requests immutable captures through the target-local
+Media Edge endpoint. Live preview remains the browser's WebRTC session. The
+AprilGrid detector uses reduced detection pixels and keeps source JPEGs for
+candidate analysis and the evidence download. Optional simulation camera
+control uses the explicitly supplied simulation endpoint; physical cameras
+remain camera-agnostic.
+
+Extrinsic calibration consumes ROS `image_raw/compressed` and `camera_info`,
+or camera `capture` and an explicit intrinsic YAML input. CameraInfo supplies
+the measured model when `intrinsicFile` is empty. Uncalibrated or mismatched
+CameraInfo leaves the model unavailable; it does not invent a pinhole model.
+Image and CameraInfo optical frames and dimensions must agree. Pose markers
+consume `geometry_msgs/PoseStamped` under `posePrefix`. Coordinate provenance
+is explicit: `raw-vrpn` converts the frozen world offset once;
+`experiment-world` already uses that coordinate system.
+
+The extrinsic TF node publishes the immutable resolved pose supplied by
+Core. It validates exact parent and optical frame roles and publishes both
+segments of the parent/link/optical chain. It reports applied transform facts
+on ROS. Core supplies a new resolved pose when it starts the camera fragment
+with a new calibration; the TF node does not update a selection file.
+
+## Launch inputs
+
+The installed process definitions are authoritative. The calibrators need
+`targetId`, `socketPath`, `cameraName`, and `calibrationMode`; native wiring
+supplies camera and media facts. Extrinsic consumers additionally need
+`resolvedExtrinsicJson`, `frameRolesJson`, and exact frame parameters.
 
 ```bash
 roslaunch xgc_camera_calibration intrinsic_calibrator.launch \
-  bootstrap_input:=/run/xgc2/calibration/intrinsic-bootstrap.json \
-  media_edge_rpc_socket:=/run/xgc2/media-edge.sock \
-  media_source_id:=usb_cam snapshot_timeout:=5.0 \
-  calibration_root:=/home/user/Documents/XGC/Calibration/camera \
-  calibration_mode:=phy camera_name:=usb_cam \
-  board_profile:=field_6x6_88mm_30pct \
-  bind_address:=127.0.0.1 http_port:=8766
-```
+  target_id:="$TARGET_ID" socket_path:="$INTRINSIC_SOCKET" \
+  camera_name:=front_camera calibration_mode:=phy \
+  media_edge_rpc_socket:="$MEDIA_SOCKET" media_source_id:=front_camera
 
-Open `http://127.0.0.1:8766/`. The optional `camera_control:=true` adapter can
-move a named Gazebo camera through the sample guide when its explicit
-`simulation_endpoint:=/run/xgc2/simulation.sock` is granted. Simulation control is
-not required by the intrinsic algorithm.
-
-`board_profile` accepts exactly two atomic profiles:
-
-- `field_6x6_88mm_30pct`;
-- `a4_6x6_24mm_30pct_kalibr_v1`.
-
-Both are 6×6 tag36h11 grids with ID 0 at the lower-left, IDs increasing along
-+X then +Y, and every tag rendered with Kalibr `rotation=2` relative to
-OpenCV's raw marker image. This datum matches the established Gazebo textures;
-it does not select the Kalibr solver or require rosbag. Detection and solving
-remain on the same XGC OpenCV path for both profiles. The retired pre-datum A4
-identifier is rejected rather than translated or restored.
-
-Gazebo gives each selected profile a distinct runtime model instance name.
-Switching profiles removes only the other known calibration-board instances;
-reselecting the current profile is idempotent. The world-file legacy instance
-is never deleted and respawned under the same name, avoiding asynchronous
-delete events that could remove a freshly selected board after startup.
-
-The Media Edge must run on the same host and expose the configured source
-before the calibrator starts. Each manual or automatic sample creates one
-immutable snapshot, reads its RGB8 pixels and intrinsic metadata from that same
-capture, then deletes it immediately. Live video remains WebRTC and is never
-polled through this calibration HTTP path.
-
-The product-facing intrinsic service is available under
-`/api/v1/intrinsic/`: `state`, `targets`, `ref/<index>.jpg`, and
-`evidence.zip` are read
-endpoints; `capture`, `goto`, `reset_pose`, `auto_run`, `candidate`, `save`,
-`continue`, and `reset` are JSON actions. `capture` performs one explicit
-immutable snapshot;
-`auto_run` returns HTTP 202 immediately and exposes its authoritative progress
-in `state.action`. Conflicting mutation requests return HTTP 409 until the
-sweep finishes. `candidate` freezes the strict observation pool and performs
-the robust batch solve plus leave-one-view-out validation without writing a
-file. `save` accepts only that candidate's exact ID and is the sole operation
-that creates a timestamped YAML; `continue` discards the candidate while
-retaining its observations. There is no `calibrate` alias. `image.jpg` is the
-most recently annotated detector snapshot, not a live-video transport.
-
-`apply-metadata` is a separate browser action accepting the exact saved
-`candidate_id`. Startup resolves the source-owned `ServiceRef` through the
-bound Media Edge `/v1/media/sources/{id}/ref` and uses that instance-bound
-`camera-source` adapter to apply ephemeral CameraInfo estimates through its native
-configuration API. A completed receipt, matching applied configuration and the
-actual published revision are required. It never changes optical/capture truth
-or persists source configuration, and uncertain mutations are not replayed.
-Without an advertised capability or an available source reference, the UI
-declares application unavailable. Source `describe`/`status` and flat
-`desired_revision`/`applied_revision` configuration fields follow the sole
-`source-control-v1` contract; there is no old source-route compatibility parser.
-
-Every solver-admitted sample retains its exact source JPEG and annotation under
-`<calibration directory>/captures/<capture identity>/`, together with a
-correspondence checkpoint and checksum manifest. Reset and process exit retain
-these captures; deletion is an explicit user file-management operation.
-Evidence ZIP download is available during collection, before solving or saving.
-
-`POST /api/v1/intrinsic/candidate` accepts a frozen observation revision and
-returns HTTP 202 with a job receipt. Repeated submissions during that solve
-return the same job. State includes `solve_job` (stage and progress); computation
-runs outside the state lock, so live detection and short status requests remain
-responsive. No new sample enters the frozen pool while solving. Reconnecting
-clients observe the job; only the exact resulting candidate ID can be saved.
-An interrupted process retains the original capture and exposes a failed job on
-checkpoint recovery; it does not silently resume computation or save an asset.
-
-The optimizer uses OpenCV QR for its linear solves while retaining free K/D,
-the same convergence criteria, iterative robust view exclusion, projected-rank
-checks and complete leave-one-view-out validation. A 30-minute cooperative job
-deadline is checked between fits; it does not forcibly interrupt a native OpenCV
-call. A failed solve retains evidence and never creates a successful YAML.
-
-Replay a preserved physical capture through real HTTP and an explicit Save:
-
-```bash
-python3 tools/verify_intrinsic_capture.py --capture /path/to/capture --output /new/analysis/directory
-```
-
-The output must be new; the source capture is verified and remains unchanged.
-This regression does not activate its resulting YAML in an experiment.
-
-### Fixed-world-camera extrinsic calibration
-
-The extrinsic calibrator is for a camera fixed in an experiment site's world
-frame. It associates world-frame marker poses with pixels in a frozen image,
-then solves and persists `parent_T_camera_optical` using robust PnP.
-
-```bash
 roslaunch xgc_camera_calibration extrinsic_calibrator.launch \
-  bootstrap_input:=/run/xgc2/calibration/extrinsic-bootstrap.json \
-  image_topic:=/usb_cam/image_raw \
-  preview_image_topic:=/usb_cam/image_raw/compressed \
-  intrinsic_file:=/home/user/Documents/XGC/Calibration/camera/phy/usb_cam/intrinsics-2026-08-30_01-02-03.yaml \
-  pose_prefix:=/vrpn_client_node \
-  calibration_root:=/home/user/Documents/XGC/Calibration/camera \
-  calibration_mode:=phy camera_name:=usb_cam \
-  bind_address:=127.0.0.1 http_port:=8765
+  target_id:="$TARGET_ID" socket_path:="$EXTRINSIC_SOCKET" \
+  camera_name:=front_camera calibration_mode:=phy \
+  image_topic:=/front_camera/image_raw/compressed \
+  preview_image_topic:=/front_camera/image_raw/compressed \
+  camera_info_topic:=/front_camera/camera_info \
+  resolved_extrinsic_json:="$RESOLVED_EXTRINSIC_JSON" \
+  frame_roles_json:="$FRAME_ROLES_JSON" \
+  parent_frame:=world child_frame:=front_camera_optical \
+  pose_coordinate_source:=experiment-world
 ```
 
-Open `http://127.0.0.1:8765/`. The solver requires valid intrinsic values, but
-those values are an input contract rather than a package dependency. They may
-come from the intrinsic tool above, a vendor calibration, or an existing
-calibration asset.
+Intrinsic evidence and observation checkpoints use a temporary directory
+under the private socket's runtime directory and are removed at process
+shutdown. They support progress, candidate analysis, and evidence downloads;
+they do not commit calibration assets. Read-only YAML import, resolver, and
+asset export utilities accept explicit data files independently of the
+calibrators. Package installation does not write user calibration files.
 
-The extrinsic HTTP contract separates computation from persistence. `freeze`
-captures one immutable image plus the latest static marker map; `solve`
-returns an in-memory candidate with a content-bound `candidate_id` and writes
-nothing; `save` accepts only that exact candidate ID and is the sole operation
-that creates a timestamped YAML. A stale candidate is rejected and repeating
-Save for the same candidate is idempotent. There is no solve-and-save alias.
+## Python SDK and verification
 
-For a managed Gazebo world camera, use the snapshot mode instead:
+Build and runtime images supply Python XRPC **0.2.0**, from released commit
+`4b257c97887b115eafbf20f7739b7072c5dc468d`, and its pinned native dependencies.
+`.xgc2/scripts/check_python_xrpc.py` verifies the installed version and
+`Context.query` before package builds and installed checks. Version 0.1.0
+cannot serve the required unbound readiness query. Product automation does
+not install toolchain or third-party Python packages.
+
+The currently published XRPC wheel is 0.1.0. The central SDK installer gate
+only allows that checksum-pinned wheel for scene generation and Gazebo
+scenes. CI image provisioning for 0.2.0 is a central prerequisite. This
+repository does not vendor the SDK or guess an unpublished wheel checksum.
+
+Light checks run serially without a ROS master:
 
 ```bash
-roslaunch xgc_camera_calibration extrinsic_calibrator.launch \
-  bootstrap_input:=/run/xgc2/calibration/extrinsic-bootstrap.json \
-  media_edge_rpc_socket:=/run/xgc2/media-edge.sock \
-  media_source_id:=gazebo_world_camera \
-  intrinsic_file:=/home/user/Documents/XGC/Calibration/camera/sim/usb_cam/intrinsics-2026-08-30_01-02-03.yaml \
-  pose_prefix:=/vrpn_client_node \
-  calibration_root:=/home/user/Documents/XGC/Calibration/camera \
-  calibration_mode:=sim camera_name:=usb_cam \
-  bind_address:=127.0.0.1 http_port:=8765
-```
-
-The panel's live view remains direct WebRTC. Freeze captures one immutable
-Media Edge frame, then copies the latest pose of every discovered marker once
-before robust PnP. This contract deliberately has no pose history, timestamp
-interpolation, or marker-age gate: it applies only to the current extrinsic
-experiment, where the calibration camera and all markers remain static during
-capture. No ROS image publisher or calibration JPEG polling is required in
-this mode.
-
-When `media_edge_rpc_socket` is empty, the ROS data adapter consumes the
-canonical JPEG-compressed ROS preview and subscribes to the raw image only
-while handling Freeze. A physical camera using that path must publish the raw,
-compressed, and CameraInfo topics.
-
-Publish a solved fixed-camera transform with:
-
-```bash
-roslaunch xgc_camera_calibration extrinsic_tf.launch \
-  calibration_root:=/home/user/Documents/XGC/Calibration/camera \
-  calibration_mode:=phy camera_name:=usb_cam
-```
-
-An Automation can start the publisher before the operator solves the camera and
-activate the new result without restarting any process:
-
-```bash
-roslaunch xgc_camera_calibration extrinsic_tf.launch \
-  calibration_root:=/home/user/Documents/XGC/Calibration/camera \
-  calibration_mode:=phy camera_name:=usb_cam \
-  wait_for_file:=true require_file_update:=true watch_file:=true
-```
-
-The calibrator writes exactly one immutable
-`<root>/<sim|phy>/<cameraName>/extrinsics-<UTC>.yaml` per explicit Save. It does not
-create or update an `extrinsics.yaml` alias. `require_file_update` ignores every
-timestamped result that existed when the node started; the directory watcher
-then activates the concrete result from the current run. `watch_file` also
-applies later re-solves while the workflow remains open, and the publisher
-exposes the active absolute path as its private `active_extrinsic_file` ROS
-parameter. When `wait_for_file` is false and the partition has no timestamped
-YAML, the node publishes a default identity parent→link→optical chain immediately
-so 3D/AR still have a camera frame; `watch_file` later hot-loads the first saved
-file. That default is not a calibration result.
-
-The stable REP-103 chain is:
-
-```text
-map -> usb_cam_link -> usb_cam_optical_frame
-```
-
-## Independence and release boundary
-
-Intrinsic calibration and fixed-camera extrinsic calibration are separate
-logical workflows. Neither declares a build or release dependency on the
-other. XGC2 Automation may run intrinsic calibration first when no usable
-intrinsic asset exists, but an existing valid intrinsic asset lets the
-extrinsic workflow start directly.
-
-This repository releases `ros-noetic-xgc2-camera-calibration` independently
-from both `libxgc2-camera-dev` and `ros-noetic-xgc2-camera-driver`.
-
-## Automation
-
-XGC2's separately owned process catalog registers three independent
-process-definition IDs for this product:
-
-- `xgc2-camera-intrinsic-calibrator-ros1`
-- `xgc2-camera-extrinsic-calibrator-ros1`
-- `xgc2-camera-extrinsic-tf-ros1`
-
-Both WebUIs bind to loopback by default and require no desktop session or
-`DISPLAY`. Media Edge snapshot mode accepts only a loopback Edge address.
-Managed definitions pass an explicit Documents calibration root, `sim` or
-`phy`, and the stable camera name. The media source ID is not a storage
-identity. This product package does not ship or own XGC2 process definitions.
-
-## Build and test
-
-CI tests the Python solvers and Web services, builds the standalone Debian
-package for Focal `amd64` and `arm64`, installs it in a clean container, and
-checks its ROS launch files, process definitions, Python imports, and local
-HTTP endpoints without installing or launching a camera driver.
-
-The intrinsic and extrinsic pages are two deterministic builds of one React
-entry. Both consume the immutable `@xgc2/ui-react` `0.17.0` release for their
-shell, single-title topbar, themes, panels, controls, feedback, progress,
-tables, structured details, code results, responsive layout, and scrollbars.
-The imperative camera/ROS transport and canvas interaction stay in small
-page-specific modules behind that shared view.
-
-```bash
+.xgc2/scripts/check_package_compliance.sh
+PYTHONPATH="$XRPC_SOURCE/python:$PWD/xgc_camera_calibration/src:$PWD/xgc_camera_calibration/test" \
+  OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 python3 -m pytest -q xgc_camera_calibration/test
 npm --prefix web-src ci
+npm --prefix web-src run check:ui-policy
 npm --prefix web-src run build
-npm --prefix web-src run test:skin-store
 ```
 
-Generated `app.js` and `styles.css` files remain beside each packaged HTML
-entry. CI and release jobs rebuild them and reject source/generated drift.
-
-Appearance uses one product-owned Managed SkinStore restored through the same
-Host's `GET /api/v1/preferences` before `initializeSkin` or page rendering.
-`PUT` carries an exact Storage scope/record CAS plan and publishes only a FULL
-durability receipt. The host's existing `state` event stream carries outside
-window updates; delayed earlier receipts cannot replace newer authority.
-Unknown writes retain their original identity for receipt lookup without replay.
-Only an ordinary never-created version-zero document defaults explicitly to
-dark. Storage failure presents a retry action without browser or memory storage.
-
-The deployment owner registers `contracts/storage-manifest.json` and supplies
-one private, mode0600 BootstrapInput in an owned mode0700 directory. The binding
-owns the `xgc2.calibration.v1.Calibration` Unix endpoint and declares its storage
-grant. `application.storage` contains exactly `grant`, `authorization`,
-`reference` (the actual Storage v1 ServiceRef), and `scope` with namespace
-`camera-calibration` plus explicit user/workspace. The named `authorization`
-resolves through the SDK's bearer grant. Both native entrypoints inject that
-same preferences domain into their browser Host; no browser or file fallback is
-used. Missing startup grants fail before either listener starts.
-
-## Interactive calibration acceptance
-
-Intrinsic Analyze starts a revision-bound background job and returns immediately.
-Save commits the completed candidate; it does not start another solve. Selection
-removes all observations outside the unchanged robust envelope in each refit.
-Independent leave-one-out fits use the same owner Runtime's bounded pool, with
-an explicit validation budget of two and one reserved state/stop worker. The
-outer solve occupies one slot; an automatic sweep waiting for its solve occupies
-another, reducing validation parallelism to one in the four-worker composition.
-Two-worker runtimes run folds inline in the solve worker; automatic sweeps need
-at least three. Standalone library calls run inline unless their caller supplies
-a bounded submitter. No job creates a private thread pool. Folds retain canonical
-observation identities and result order. All retained observations still
-receive a full free-parameter QR fit; final points and intrinsics stay in the source
-image coordinate system. Parallel speed is machine-dependent, not a one-minute SLA.
-
-Extrinsic correspondences use arbitrary discovered pose markers, independent of
-Experiment participants or robot type. The selected pixel must represent the rigid
-body coordinate origin. Freeze captures a static scene; keep bodies stationary.
-Solve estimates a candidate and rejects outliers; Save alone persists a versioned
-`<calibrationRoot>/<sim|phy>/<cameraName>/extrinsics-<UTC>.yaml` and advances the
-exact shared selection. A running TF publisher with `watch_file=true` consumes that
-selection, allowing repeated calibration after moving the camera without restarting
-the Experiment. This file/service contract does not by itself certify downstream
-browser rendering or capture/pose time synchronization.
-
-
-### Resolve a workflow intrinsic input
-
-`resolve_intrinsic.sh --root /path/to/calibration --mode phy --camera usb_cam
---file '' --policy latest --width 3840 --height 2160` selects the newest valid
-same-mode, same-camera timestamped YAML at the requested source resolution.
-The command emits the exact path on stdout and a JSON receipt on stderr. An
-empty path means no valid saved calibration was selected. An explicit `--file`
-is validated and fails on invalid input instead of falling back. `--policy default`
-disables history discovery. Resolution does not modify calibration storage.
-
-New intrinsic saves include `calibration_mode`; legacy files without that field
-retain directory-based mode identity, reported as `legacy-directory`.
-
-
-The extrinsic TF watcher polls selection changes using wall time, including while
-simulation time is paused. Invalid updates retain the last transform and expose
-`~extrinsic_update_error`; a subsequent valid update clears the error. Successful
-publication records the previous and current file in `~active_extrinsic_transition`.
-An invalid initial selection remains a startup error.
-
-With ROS sourced and the package on `PYTHONPATH`, run
-`python3 tools/verify_extrinsic_hot_reload.py --publisher
-xgc_camera_calibration/scripts/extrinsic_tf_publisher.py --output /new/evidence/path`.
-The check creates an isolated ROS master on port 11429 and synthetic calibration
-assets; `--port` chooses another free port and `--static false` checks dynamic TF.
-
-
-Physical workflows declare `poseCoordinateSource=raw-vrpn` and supply the frozen
-Session world offset. Frozen marker coordinates include that offset; saved
-extrinsics therefore describe the camera in experiment-world coordinates. Saved
-points retain both `source_world` and `world`; `metadata.pose_coordinates` records
-the input coordinate source and saved offset.
-
-TF `worldOffsetMode=stored` consumes the saved pose directly, including for
-simulation comparison. `rebase` applies target offset minus saved offset. A
-nonzero rebase of a legacy result without coordinate provenance is rejected.
-The ROS acceptance tool also accepts `--saved-offset X Y Z`, `--target-offset X Y Z`
-and `--world-offset-mode stored|rebase`.
-
-### Workflow file export
-
-The installed `render_asset.py` renders an explicitly pinned Calibration Asset
-spec JSON file, without contacting Core, looking up a branch, or starting ROS:
-
-```sh
-/opt/ros/noetic/lib/xgc_camera_calibration/render_asset.py \
-  --input "$PINNED_CALIBRATION_SPEC_FILE" --format camera_info_yaml \
-  --output "$GRANTED_CAMERA_YAML_FILE"
-```
-
-Use `extrinsics_yaml` for the existing optical transform document. A workflow
-passes the exact spec through its ordinary structured process input and runs
-this command as a finite process. The caller supplies the output directory;
-the tool atomically replaces only the explicit output file and prints its
-path, byte count, and digest. Calibration asset commits use the existing asset
-API. No calibration-specific workflow node, Job, or Core renderer is required.
+Package CI builds with `catkin_make -j1` in the locked XGC2 image. The
+installed check uses an isolated ROS_HOME and a random master port in
+20000–40000, starts real entrypoints, checks held unbound describe and empty
+result reads, verifies TF publication, and stops and waits for its processes.
+Real headless camera calibration and obstacle-scene modeling runs belong to
+the later R5 quiet-window regression gate.

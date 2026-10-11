@@ -20,7 +20,7 @@ IMAGE_PIXELS = 16 * 1024 * 1024
 LIMITS = {"image_bytes": IMAGE_BYTES, "image_pixels": IMAGE_PIXELS, "samples": 64,
           "pending": 4, "total_image_bytes": 256 << 20, "pending_seconds": 120}
 IMAGE_PATH = re.compile(r"^/api/v1/samples/([0-9a-f]{32})/image$")
-TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
 
 class ApiError(RuntimeError):
@@ -138,7 +138,7 @@ class SampleCollection:
         if not isinstance(value, dict) or not required <= set(value) or set(value) - required - optional:
             raise ApiError(400, "Invalid display observation")
         for name in ("id", "source_epoch"):
-            if not isinstance(value[name], str) or not TOKEN.fullmatch(value[name]):
+            if not isinstance(value[name], str) or not IDENTIFIER.fullmatch(value[name]):
                 raise ApiError(400, "Invalid display " + name)
         if value["source_id"] != self.source.source_id:
             raise ApiError(409, "Displayed source does not match the calibration source")
@@ -160,7 +160,7 @@ class SampleCollection:
             fields = {"sampling_session_id", "expected_revision", "request_id", "marker", "pixel", "display"}
             self._check(request, fields, {"replaces_sample_id"}, revision=False)
             request_id = request["request_id"]
-            if not isinstance(request_id, str) or not TOKEN.fullmatch(request_id):
+            if not isinstance(request_id, str) or not IDENTIFIER.fullmatch(request_id):
                 raise ApiError(400, "Invalid sample request_id")
             try:
                 request_digest = digest(request)

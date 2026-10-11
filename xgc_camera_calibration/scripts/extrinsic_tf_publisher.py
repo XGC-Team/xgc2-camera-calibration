@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-"""Publish one frozen camera pose; acknowledge only this Run's exact saves."""
+"""Publish the immutable camera pose supplied by Core for this Run."""
 import sys
 import math
-import time
+import uuid
 
 import rospy
 import tf2_ros
 from geometry_msgs.msg import TransformStamped
 
 from xgc_camera_calibration.extrinsic_application import (
-    ExtrinsicApplication, application_arguments, parse_frame_roles,
+    application_arguments, parse_frame_roles,
 )
+from xgc_camera_calibration.extrinsic_resolver import decode_frozen
 from xgc_camera_calibration.transforms import split_parent_to_optical_pose
 from xgc_camera_calibration.record_facts import AppliedTransformFacts, transform_values
 
@@ -86,21 +87,19 @@ def main():
     args = application_arguments(rospy.myargv()[1:])
     rospy.init_node("xgc_camera_extrinsic_tf")
     try:
-        root = str(rospy.get_param("~calibration_root")).strip()
         mode = str(rospy.get_param("~calibration_mode")).strip()
         camera_name = str(rospy.get_param("~camera_name")).strip()
         roles = parse_frame_roles(args.frame_roles_json)
-        parent = str(rospy.get_param("~parent_frame", "world"))
-        optical = str(rospy.get_param("~optical_frame", "usb_cam_optical_frame"))
-        link = str(rospy.get_param("~camera_link_frame", "usb_cam_link"))
+        parent = str(rospy.get_param("~parent_frame"))
+        optical = str(rospy.get_param("~optical_frame"))
+        link = str(rospy.get_param("~camera_link_frame"))
         if mode not in ("sim", "phy") or parent != roles["parentFrame"] or optical != roles["opticalFrames"][mode]:
             raise ValueError("output frames do not match the controlled camera roles")
         link_offset = tuple(float(rospy.get_param("~link_to_optical_" + axis, 0.0)) for axis in ("x", "y", "z"))
         if not all(math.isfinite(value) for value in link_offset):
             raise ValueError("camera link offset must be finite")
-        application = ExtrinsicApplication(root, camera_name, args.resolved_extrinsic_json, roles,
-            lambda state: rospy.set_param("~extrinsic_application_state", state))
-        frozen = application.frozen
+        frozen = decode_frozen(args.resolved_extrinsic_json, camera_name, roles)
+        instance_id = uuid.uuid4().hex
         # Only explicit uncalibrated auto uses the declared raw-origin identity.
         # The target offset comes from the frozen resolver, not mutable ROS params.
         if frozen["status"] == "uncalibrated":
@@ -111,13 +110,12 @@ def main():
         else:
             transforms = frozen_transform_chain(frozen, parent, link, optical, link_offset)
         static = bool(rospy.get_param("~static", True))
-        rate = float(rospy.get_param("~file_poll_rate" if static else "~publish_rate", 5.0 if static else 10.0))
+        rate = float(rospy.get_param("~publish_rate", 10.0))
         if not math.isfinite(rate) or rate <= 0:
             raise ValueError("camera publication rate must be finite and positive")
         broadcaster = tf2_ros.StaticTransformBroadcaster() if static else tf2_ros.TransformBroadcaster()
         optical_broadcaster = None if static else tf2_ros.StaticTransformBroadcaster()
-        # The same producer epoch binds the publication evidence and selection
-        # handshake. This publisher is a transport projection, not a new owner.
+        # Publication evidence records this process and the supplied resolution.
         fact_topic = [None]
         def emit_fact(text):
             from std_msgs.msg import String
@@ -125,45 +123,30 @@ def main():
                 fact_topic[0] = rospy.Publisher(AppliedTransformFacts.TOPIC, String, queue_size=64, latch=True)
             fact_topic[0].publish(String(data=text))
         facts = AppliedTransformFacts({"id": camera_name + ":" + parent + ":" + optical,
-            "instanceId": application.producer["instanceEpoch"], "kind": "camera-extrinsic",
-            "resolutionId": application.producer["resolutionId"]},
+            "instanceId": instance_id, "kind": "camera-extrinsic",
+            "resolutionId": frozen["resolutionId"]},
             emit_fact,
             lambda message: rospy.logwarn_throttle(5.0, message))
-        active_resolved = frozen
         stamp = publish_chain(transforms, broadcaster, optical_broadcaster)
-        facts.applied(transform_values(transforms), active_resolved, stamp.to_nsec())
-        application.initial_published()
+        facts.applied(transform_values(transforms), frozen, stamp.to_nsec())
+        rospy.set_param("~extrinsic_ready", True)
     except Exception as error:
         rospy.logfatal("Could not start frozen camera extrinsic publisher: %s", error)
         return 2
 
-    def apply(resolved):
-        nonlocal transforms, active_resolved
-        candidate = frozen_transform_chain(resolved, parent, link, optical, link_offset)
-        stamp = publish_chain(candidate, broadcaster, optical_broadcaster)
-        transforms = candidate
-        active_resolved = resolved
-        # Publish success is an actual fact even if the subsequent selection
-        # confirmation CAS fails. Do not rewrite it as the requested/old pose.
-        facts.applied(transform_values(candidate), resolved, stamp.to_nsec())
-
     try:
         while not rospy.is_shutdown():
-            try:
-                application.tick(apply)
-                rospy.set_param("~extrinsic_update_error", "")
-            except Exception as error:
-                rospy.set_param("~extrinsic_update_error", str(error))
-                rospy.logwarn_throttle(5.0, "Camera application is not confirmed: %s", error)
             if not static:
                 stamp = publish_chain(transforms, broadcaster, optical_broadcaster)
-                facts.applied(transform_values(transforms), active_resolved, stamp.to_nsec())
+                facts.applied(transform_values(transforms), frozen, stamp.to_nsec())
             facts.flush()
-            time.sleep(1.0 / rate)
+            if static:
+                rospy.spin()
+                break
+            rospy.rostime.wallsleep(1.0 / rate)
     finally:
         facts.stop(rospy.Time.now().to_nsec())
-        application.ready = False
-        application.project(application.state())
+        rospy.set_param("~extrinsic_ready", False)
     return 0
 
 

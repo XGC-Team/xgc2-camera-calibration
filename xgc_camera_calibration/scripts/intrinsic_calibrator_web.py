@@ -5,21 +5,20 @@ Live imagery belongs to the browser WebRTC session. Simulation requests an
 automatic camera pose; a person moves the physical camera. Both origins feed
 the same continuous, lower-rate Media Edge snapshot detection loop, which
 updates the annotated result and coverage independently from WebRTC FPS.
-Frames themselves are never persisted.
+Frame evidence stays in the private runtime directory until shutdown.
 """
 
 import math
 import sys
+import tempfile
 from pathlib import Path
 
 import rospkg
 import rospy
-from xgc2_xrpc import Runtime, load_bootstrap_input
-from xgc_camera_calibration.preferences import create_preferences
+from xgc2_xrpc import Runtime
 
 from xgc_camera_calibration.intrinsic_service import (
     IntrinsicCalibrationService,
-    intrinsic_calibration_directory,
 )
 from xgc_camera_calibration.board_profiles import (
     FIELD_6X6_88MM_30PCT,
@@ -66,33 +65,28 @@ def main():
     rospy.init_node("xgc_camera_intrinsic_calibrator_web")
     runtime = None
     snapshot_client = None
-    preference_client = None
     metadata_client = None
     camera = None
     service = None
     server = None
+    work_directory = None
     try:
-        bootstrap = load_bootstrap_input(str(rospy.get_param("~bootstrap_input")), role="client")
+        target_id = str(rospy.get_param("~target_id"))
+        socket_path = str(rospy.get_param("~socket_path"))
         runtime = Runtime(blocking_workers=4, max_calls=16, max_connections=24)
-        preferences, preference_client = create_preferences(bootstrap, runtime=runtime)
         snapshot_client = MediaSnapshotClient(
-            rospy.get_param("~media_edge_rpc_socket", "/run/xgc2/media-edge/control/control.sock"),
+            rospy.get_param("~media_edge_rpc_socket"),
             rospy.get_param("~media_source_id", "usb_cam"),
             float(rospy.get_param("~snapshot_timeout", 5.0)),
             runtime=runtime,
-            local_target=bootstrap.binding.target_id,
+            local_target=target_id,
         )
         snapshot_client.health()
         package_root = Path(rospkg.RosPack().get_path("xgc_camera_calibration"))
         web_root = Path(rospy.get_param("~web_root", str(package_root / "web" / "intrinsic")))
-        calibration_root = Path(str(rospy.get_param("~calibration_root")))
-        if not calibration_root.is_absolute():
-            raise ValueError("~calibration_root must be an explicitly granted absolute path")
         calibration_mode = str(rospy.get_param("~calibration_mode")).strip()
         camera_name = str(rospy.get_param("~camera_name")).strip()
-        calibrations = intrinsic_calibration_directory(
-            str(calibration_root), calibration_mode, camera_name
-        )
+        work_directory = tempfile.TemporaryDirectory(prefix="intrinsic-", dir=str(Path(socket_path).parent))
         board_center = (
             float(rospy.get_param("~board_x", 2.0)),
             float(rospy.get_param("~board_y", 0.0)),
@@ -110,13 +104,13 @@ def main():
                 float(rospy.get_param("~camera_control_timeout", 8.0)),
                 endpoint=str(rospy.get_param("~simulation_endpoint")),
                 runtime=runtime,
-                local_target=bootstrap.binding.target_id,
+                local_target=target_id,
             )
         display_width = int(rospy.get_param("~display_width", 720))
         service = IntrinsicCalibrationService(
             board_size=(board_profile.columns, board_profile.rows),
             square=board_profile.tag_size_m,
-            output_file=str(calibrations / "intrinsics.yaml"),
+            output_file=str(Path(work_directory.name) / "intrinsics.yaml"),
             camera_name=camera_name,
             calibration_mode=calibration_mode,
             board_profile_id=board_profile.profile_id,
@@ -136,7 +130,7 @@ def main():
             service.attach_metadata_application(metadata_client)
         except Exception as error:
             rospy.logwarn("Source CameraInfo metadata application unavailable: %s", error)
-        camera = maybe_camera_control(board_center, runtime=runtime, local_target=bootstrap.binding.target_id)
+        camera = maybe_camera_control(board_center, runtime=runtime, local_target=target_id)
         if camera is not None:
             service.attach_camera_control(camera)
         if service.board_type == "aprilgrid":
@@ -174,9 +168,8 @@ def main():
             logger=lambda message: rospy.logdebug("Intrinsic web: %s", message),
             intrinsic_service=service,
             runtime=runtime,
-            binding=bootstrap.binding,
-            rpc_socket=rospy.get_param("~socket_path", None),
-            preferences=preferences,
+            target_id=target_id,
+            rpc_socket=socket_path,
         )
         server.start()
     except Exception as error:
@@ -191,10 +184,10 @@ def main():
             snapshot_client.close()
         if metadata_client is not None:
             metadata_client.close()
-        if preference_client is not None:
-            preference_client.close()
         if runtime is not None:
             runtime.close()
+        if work_directory is not None:
+            work_directory.cleanup()
         return 1
 
     rospy.loginfo(
@@ -214,8 +207,8 @@ def main():
         snapshot_client.close()
         if metadata_client is not None:
             metadata_client.close()
-        preference_client.close()
         runtime.close()
+        work_directory.cleanup()
     return 0
 
 

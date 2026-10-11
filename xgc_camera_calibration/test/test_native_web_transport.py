@@ -121,7 +121,11 @@ class NativeWebTransportTest(unittest.TestCase):
                 self.calls += 1
                 return {"phase": "collecting", "session_revision": 7}
             def start_candidate(self): return {"accepted": True, "job": {"id": "one"}}
-            def save(self, candidate_id): return {"saved": True, "candidate_id": candidate_id}
+            camera_name = "camera"
+            calibration_mode = "phy"
+            def wait_ready(self, timeout): return True
+            def stop_readiness(self): pass
+            def read_result(self): return None
         domain = Intrinsic()
         path = str(self.root / "calibration.sock")
         server = self.server(intrinsic_service=domain, rpc_socket=path, target_id="test-target")
@@ -136,7 +140,7 @@ class NativeWebTransportTest(unittest.TestCase):
                              {"phase": "collecting", "session_revision": 7})
             self.assertEqual(client.call("/api/v1/intrinsic/candidate", {}).status, 202)
             with self.assertRaises(Fault): client.json("/api/v1/intrinsic/save", {})
-            self.assertEqual(client.json("/api/v1/intrinsic/save", {"candidate_id": "candidate-1"})["candidate_id"], "candidate-1")
+            self.assertIsNone(client.json("/v1/result", method="GET")["result"])
             calls = domain.calls
             server.private_host.instance_id = "replaced-instance"
             with self.assertRaises(Exception): client.json("/api/v1/intrinsic/state", method="GET")
@@ -165,7 +169,7 @@ class NativeWebTransportTest(unittest.TestCase):
                 calls.append("state")
                 return {}
             def solve(self, value): return {}
-            def save(self, identity): return {}
+            def stop_readiness(self): pass
         path = str(self.root / "calibration.sock")
         server = self.server(service=Service(), rpc_socket=path, target_id="test-target")
         errors = []
@@ -202,7 +206,7 @@ class NativeWebTransportTest(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertFalse(Path(path).exists())
 
-    def test_saved_candidate_applies_native_camera_info_receipt_once(self):
+    def test_reviewed_candidate_applies_native_camera_info_receipt_once(self):
         import copy
         import numpy as np
         state = {"source_id": "camera", "desired_revision": 4, "desired": {},
@@ -239,10 +243,10 @@ class NativeWebTransportTest(unittest.TestCase):
             service = IntrinsicCalibrationService(output_file=str(self.root / "intrinsics.yaml"),
                 camera_name="camera", board_size=(7, 5), square=.2, media_source="camera")
             service.attach_metadata_application(application)
-            service.result = IntrinsicResult(np.array([[500., 0., 320.], [0., 501., 240.], [0., 0., 1.]]),
+            service._candidate_save_assessment_locked = lambda: ({"passed": True}, [])
+            service.candidate_result = IntrinsicResult(np.array([[500., 0., 320.], [0., 501., 240.], [0., 0., 1.]]),
                 np.zeros(5), (640, 480), .1, 3)
-            service._saved_candidate_id = "saved-1"
-            service.result_payload = {"candidate_id": "saved-1"}
+            service.candidate_payload = {"candidate_id": "candidate-1"}
             server = self.server(intrinsic_service=service, runtime=runtime)
             def request(identity):
                 return urllib.request.Request(self.url(server, "/api/v1/intrinsic/apply-metadata"),
@@ -251,25 +255,25 @@ class NativeWebTransportTest(unittest.TestCase):
                 urllib.request.urlopen(request("stale"), timeout=1)
             self.assertEqual(mismatch.exception.code, 409)
             self.assertEqual(mutations, [])
-            with urllib.request.urlopen(request("saved-1"), timeout=1) as response:
+            with urllib.request.urlopen(request("candidate-1"), timeout=1) as response:
                 receipt = json.load(response)
             self.assertEqual(receipt["published_calibration_revision"], 5)
             self.assertEqual(mutations[0]["config"]["calibration"]["model"], "plumb_bob")
-            with urllib.request.urlopen(request("saved-1"), timeout=1) as response:
+            with urllib.request.urlopen(request("candidate-1"), timeout=1) as response:
                 self.assertEqual(json.load(response), receipt)
             self.assertEqual(len(mutations), 1)
             with urllib.request.urlopen(self.url(server, "/api/v1/intrinsic/state"), timeout=1) as response:
                 self.assertEqual(json.load(response)["metadata_application"]["receipt"], receipt)
             # A 200 response and applied fields alone cannot prove ROS publication.
-            service._saved_candidate_id = "saved-2"
+            service.candidate_payload = {"candidate_id": "candidate-2"}
             service._metadata_receipt = None
             state["desired_revision"] = 4
             valid_receipt[0] = False
             with self.assertRaises(urllib.error.HTTPError) as unconfirmed:
-                urllib.request.urlopen(request("saved-2"), timeout=1)
+                urllib.request.urlopen(request("candidate-2"), timeout=1)
             self.assertEqual(unconfirmed.exception.code, 502)
             with self.assertRaises(urllib.error.HTTPError) as repeated:
-                urllib.request.urlopen(request("saved-2"), timeout=1)
+                urllib.request.urlopen(request("candidate-2"), timeout=1)
             self.assertEqual(repeated.exception.code, 409)
             self.assertEqual(len(mutations), 2)
             server.close()
@@ -311,8 +315,8 @@ class NativeWebTransportTest(unittest.TestCase):
             native.close()
             runtime.close()
 
-class ManagedCalibrationStorageTest(unittest.TestCase):
-    def test_readable_versions_are_immutable_and_atomic_failed_ref_keeps_old_bytes(self):
+class CalibrationEvidenceTest(unittest.TestCase):
+    def test_evidence_keeps_old_reference_after_atomic_write_failure(self):
         import numpy as np
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as directory:
@@ -321,17 +325,6 @@ class ManagedCalibrationStorageTest(unittest.TestCase):
             service = IntrinsicCalibrationService(output_file=str(partition / "intrinsics.yaml"),
                 camera_name="camera", calibration_mode="phy", board_size=(7, 5), square=.2,
                 references_dir=str(partition / "references"))
-            first = service._versioned_output_path()
-            result = IntrinsicResult(np.eye(3), np.zeros(5), (640, 480), .1, 3)
-            save_intrinsic(first, result, camera_name="camera", calibration_mode="phy", board_size=(7, 5), square=.2)
-            self.assertRegex(first.name, r"^intrinsics-\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}(?:-\d{2,4})?\.yaml$")
-            self.assertEqual(selected_intrinsic_path(str(root), "phy", "camera", str(first)), first)
-            old = first.read_bytes()
-            with self.assertRaises(FileExistsError):
-                save_intrinsic(first, result, camera_name="camera", board_size=(7, 5), square=.2)
-            self.assertEqual(first.read_bytes(), old)
-            second = service._versioned_output_path()
-            self.assertNotEqual(first, second)
             self.assertRegex(service._evidence_root.name, r"^capture-\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}(?:-\d{2,4})?$")
             service._save_ref(0, b"old")
             with patch("xgc_camera_calibration.intrinsic_service.os.replace", side_effect=OSError("disk full")):
