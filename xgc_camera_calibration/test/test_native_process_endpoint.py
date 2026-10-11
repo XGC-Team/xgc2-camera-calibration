@@ -212,6 +212,7 @@ class NativeProcessEndpointTest(unittest.TestCase):
             media.close()
 
     def test_node_arguments_forward_socket_and_target(self):
+        importlib.import_module('xgc_camera_calibration.ros_lifecycle')
         parameters = {'~target_id': 'local-test', '~socket_path': str(self.root / 'allocated.sock'),
                       '~calibration_mode': 'phy', '~camera_name': 'test-camera',
                       '~parent_frame': 'world', '~child_frame': 'test-camera-optical',

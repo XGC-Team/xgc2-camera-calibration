@@ -208,8 +208,7 @@
           "_allowed_origins:=${allowedOrigins}",
           "_socket_path:=${socketPath}",
           "_target_id:=${targetId}",
-          "_camera_info_topic:=${cameraInfoTopic}",
-          "_trackers:=${trackers}"
+          "_camera_info_topic:=${cameraInfoTopic}"
         ],
         "env": {
           "ROS_MASTER_URI": "${rosMasterUri}",
