@@ -2877,6 +2877,11 @@ class IntrinsicCalibrationService:
             if result is None:
                 return None
             payload = self.candidate_payload
+            quality = payload["quality"]
+            if quality["status"] != "save_ready" or quality["reasons"] or not quality["assessment"]["passed"]:
+                raise ApiError(HTTPStatus.UNPROCESSABLE_ENTITY,
+                               "Intrinsic calibration candidate is not ready to save",
+                               details=quality)
             document = intrinsic_solver.intrinsic_document(result,
                 camera_name=self.camera_name, board_size=self.board_size, square=self.square,
                 board=self._board_document(), metadata={
@@ -2910,8 +2915,8 @@ class IntrinsicCalibrationService:
     def _calibrate_locked(self) -> Dict[str, Any]:
         """Produce one immutable diagnostic candidate from the current pool.
 
-        Rank/LOO failures are rejected immediately. Core reads the quality
-        assessment and full diagnostics through the result route before commit.
+        Rank/LOO failures are rejected immediately. This product owns the quality
+        assessment; the result route supplies accepted commit data to Core.
         """
         if self.candidate_result is not None:
             if self._candidate_error is not None:

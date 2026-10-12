@@ -1577,7 +1577,7 @@ class IntrinsicServiceTest(unittest.TestCase):
                 server.close()
             self.assertEqual(list(Path(directory).glob("intrinsics*.yaml")), [])
 
-    def test_normalized_ray_instability_is_in_the_result_for_core_review(self):
+    def test_native_result_refuses_normalized_ray_instability(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory) / "intrinsics.yaml"
             service = make_service(base)
@@ -1587,10 +1587,11 @@ class IntrinsicServiceTest(unittest.TestCase):
             unstable = make_diagnostic_result((frame.shape[1], frame.shape[0]), 3, ray_max=214.0)
             with patch.object(intrinsic_solver, "calibrate_intrinsic", return_value=unstable):
                 candidate = service.calibrate()
-            result = service.read_result()
-            self.assertEqual(result["candidate_id"], candidate["candidate_id"])
-            self.assertEqual(result["quality"]["status"], "unstable")
-            self.assertIn("normalized_ray_stability_exceeds_confidence_envelope", result["quality"]["reasons"])
+            self.assertEqual(candidate["quality"]["status"], "unstable")
+            self.assertIn("normalized_ray_stability_exceeds_confidence_envelope", candidate["quality"]["reasons"])
+            with self.assertRaises(ApiError) as caught:
+                service.read_result()
+            self.assertEqual(caught.exception.status, int(HTTPStatus.UNPROCESSABLE_ENTITY))
             self.assertFalse(base.exists())
             self.assertFalse(hasattr(service, "save"))
 

@@ -80,7 +80,9 @@ algorithm provenance, full residual and stability diagnostics, and the
 candidate quality assessment. Extrinsic documents carry parent and optical
 frame ids, translation, quaternion, sample/inlier counts, every residual,
 point observations, intrinsic model identity, and coordinate provenance.
-Core checks intrinsic quality and reviews the candidate before committing.
+The native calibrator owns intrinsic quality assessment. `/v1/result` refuses a
+candidate that is not ready to save; Core maps the accepted document into the
+configuration store without interpreting quality or algorithm provenance.
 
 The product pages analyze candidates and apply reviewed intrinsic estimates
 as ephemeral CameraInfo metadata when the source advertises that capability.
