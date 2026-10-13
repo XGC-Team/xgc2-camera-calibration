@@ -56,6 +56,17 @@ class FrozenResolverTest(SelectionFixture):
         self.path.unlink()
         self.assertEqual(decode_frozen(frozen, "usb_cam", ROLES), first)
 
+    def test_pinned_core_asset_consumes_numbers_without_files_or_selection(self):
+        value = self.resolve({"mode": "version", "result": self.result})
+        value.pop("result")
+        value.update(choiceMode="asset", sourceMode="phy", asset={"resourceId": "asset-id", "commitId": "commit-id"})
+        self.path.unlink()
+        self.assertEqual(decode_frozen(encode_frozen(value), "usb_cam", ROLES), value)
+        corrupt = copy.deepcopy(value)
+        corrupt["resolvedOpticalPose"]["translation"][0] += 1
+        with self.assertRaises(CalibrationError):
+            encode_frozen(corrupt)
+
     def test_manual_version_does_not_read_corrupt_global_selection(self):
         self.pointer().parent.mkdir(parents=True)
         self.pointer().write_bytes(b'broken')

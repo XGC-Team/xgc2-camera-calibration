@@ -101,7 +101,14 @@ def _validate_frozen(value):
         if mode != "auto" or value["globalAppliedRevision"] != 0:
             raise CalibrationError("uncalibrated result cannot claim an applied revision")
         return
-    if status == "calibrated" and mode in ("auto", "version"):
+    if status == "calibrated" and mode == "asset":
+        base |= {"asset", "sourceMode", "sourceOpticalFrame"}
+        pin = closed_object(value.get("asset"), {"resourceId", "commitId"}, "calibration asset pin")
+        identifier(pin["resourceId"], "asset resource")
+        identifier(pin["commitId"], "asset commit")
+        if value.get("sourceMode") not in ("sim", "phy") or not isinstance(value.get("sourceOpticalFrame"), str):
+            raise CalibrationError("asset optical source is invalid")
+    elif status == "calibrated" and mode in ("auto", "version"):
         base |= {"result", "sourceOpticalFrame"}
         validate_result(value.get("result"))
         frame = value.get("sourceOpticalFrame")
@@ -139,7 +146,7 @@ def decode_frozen(payload, camera_name, frame_roles):
     _validate_frozen(value)
     if value["cameraName"] != camera_name:
         raise CalibrationError("frozen extrinsic camera does not match")
-    if value["status"] == "calibrated" and value["sourceOpticalFrame"] != roles["opticalFrames"][value["result"]["sourceMode"]]:
+    if value["status"] == "calibrated" and value["sourceOpticalFrame"] != roles["opticalFrames"][value["sourceMode"] if value["choiceMode"] == "asset" else value["result"]["sourceMode"]]:
         raise CalibrationError("frozen extrinsic optical role does not match")
     return value
 
