@@ -491,10 +491,11 @@ class WebCalibrationServiceTest(unittest.TestCase):
             "coordinate_provenance": coordinate_provenance, "ideal_intrinsic_parameters": ideal_intrinsic_parameters,
             "rospy": SimpleNamespace(Time=SimpleNamespace(now=lambda:SimpleNamespace(to_sec=lambda:12.34)))}
         exec(compile(ast.Module(body=methods,type_ignores=[]),str(source_path),"exec"),namespace)
-        source = SimpleNamespace(lock=threading.RLock(),marker_latest={},marker_receipts={},
-            source_size=(640,480),snapshot_client=SimpleNamespace(status=lambda: {"ready": True}),pose_max_age=2.,
-            use_camera_info=False,intrinsic_matrix=self.intrinsic,intrinsic_distortion=self.distortion,
-            intrinsic_size=(640,480),intrinsic_provenance={},pose_coordinate_source="raw-vrpn",pose_world_offset=(10.,-5.,2.))
+        # CameraInfo is the model authority even when no ROS preview or helper
+        # native capture has run. Browser image bytes are validated at commit.
+        source = SimpleNamespace(lock=threading.RLock(),marker_latest={},marker_receipts={},pose_max_age=2.,
+            use_camera_info=True,camera_info=(self.intrinsic,self.distortion,(640,480),"camera-optical"),
+            camera_info_topic="/camera/camera_info",pose_coordinate_source="raw-vrpn",pose_world_offset=(10.,-5.,2.))
         source._observation_context=MethodType(namespace["_observation_context"],source)
         callback=namespace["_marker_callback"](source,"one")
         def message(position):
@@ -507,6 +508,8 @@ class WebCalibrationServiceTest(unittest.TestCase):
         self.assertEqual(first.position,(11.,-3.,5.));self.assertEqual(first.source_position,(1.,2.,3.))
         self.assertEqual(second.position,(14.,0.,8.));self.assertNotEqual(first.observation_id,second.observation_id)
         self.assertEqual((first.source_stamp_sec,first.received_at_sec,first.received_monotonic_sec),(12.34,123456.,100.))
+        with self.assertRaisesRegex(ApiError,"Camera intrinsics are 640x480"):
+            namespace["observe_marker"](source,"one",320,240,"world")
         clock.monotonic=lambda:104.
         with self.assertRaisesRegex(ApiError,"fresh"):
             namespace["observe_marker"](source,"one",640,480,"world")

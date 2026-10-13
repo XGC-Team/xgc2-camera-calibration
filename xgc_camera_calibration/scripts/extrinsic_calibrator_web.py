@@ -319,13 +319,9 @@ class RosCalibrationSource:
     def observe_marker(self, marker, width, height, parent_frame):
         # Metadata and latest pose only: the browser already owns the clicked
         # image. Never capture another frame to reinterpret its pixels.
-        with self.lock:
-            expected_size = self.source_size
-            available = self.snapshot_client.status()["ready"] if self.snapshot_client is not None else self.preview_jpeg_bytes() is not None
-        if not available or expected_size is None:
-            raise ApiError(409, "Calibration source dimensions are unavailable")
-        if (width, height) != expected_size:
-            raise ApiError(409, "Displayed image does not match calibration source dimensions")
+        # The selected intrinsic model owns dimensions. A browser-owned frame
+        # must not depend on a separate ROS preview or native capture having run.
+        # _observation_context checks the model here; commit validates the image.
         context = self._observation_context(width, height, parent_frame, marker)
         observation = context.pop("markers").get(marker)
         if observation is None:
