@@ -38,8 +38,9 @@ def split_list_parameter(value):
 def maybe_camera_control(board_center, board_profile, parameters, *, runtime, local_target):
     """Attach the optional Gazebo camera adapter, or run camera-agnostic.
 
-    The explicit simulation endpoint connects lazily when the guide is viewed.
-    The configured adapter survives an absent or restarted world.
+    The selected board belongs to the running calibration, including when no
+    guide is viewed. Its existing peer connects asynchronously and survives an
+    absent or restarted world.
     """
     if not bool(parameters.get("~camera_control", False)):
         return None
@@ -49,8 +50,10 @@ def maybe_camera_control(board_center, board_profile, parameters, *, runtime, lo
         raise ValueError("~camera_control_timeout must be finite and positive")
     endpoint = str(parameters.get("~simulation_endpoint"))
     from xgc_camera_calibration.camera_control import GazeboCameraControl
-    return GazeboCameraControl(model_name, board_center, connection_timeout=timeout,
+    camera = GazeboCameraControl(model_name, board_center, connection_timeout=timeout,
         endpoint=endpoint, runtime=runtime, local_target=local_target, board_profile=board_profile)
+    camera.world.peer.activate()
+    return camera
 
 
 def main():
