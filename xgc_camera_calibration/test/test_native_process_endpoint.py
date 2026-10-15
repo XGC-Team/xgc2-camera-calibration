@@ -266,6 +266,69 @@ class NativeProcessEndpointTest(unittest.TestCase):
         source.stop_readiness()
         self.assertFalse(source.wait_ready(0))
 
+    def test_extrinsic_describe_survives_ros_clock_initialization_window(self):
+        path = Path(__file__).parents[1] / 'scripts/extrinsic_calibrator_web.py'
+        spec = importlib.util.spec_from_file_location('extrinsic_clock_window_test', path)
+        entry = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(entry)
+        source = entry.RosCalibrationSource('', 'phy', 'test-camera',
+            parameters={'~pose_coordinate_source': 'experiment-world',
+                        '~child_frame': 'test-camera-optical'},
+            frozen_extrinsic={'targetCoordinates': {'worldOffset': [0, 0, 0]}})
+        self.addCleanup(source.close)
+        initialized = entry.rospy.core.is_initialized()
+        clock_initialized = entry.rospy.rostime.is_rostime_initialized()
+        self.addCleanup(entry.rospy.core.set_initialized, initialized)
+        self.addCleanup(entry.rospy.rostime.set_rostime_initialized, clock_initialized)
+        # Noetic init_node sets the node flag before init_simtime. Local HTTP
+        # may run in that window, even with no camera or pose publisher.
+        entry.rospy.core.set_initialized(True)
+        entry.rospy.rostime.set_rostime_initialized(False)
+        with self.assertRaises(entry.rospy.exceptions.ROSInitException):
+            entry.rospy.Time.now()
+        domain = Domain()
+        server = CalibrationHttpServer(('127.0.0.1', 0), domain, self.root,
+            frame_ancestors="'self'", target_id='local-test',
+            rpc_socket=str(self.root / 'clock-window.sock'),
+            peer_status=lambda: {'world': source.status()}).start()
+        self.addCleanup(server.close)
+        with Client.from_service(server.service_ref, runtime=server.runtime,
+                                 local_target='local-test') as client:
+            before = client.json('/v1/describe?wait_ready_ms=0', method='GET', timeout=1)
+            self.assertTrue(before['ready'])
+            self.assertFalse(before['facts']['peers']['world']['world_pose_available'])
+            entry.rospy.rostime.set_rostime_initialized(True)
+            now = entry.rospy.Time.now().to_sec()
+            source.marker_latest['body'] = object()
+            source.marker_receipts['body'] = (time.monotonic(), now)
+            after = client.json('/v1/describe?wait_ready_ms=0', method='GET', timeout=1)
+            self.assertTrue(after['ready'])
+            self.assertTrue(after['facts']['peers']['world']['world_pose_available'])
+        server.close()
+        self.assertTrue(server.runtime.closed)
+        self.assertFalse(Path(server.service_ref.endpoint.address).exists())
+
+    def test_stop_during_ros_initialization_does_not_admit_a_bound_lifetime(self):
+        from xgc_camera_calibration.ros_lifecycle import RosMasterBinding
+        import rospy
+        for interrupted in (False, True):
+            with self.subTest(interrupted=interrupted):
+                binding = RosMasterBinding('initialization-stop-test')
+                self.addCleanup(binding.close)
+                def initialize(*_args, **_kwargs):
+                    binding._signal(signal.SIGTERM, None)
+                    if interrupted:
+                        raise rospy.exceptions.ROSInitException('init_node interrupted')
+                with patch.object(binding, '_probe', return_value=(123, 'master-run')), \
+                        patch.object(rospy.core, 'is_initialized', return_value=False), \
+                        patch.object(rospy, 'init_node', side_effect=initialize), \
+                        patch.object(rospy, 'signal_shutdown') as shutdown:
+                    self.assertFalse(binding.initialize())
+                    shutdown.assert_called_once_with('process stopped')
+                self.assertIsNone(binding._thread)
+                self.assertFalse(binding.status()['available'])
+                binding.close()
+
 
 class NativeEntrypointTest(unittest.TestCase):
     """Real rospy processes, released SDK hosts, and isolated ROS masters."""

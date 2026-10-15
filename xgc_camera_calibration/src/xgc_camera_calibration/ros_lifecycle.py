@@ -76,8 +76,9 @@ class RosMasterBinding:
 
     def _signal(self, *_args):
         self.stop_readiness()
-        if rospy.core.is_initialized():
-            rospy.signal_shutdown("process stopped")
+        # rospy's shutdown flag also interrupts init_node before initialization
+        # completes; waiting for is_initialized can lose this stop request.
+        rospy.signal_shutdown("process stopped")
 
     def status(self):
         with self._condition:
@@ -115,7 +116,14 @@ class RosMasterBinding:
                 ceiling = min(30.0, ceiling * 2)
                 continue
             self._identity = identity
-            rospy.init_node(self.node_name, disable_signals=True)
+            try:
+                rospy.init_node(self.node_name, disable_signals=True)
+            except rospy.exceptions.ROSInitException:
+                if self._stop.is_set():
+                    return False
+                raise
+            if self._stop.is_set():
+                return False
             with self._condition:
                 self._status.update(available=True, reason="available", pid=identity[0], run_id=identity[1])
                 self._condition.notify_all()

@@ -223,7 +223,8 @@ class RosCalibrationSource:
                 self.source_size = (media["width"], media["height"])
             preview_ready = self.preview_jpeg_bytes() is not None
             wall_now = time.monotonic()
-            ros_now = rospy.Time.now().to_sec() if rospy.core.is_initialized() else 0.0
+            # init_node marks the node initialized before it initializes time.
+            ros_now = rospy.Time.now().to_sec() if rospy.rostime.is_rostime_initialized() else 0.0
             marker_names = sorted(name for name in self.marker_latest
                 if pose_is_fresh(self.marker_receipts.get(name), wall_now, ros_now, self.pose_max_age))
             return {
