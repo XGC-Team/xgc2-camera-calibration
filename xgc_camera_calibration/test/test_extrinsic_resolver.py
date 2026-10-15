@@ -11,7 +11,7 @@ import unittest
 
 import yaml
 
-from xgc_camera_calibration.extrinsic_resolver import decode_frozen, encode_frozen, resolve_selection
+from xgc_camera_calibration.extrinsic_resolver import decode_frozen, encode_frozen, resolve_selection, resolve_pinned_asset
 from xgc_camera_calibration.extrinsic_selection import CalibrationError, SelectionStore
 # catkin/nose loads this file by path, without adding its sibling test directory.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -66,6 +66,48 @@ class FrozenResolverTest(SelectionFixture):
         corrupt["resolvedOpticalPose"]["translation"][0] += 1
         with self.assertRaises(CalibrationError):
             encode_frozen(corrupt)
+
+    def test_raw_pinned_asset_resolves_without_storage_and_preserves_input(self):
+        asset = {"camera": {"sourceId": "usb_cam"}, "extrinsics": {
+            "parentFrame": "world", "childFrame": ROLES["opticalFrames"]["phy"], "calibrationMode": "phy",
+            "translation": [1, 2, 3], "rotationRpy": [0, 0, 0],
+            "poseCoordinates": {"schema_version": 1, "kind": "experiment-world", "frame": "world", "world_offset": [4, 5, 6]}}}
+        before = copy.deepcopy(asset)
+        pin = {"resourceId": "asset-id", "commitId": "commit-id"}
+        value = resolve_pinned_asset("usb_cam", asset, pin, TARGET, ROLES, "pinned-resolution")
+        self.assertEqual(value["resolvedOpticalPose"]["translation"], [4, 5, 6])
+        self.assertEqual(value["originalOpticalPose"]["translation"], [1, 2, 3])
+        self.assertEqual(asset, before)
+        self.assertEqual(decode_frozen(encode_frozen(value), "usb_cam", ROLES), value)
+        result = subprocess.run([sys.executable, str(SCRIPT), "--camera", "usb_cam",
+            "--asset-json", json.dumps(asset), "--asset-pin-json", json.dumps(pin),
+            "--target-offset-json", json.dumps(dict(zip(("x", "y", "z"), TARGET["worldOffset"]))),
+            "--frame-roles-json", json.dumps(ROLES), "--resolution-id", "pinned-resolution"],
+            capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), value)
+        intrinsic = {"camera":{"sourceId":"usb_cam"}, "intrinsics":{
+            "model":"plumb_bob", "width":640,"height":480,
+            "k":[500,0,320,0,500,240,0,0,1], "d":[0,0,0,0,0]}}
+        rendered = subprocess.run([sys.executable, str(SCRIPT), "--camera", "usb_cam",
+            "--asset-json", json.dumps(asset), "--asset-pin-json", json.dumps(pin),
+            "--intrinsic-asset-json", json.dumps(intrinsic), "--output-format", "camera-context",
+            "--target-offset-json", json.dumps(dict(zip(("x","y","z"),TARGET["worldOffset"]))),
+            "--frame-roles-json", json.dumps(ROLES), "--resolution-id", "pinned-resolution"],
+            capture_output=True,text=True,timeout=5)
+        self.assertEqual(rendered.returncode,0,rendered.stderr)
+        context=json.loads(rendered.stdout)
+        self.assertEqual(json.loads(context["resolvedExtrinsicJson"]),value)
+        self.assertEqual(json.loads(context["intrinsicJson"])["camera_name"],"usb_cam")
+        self.assertEqual(json.loads(context["intrinsicJson"])["camera_matrix"]["data"],intrinsic["intrinsics"]["k"])
+        asset["extrinsics"]["parentFrame"] = "map"
+        with self.assertRaisesRegex(CalibrationError, "parent frame"):
+            resolve_pinned_asset("usb_cam", asset, pin, TARGET, ROLES)
+
+    def test_malformed_raw_asset_is_a_bounded_domain_error(self):
+        for invalid in ([], False, {}, {"camera":[]}):
+            with self.subTest(asset=invalid),self.assertRaises(CalibrationError):
+                resolve_pinned_asset("usb_cam",invalid,None,TARGET,ROLES)
 
     def test_manual_version_does_not_read_corrupt_global_selection(self):
         self.pointer().parent.mkdir(parents=True)

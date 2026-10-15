@@ -3,7 +3,7 @@
   "definitions": [
     {
       "id": "xgc2-camera-extrinsic-calibrator-ros1",
-      "version": "3.0.0",
+      "version": "4.0.0",
       "label": "XGC2 camera extrinsic calibration WebUI",
       "description": "Consume compressed ROS images or capture and CameraInfo or an explicit intrinsic YAML, solve robust PnP, and expose parent_T_camera_optical with residuals at GET /v1/result for Core to commit.",
       "parameters": {
@@ -146,10 +146,6 @@
             "type": "string",
             "default": "/tmp/xgc2/ros/log/camera-calibration"
           },
-          "resolvedExtrinsicJson": {
-            "type": "string",
-            "description": "One immutable extrinsic resolution produced by the camera workflow."
-          },
           "frameRolesJson": {
             "type": "string",
             "description": "Exact parent and optical frame roles from the camera fragment."
@@ -173,10 +169,21 @@
             "type": "string",
             "default": "/usb_cam/camera_info",
             "description": "CameraInfo topic from camera:<id>; used when intrinsicFile is empty."
+          },
+          "extrinsicAssetJson": {
+            "type": "string",
+            "default": "null"
+          },
+          "extrinsicPinJson": {
+            "type": "string",
+            "default": "null"
+          },
+          "targetOffsetJson": {
+            "type": "string",
+            "default": "{\"x\":0,\"y\":0,\"z\":0}"
           }
         },
         "required": [
-          "resolvedExtrinsicJson",
           "socketPath",
           "targetId",
           "parentFrame",
@@ -187,8 +194,12 @@
       "command": {
         "executable": "/opt/ros/noetic/lib/xgc_camera_calibration/extrinsic_calibrator_web.py",
         "args": [
-          "--resolved-extrinsic-json",
-          "${resolvedExtrinsicJson}",
+          "--target-offset-json",
+          "${targetOffsetJson}",
+          "--extrinsic-pin-json",
+          "${extrinsicPinJson}",
+          "--extrinsic-asset-json",
+          "${extrinsicAssetJson}",
           "--frame-roles-json",
           "${frameRolesJson}",
           "__name:=xgc_camera_extrinsic_calibrator_web",

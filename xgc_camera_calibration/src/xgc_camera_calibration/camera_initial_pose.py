@@ -20,6 +20,9 @@ from .transforms import (
 )
 
 
+GAZEBO_LINK_TO_OPTICAL_TRANSLATION = (0.067, 0.0, 0.0)
+
+
 def gazebo_camera_link_pose_from_optical(
     translation: Sequence[float],
     quaternion_xyzw: Sequence[float],

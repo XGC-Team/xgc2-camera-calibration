@@ -1,7 +1,7 @@
 schema: xgc2.product.v1
 id: xgc2-camera-calibration-ros1
 name: XGC2 ROS1 Camera Calibration
-version: 0.4.0-2
+version: 0.4.0-3
 kind: ros1-apt
 summary: Independent intrinsic and fixed-world-camera extrinsic calibration tools
   for ROS Noetic.

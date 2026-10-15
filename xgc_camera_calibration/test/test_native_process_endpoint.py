@@ -78,15 +78,15 @@ class NativeProcessEndpointTest(unittest.TestCase):
                              server.service_ref.endpoint)
         return domain, server, initial
 
-    def test_both_domains_hold_unbound_readiness_and_publish_result_facts(self):
+    def test_both_domains_publish_local_readiness_and_result_facts(self):
         for kind in ('intrinsic', 'extrinsic'):
             with self.subTest(kind=kind):
                 domain, server, initial = self.start(kind)
                 with Client.from_service(initial, runtime=server.runtime, local_target='local-test', discovery=True) as client:
                     started = time.monotonic()
                     description = client.json('/v1/describe?wait_ready_ms=150', method='GET', timeout=1)
-                    self.assertGreaterEqual(time.monotonic() - started, .14)
-                    self.assertFalse(description['ready'])
+                    self.assertLess(time.monotonic() - started, 1)
+                    self.assertTrue(description['ready'])
                     self.assertEqual(description['service'], initial.service)
                     self.assertEqual(description['api_version'], '1')
                     self.assertRegex(description['instance_id'], r'^[0-9a-f]{32}$')
@@ -95,15 +95,8 @@ class NativeProcessEndpointTest(unittest.TestCase):
                     self.assertEqual(description['facts']['camera_id'], domain.camera_name)
                     with self.assertRaises(Fault):
                         client.json('/v1/result', method='GET')
-                    domain.waiting.clear()
-                    with ThreadPoolExecutor(max_workers=1) as executor:
-                        waiting = executor.submit(client.json, '/v1/describe?wait_ready_ms=2000', method='GET', timeout=3)
-                        self.assertTrue(domain.waiting.wait(1))
-                        self.assertFalse(waiting.done())
-                        with domain.condition:
-                            domain.ready = True
-                            domain.condition.notify_all()
-                        self.assertTrue(waiting.result(timeout=1)['ready'])
+                    self.assertFalse(domain.ready)
+                    self.assertFalse(domain.waiting.is_set())
                     for query in ('wait_ready_ms=-1', 'wait_ready_ms=30001', 'wait_ready_ms=',
                                   'wait_ready_ms=1&wait_ready_ms=2', 'unknown=1'):
                         with self.subTest(query=query), self.assertRaises(Fault) as error:
@@ -177,13 +170,17 @@ class NativeProcessEndpointTest(unittest.TestCase):
         self.addCleanup(media.close)
         self.addCleanup(available.set)
         self.assertEqual(media.status()['connect_attempts'], 0)
-        for _ in range(8):
-            with self.assertRaises(MediaSnapshotError):
-                media.capture()
-        self.assertTrue(entered.wait(1))
-        self.assertEqual(calls, ['wait_ready_ms=30000'])
-        self.assertFalse(media.status()['ready'])
-        available.set()
+        # Concurrent callers share the outstanding watch. Sequential calls can
+        # legitimately outlive its 30-second hold and re-arm discovery.
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            captures = [executor.submit(media.capture) for _ in range(8)]
+            self.assertTrue(entered.wait(1))
+            self.assertEqual(calls, ['wait_ready_ms=30000'])
+            self.assertFalse(media.status()['ready'])
+            available.set()
+            for capture in captures:
+                with self.assertRaises(MediaSnapshotError):
+                    capture.result(timeout=6)
         deadline = time.monotonic() + 2
         while not media.status()['ready'] and time.monotonic() < deadline:
             time.sleep(.01)
@@ -237,7 +234,7 @@ class NativeProcessEndpointTest(unittest.TestCase):
                             self.assertEqual(entry.main(), 1)
                     else:
                         with patch.object(entry, 'RosCalibrationSource') as source, patch.object(entry, 'CalibrationService') as service, \
-                                patch.object(entry, 'parse_frame_roles'), patch.object(entry, 'decode_frozen'):
+                                patch.object(entry, 'resolve_application'):
                             source.return_value.pose_coordinate_source = 'experiment-world'
                             source.return_value.pose_world_offset = (0, 0, 0)
                             service.return_value.frozen_extrinsic = {'targetCoordinates': {'worldOffset': [0, 0, 0]}}
@@ -353,7 +350,10 @@ class NativeEntrypointTest(unittest.TestCase):
             'camera_control_timeout': .5}
         script = 'extrinsic_tf_publisher.py' if kind == 'tf' else kind + '_calibrator_web.py'
         command = [sys.executable, str(self.package / 'scripts' / script)]
-        if kind != 'intrinsic':
+        if kind == 'extrinsic':
+            command += ['--extrinsic-asset-json', 'null', '--extrinsic-pin-json', 'null',
+                        '--target-offset-json', '{"x":0,"y":0,"z":0}', '--frame-roles-json', json.dumps(self.roles)]
+        elif kind == 'tf':
             command += ['--resolved-extrinsic-json', self.frozen, '--frame-roles-json', json.dumps(self.roles)]
         command += ['_' + name + ':=' + json.dumps(value) for name, value in parameters.items()]
         process = self.launch(command, kind)
@@ -364,7 +364,7 @@ class NativeEntrypointTest(unittest.TestCase):
         self.until(lambda: Path(socket_path).exists(), process=process)
         return process, client, port
 
-    def until(self, predicate, timeout=12, process=None):
+    def until(self, predicate, timeout=12, process=None, diagnostic=None):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if process is not None and process.poll() is not None:
@@ -377,7 +377,7 @@ class NativeEntrypointTest(unittest.TestCase):
             except (TransportError, OSError):
                 pass
             time.sleep(.025)
-        self.fail('native condition did not become true')
+        self.fail('native condition did not become true: ' + repr(diagnostic() if diagnostic else None))
 
     def describe(self, client, wait=0):
         return client.json('/v1/describe?wait_ready_ms=%d' % wait, method='GET', timeout=max(2, wait / 1000 + 1))
@@ -463,8 +463,8 @@ finally:
             process, client, port = self.start_helper(kind)
             clients.append((kind, process, client, port))
             started = time.monotonic()
-            self.assertFalse(self.describe(client, 150)['ready'])
-            self.assertGreaterEqual(time.monotonic() - started, .14)
+            self.assertEqual(self.describe(client, 150)['ready'], kind != 'tf')
+            if kind == 'tf': self.assertGreaterEqual(time.monotonic() - started, .14)
             self.assertFalse(self.describe(client)['facts']['peers']['ros_master']['available'])
             if kind != 'tf':
                 with urllib.request.urlopen('http://127.0.0.1:%d/' % port, timeout=1) as page:
@@ -497,7 +497,7 @@ finally:
             self.until(lambda: self.describe(client)['facts']['peers']['media']['instance_id'] == 'edge-late', process=process)
             self.assertTrue(self.describe(client)['ready'])
             if kind == 'intrinsic':
-                self.until(lambda: self.state(kind, port)['image_ready'], process=process)
+                self.until(lambda: self.state(kind, port)['image_ready'], process=process, diagnostic=lambda: self.state(kind, port))
         topics = self.publishers()
         extrinsic = helpers[1]
         self.until(lambda: self.describe(extrinsic[2])['facts']['peers']['camera_info']['received'])

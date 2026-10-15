@@ -541,8 +541,9 @@ class CalibrationHttpServer:
                         or int(wait[0]) > 30000):
                     raise Fault("invalid_argument", "wait_ready_ms must be in [0, 30000]", 400)
                 wait_ms = int(wait[0])
-            ready = await self.runtime.blocking(self.private_host,
-                (self.lifecycle or domain).wait_ready, wait_ms / 1000.0)
+            # The application owns these HTTP endpoints. ROS, media and World
+            # availability are peer facts, checked by the actual control calls.
+            ready = not self._stopping
             capabilities = {"intrinsic": self.intrinsic_service is not None, "extrinsic": self.service is not None}
             return {"service": self.service_ref.service, "api_version": self.service_ref.api_version,
                 "instance_id": self.service_ref.instance_id, "ready": ready,

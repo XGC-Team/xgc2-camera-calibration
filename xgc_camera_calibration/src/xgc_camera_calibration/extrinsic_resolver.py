@@ -85,6 +85,44 @@ def resolve_selection(root, camera_name, choice, target_coordinates, frame_roles
     return value
 
 
+def resolve_pinned_asset(camera_name, asset, pin, target_coordinates, frame_roles, resolution_id=None):
+    """Resolve immutable Core asset bytes in the calibration product, without IO."""
+    roles = validate_roles(frame_roles)
+    target = validate_target(target_coordinates)
+    value = {"schemaVersion": 1, "resolutionId": identifier(resolution_id or str(uuid.uuid4()), "resolution id"),
+             "cameraName": camera_name, "targetCoordinates": target}
+    if asset is None:
+        value.update(choiceMode="auto", status="uncalibrated", globalAppliedRevision=0)
+    else:
+        if not isinstance(asset, dict) or not isinstance(asset.get("camera"), dict):
+            raise CalibrationError("calibration asset must be a camera spec object")
+        if asset.get("camera", {}).get("sourceId") != camera_name:
+            raise CalibrationError("calibration asset camera does not match")
+        extrinsic = asset.get("extrinsics")
+        if not isinstance(extrinsic, dict) or extrinsic.get("parentFrame") != roles["parentFrame"] or roles["parentFrame"] != "world":
+            raise CalibrationError("calibration asset requires world parent frame")
+        mode = extrinsic.get("calibrationMode")
+        if mode not in ("sim", "phy") or extrinsic.get("childFrame") != roles["opticalFrames"][mode]:
+            raise CalibrationError("calibration asset optical role does not match")
+        coordinates = extrinsic.get("poseCoordinates")
+        if not isinstance(coordinates, dict) or type(coordinates.get("schema_version")) is not int or coordinates["schema_version"] != 1:
+            raise CalibrationError("calibration asset lacks coordinate provenance")
+        roll, pitch, yaw = finite_vector(extrinsic.get("rotationRpy"), 3, "asset rotation")
+        sr, cr = math.sin(roll / 2), math.cos(roll / 2)
+        sp, cp = math.sin(pitch / 2), math.cos(pitch / 2)
+        sy, cy = math.sin(yaw / 2), math.cos(yaw / 2)
+        pose = _pose({"translation": extrinsic.get("translation"), "quaternionXyzw": [
+            sr*cp*cy-cr*sp*sy, cr*sp*cy+sr*cp*sy, cr*cp*sy-sr*sp*cy, cr*cp*cy+sr*sp*sy]})
+        document = _document(pose, {"kind": coordinates.get("kind"), "frame": coordinates.get("frame"),
+                                    "worldOffset": coordinates.get("world_offset")})
+        source, original, resolved = pose_from_document(document, target)
+        value.update(choiceMode="asset", status="calibrated", asset=pin, sourceMode=mode,
+                     sourceOpticalFrame=extrinsic["childFrame"], sourceCoordinates=source,
+                     originalOpticalPose=original, resolvedOpticalPose=resolved)
+    encode_frozen(value)
+    return value
+
+
 def _validate_frozen(value):
     base = {"schemaVersion", "resolutionId", "cameraName", "choiceMode", "status", "targetCoordinates"}
     if not isinstance(value, dict) or type(value.get("schemaVersion")) is not int or value["schemaVersion"] != 1:
@@ -153,9 +191,13 @@ def decode_frozen(payload, camera_name, frame_roles):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--root", required=True)
+    parser.add_argument("--root", default="")
     parser.add_argument("--camera", required=True)
-    parser.add_argument("--selection-json", required=True)
+    parser.add_argument("--selection-json", default="")
+    parser.add_argument("--asset-json")
+    parser.add_argument("--asset-pin-json", default="null")
+    parser.add_argument("--intrinsic-asset-json", default="null")
+    parser.add_argument("--output-format", choices=("extrinsic", "camera-context"), default="extrinsic")
     parser.add_argument("--target-offset-json", required=True)
     parser.add_argument("--frame-roles-json", required=True)
     parser.add_argument("--resolution-id")
@@ -170,19 +212,39 @@ def main(argv=None):
             raise CalibrationError("resolver context exceeds its byte limit")
         offset = closed_object(strict_json(args.target_offset_json), {"x", "y", "z"}, "target offset")
         target = validate_target({"frame": "world", "worldOffset": [offset[key] for key in ("x", "y", "z")]})
-        if args.selection_json:
-            choice = strict_json(args.selection_json)
+        if args.asset_json is not None:
+            if len(args.asset_json.encode("utf-8")) > 256 * 1024:
+                raise CalibrationError("pinned calibration asset exceeds its byte limit")
+            value = resolve_pinned_asset(args.camera, strict_json(args.asset_json), strict_json(args.asset_pin_json),
+                                         target, strict_json(args.frame_roles_json), args.resolution_id)
         else:
-            from .camera_initial_pose import legacy_selection_choice
-            if len(args.legacy_link_pose_json.encode("utf-8")) > 1024:
-                raise CalibrationError("legacy camera pose exceeds its byte limit")
-            choice = legacy_selection_choice(args.root, args.camera, args.legacy_pose_source,
-                args.legacy_file,
-                strict_json(args.legacy_link_pose_json) if args.legacy_pose_source == "authored" else None,
-                target)
-        value = resolve_selection(args.root, args.camera, choice, target,
-                                  strict_json(args.frame_roles_json), args.resolution_id)
+            if args.selection_json:
+                choice = strict_json(args.selection_json)
+            else:
+                from .camera_initial_pose import legacy_selection_choice
+                if len(args.legacy_link_pose_json.encode("utf-8")) > 1024:
+                    raise CalibrationError("legacy camera pose exceeds its byte limit")
+                choice = legacy_selection_choice(args.root, args.camera, args.legacy_pose_source,
+                    args.legacy_file,
+                    strict_json(args.legacy_link_pose_json) if args.legacy_pose_source == "authored" else None,
+                    target)
+            value = resolve_selection(args.root, args.camera, choice, target,
+                                      strict_json(args.frame_roles_json), args.resolution_id)
         payload = encode_frozen(value)
+        if args.output_format == "camera-context":
+            import yaml
+            from .asset_document import render
+            if len(args.intrinsic_asset_json.encode("utf-8")) > 256 * 1024:
+                raise CalibrationError("pinned intrinsic asset exceeds its byte limit")
+            intrinsic = strict_json(args.intrinsic_asset_json)
+            document = ""
+            if intrinsic is not None:
+                if not isinstance(intrinsic, dict) or not isinstance(intrinsic.get("camera"), dict):
+                    raise CalibrationError("intrinsic asset must be a camera spec object")
+                if intrinsic.get("camera", {}).get("sourceId") != args.camera:
+                    raise CalibrationError("intrinsic asset camera does not match")
+                document = compact_json(yaml.safe_load(render(intrinsic, "camera_info_yaml")))
+            payload = compact_json({"resolvedExtrinsicJson": payload, "intrinsicJson": document})
     except (CalibrationError, OSError, ValueError, TypeError, OverflowError, RecursionError) as error:
         print("Extrinsic resolution failed: " + str(error), file=sys.stderr)
         return 1

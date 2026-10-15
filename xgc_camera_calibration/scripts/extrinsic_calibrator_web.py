@@ -19,8 +19,7 @@ from sensor_msgs.msg import CameraInfo, CompressedImage
 
 from xgc_camera_calibration.pose_freshness import pose_is_fresh
 from xgc_camera_calibration.ros_lifecycle import NodeParameters, RosMasterBinding
-from xgc_camera_calibration.extrinsic_application import application_arguments, parse_frame_roles
-from xgc_camera_calibration.extrinsic_resolver import decode_frozen
+from xgc_camera_calibration.extrinsic_application import resolve_application, application_arguments
 from xgc_camera_calibration.extrinsic_samples import image_dimensions
 
 from xgc_camera_calibration.web_service import (
@@ -419,8 +418,7 @@ def main():
             camera_name,
             snapshot_client=snapshot_client,
             parameters=parameters,
-            frozen_extrinsic=decode_frozen(args.resolved_extrinsic_json, camera_name,
-                                          parse_frame_roles(args.frame_roles_json)),
+            frozen_extrinsic=resolve_application(args, camera_name),
         )
         package_root = Path(rospkg.RosPack().get_path("xgc_camera_calibration"))
         web_root = Path(parameters.get("~web_root", str(package_root / "web" / "extrinsic")))
