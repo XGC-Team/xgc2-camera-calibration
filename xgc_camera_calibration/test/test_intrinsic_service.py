@@ -39,6 +39,15 @@ ENTRYPOINT = Path(__file__).resolve().parents[1] / "scripts" / "intrinsic_calibr
 WEB_SERVICE_SOURCE = Path(__file__).resolve().parents[1] / "src" / "xgc_camera_calibration" / "web_service.py"
 
 
+def resolved_validation_selection(calibration_id):
+    """The service receives immutable document bytes resolved by Core."""
+    return {"kind":"calibration", "calibration_id":calibration_id, "document":{
+        "camera_name":"usb_cam", "image_width":400, "image_height":320,
+        "camera_matrix":{"rows":3,"cols":3,"data":[638.,0.,200.,0.,637.,160.,0.,0.,1.]},
+        "distortion_coefficients":{"rows":1,"cols":5,"data":[-.18,.04,0.,0.,0.]},
+        "distortion_model":"plumb_bob"}}
+
+
 def render_board(cols_squares=8, rows_squares=6, square=40, border=40):
     """A clean synthetic chessboard (cols_squares x rows_squares squares)."""
     width = cols_squares * square + 2 * border
@@ -2402,24 +2411,7 @@ class IntrinsicServiceTest(unittest.TestCase):
     def test_validation_v2_captures_once_and_keeps_generation_atomic(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory) / "intrinsics.yaml"
-            calibration = Path(directory) / "intrinsics-2026-08-30_12-00-00.yaml"
-            intrinsic_solver.save_intrinsic(
-                calibration,
-                intrinsic_solver.IntrinsicResult(
-                    camera_matrix=np.array([
-                        [638.0, 0.0, 200.0],
-                        [0.0, 637.0, 160.0],
-                        [0.0, 0.0, 1.0],
-                    ]),
-                    distortion=np.array([-0.18, 0.04, 0.0, 0.0, 0.0]),
-                    image_size=(400, 320),
-                    rms_reprojection_error_px=0.7,
-                    sample_count=40,
-                ),
-                camera_name="usb_cam",
-                board_size=(7, 5),
-                square=0.20,
-            )
+            selected = resolved_validation_selection("calibration-asset:commit")
             service = make_service(base)
             captures = []
 
@@ -2437,14 +2429,14 @@ class IntrinsicServiceTest(unittest.TestCase):
             ) as render:
                 first = service.validate_intrinsic(
                     {"kind": "raw"},
-                    {"kind": "calibration", "calibration_id": calibration.name},
+                    selected,
                 )
             self.assertEqual(render.call_args.kwargs["jpeg_quality"], 95)
             self.assertEqual(captures, [1])
             self.assertEqual(first["schema"], "xgc2.camera.intrinsic-validation.v2")
             self.assertEqual(first["configurations"]["reference"], {"kind": "raw"})
             self.assertEqual(
-                first["configurations"]["comparison"]["calibration_id"], calibration.name
+                first["configurations"]["comparison"]["calibration_id"], selected["calibration_id"]
             )
             self.assertEqual(first["source_image_size"], [400, 320])
             self.assertEqual(first["analysis_image_size"], [400, 320])
@@ -2455,8 +2447,8 @@ class IntrinsicServiceTest(unittest.TestCase):
             self.assertTrue(service.validation_image("reference", first["generation"]).startswith(b"\xff\xd8"))
 
             same = service.validate_intrinsic(
-                {"kind": "calibration", "calibration_id": calibration.name},
-                {"kind": "calibration", "calibration_id": calibration.name},
+                selected,
+                selected,
             )
             self.assertEqual(captures, [1, 2])
             self.assertEqual(same["remap_delta_px"], {"mean": 0.0, "maximum": 0.0})
@@ -2668,14 +2660,20 @@ class IntrinsicServiceTest(unittest.TestCase):
 
                 service.attach_frame_capture(capture_validation)
                 samples_before_validation = service.state()["samples"]
+                unresolved_request = urllib.request.Request(
+                    base + "/api/v1/intrinsic/validation",
+                    data=json.dumps({"reference":{"kind":"raw"}, "comparison":{
+                        "kind":"calibration", "calibration_id":calibration_path.name}}).encode("utf-8"),
+                    headers={"Content-Type":"application/json"}, method="POST")
+                with self.assertRaises(urllib.error.HTTPError) as unresolved:
+                    urllib.request.urlopen(unresolved_request)
+                self.assertEqual(unresolved.exception.code, int(HTTPStatus.BAD_REQUEST))
+                self.assertEqual(validation_captures, [])
                 request = urllib.request.Request(
                     base + "/api/v1/intrinsic/validation",
                     data=json.dumps({
                         "reference": {"kind": "raw"},
-                        "comparison": {
-                            "kind": "calibration",
-                            "calibration_id": calibration_path.name,
-                        },
+                        "comparison": resolved_validation_selection(calibration_path.name),
                     }).encode("utf-8"),
                     headers={"Content-Type": "application/json"},
                     method="POST",

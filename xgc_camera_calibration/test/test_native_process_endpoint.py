@@ -470,15 +470,36 @@ finally:
                 with urllib.request.urlopen('http://127.0.0.1:%d/' % port, timeout=1) as page:
                     self.assertIn(b'<html', page.read().lower())
         master = self.start_master()
+        first_master = None
+        bound_identities = {}
+        def bound_master(client):
+            observed = self.describe(client)['facts']['peers']['ros_master']
+            return observed if observed['available'] else None
         for kind, process, client, port in clients:
-            self.assertTrue(self.until(lambda: self.describe(client)['ready'], process=process))
+            # Local HTTP readiness does not prove that this process has bound
+            # the first master. Establish that identity before replacing it.
+            bound = self.until(lambda: bound_master(client), process=process)
+            identity = (bound['pid'], bound['run_id'])
+            if first_master is None:
+                first_master = identity
+            self.assertEqual(identity, first_master)
+            bound_identities[kind] = identity
+            self.assertTrue(bound['run_id'])
+            self.assertIsInstance(bound['pid'], int)
+            self.assertTrue(self.describe(client)['ready'])
             if kind != 'tf':
                 self.assertFalse(self.describe(client)['facts']['peers']['camera_info']['received'])
         self.stop(master)
         self.start_master()
-        for _kind, process, _client, _port in clients:
-            self.until(lambda: process.poll() is not None, timeout=20)
+        replaced_at = time.monotonic()
+        exit_seconds = {}
+        for kind, process, _client, _port in clients:
+            self.until(lambda: process.poll() is not None, timeout=20,
+                diagnostic=lambda: {"kind":kind, "bound_master":bound_identities[kind],
+                    "log_tail":(self.root / (kind + '.log')).read_text()[-2000:]})
             self.assertEqual(process.wait(), 0)
+            exit_seconds[kind] = round(time.monotonic() - replaced_at, 3)
+        print(json.dumps({"bound_master":first_master, "replacement_exit_seconds":exit_seconds}))
 
     def test_calibrators_start_before_media_camera_info_and_pose_and_recover(self):
         self.start_master()
