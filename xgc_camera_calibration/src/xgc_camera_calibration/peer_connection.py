@@ -27,13 +27,14 @@ class UnixPeer:
     """
 
     def __init__(self, path, service, api_version, *, runtime, local_target,
-                 limits=None, connected=None):
+                 limits=None, connected=None, describe_reference=None):
         self.reference = ServiceRef(local_target, service, api_version, "", "http.v1",
                                     Endpoint("unix", str(path))).validate(discovery=True)
         self.runtime = runtime
         self.local_target = local_target
         self.limits = limits or Limits(connections=2, in_flight=4, call_timeout=35.0)
         self.connected = connected
+        self.describe_reference = describe_reference or (lambda document: document["service_ref"])
         self.client = None
         self.description = {}
         self._condition = threading.Condition()
@@ -152,7 +153,7 @@ class UnixPeer:
                     finished, pending = pending, None
                     try:
                         document = json.loads(finished.result().body)
-                        observed = ServiceRef.from_dict(document["service_ref"]).validate()
+                        observed = ServiceRef.from_dict(self.describe_reference(document)).validate()
                         if (observed.service != self.reference.service or observed.api_version != self.reference.api_version
                                 or observed.target_id != self.local_target or observed.endpoint != self.reference.endpoint):
                             raise ValueError("peer discovery differs from its granted endpoint")

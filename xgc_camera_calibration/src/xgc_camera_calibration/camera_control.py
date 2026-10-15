@@ -41,7 +41,8 @@ class _SimulationWorld:
         self._owns_runtime = runtime is None
         self._closed = False
         self.peer = UnixPeer(endpoint, "xgc2.simulation", "v1", runtime=self.runtime,
-                             local_target=local_target)
+                             local_target=local_target,
+                             describe_reference=lambda document: document["facts"]["service_ref"])
 
     @property
     def client(self):

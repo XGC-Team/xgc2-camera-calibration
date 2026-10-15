@@ -54,7 +54,10 @@ class NativeWorld:
                 elif kind == "create": self.models[identity] = {"id": identity, "generation": 1}
                 self.completed += 1
             return {"id": "op-1", "state": self.operation_state, "error": None}
-        routes = {("GET", "/v1/describe"): lambda c, r: {"ready": True, "service_ref": ref},
+        self.description = {"service": "xgc2.simulation", "api_version": "v1",
+                            "instance_id": self.instance, "ready": True,
+                            "facts": {"service_ref": ref}}
+        routes = {("GET", "/v1/describe"): lambda c, r: self.description,
                   ("GET", "/v1/entities"): lambda c, r: {"entities": [entity(i) for i in self.models]},
                   ("GET", "/v1/entities/camera"): query,
                   ("POST", "/v1/entities/camera/state"): lambda c, r: mutation("pose", "camera", r),
@@ -85,6 +88,18 @@ class NativeWorld:
 
 
 class NativeCameraControlTest(unittest.TestCase):
+    def test_world_uses_facts_reference_and_does_not_accept_top_level_reference(self):
+        with NativeWorld() as world:
+            control = world.control()
+            try:
+                self.assertEqual(control.world.peer.description, world.description)
+                reference = control.world.peer.describe_reference(world.description)
+                self.assertEqual(reference, world.description["facts"]["service_ref"])
+                with self.assertRaises(KeyError):
+                    control.world.peer.describe_reference({"ready": True, "service_ref": reference})
+            finally:
+                control.close()
+
     def test_pose_waits_for_native_completion_and_status_uses_cached_snapshot(self):
         with NativeWorld() as world:
             control = world.control()
