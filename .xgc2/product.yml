@@ -1,7 +1,7 @@
 schema: xgc2.product.v1
 id: xgc2-camera-calibration-ros1
 name: XGC2 ROS1 Camera Calibration
-version: 0.4.0-3
+version: 0.4.0-4
 kind: ros1-apt
 summary: Independent intrinsic and fixed-world-camera extrinsic calibration tools
   for ROS Noetic.
@@ -47,7 +47,7 @@ usage:
     Core. They consume camera capture, compressed ROS images and CameraInfo;
     they never open a camera device. The TF node consumes the immutable pose
     supplied by Core. Intrinsic evidence lives in the private runtime directory.
-    Build and runtime images supply Python XRPC 0.2.0 and its dependencies.
+    Build and runtime images supply Python XRPC 0.2.1 and its dependencies.
 
 ownership:
   paths:
@@ -63,4 +63,4 @@ release:
   workflow: release.yml
   ci_workflow: ci.yml
   apt_versions:
-    focal: 0.4.0-3
+    focal: 0.4.0-4

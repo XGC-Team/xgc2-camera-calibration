@@ -63,9 +63,7 @@ Priority: optional
 Architecture: ${ARCH}
 Maintainer: XGC2 <dev@xiaokang.ink>
 Depends: python3 (>= 3.8), python3-numpy, python3-opencv, python3-rospkg, python3-yaml, ros-noetic-gazebo-msgs, ros-noetic-geometry-msgs, ros-noetic-rosbash, ros-noetic-roslaunch, ros-noetic-rospy, ros-noetic-sensor-msgs, ros-noetic-tf, ros-noetic-tf2-ros
-Provides: ros-noetic-xgc-camera-calibration
 Conflicts: ros-noetic-xgc-camera-calibration
-Replaces: ros-noetic-xgc-camera-calibration
 Description: Independent intrinsic and fixed-world-camera extrinsic calibration for ROS Noetic
 EOF
 install -m 0644 "${REPO_ROOT}/LICENSE" "${PACKAGE_ROOT}/usr/share/doc/${PACKAGE_NAME}/copyright"
