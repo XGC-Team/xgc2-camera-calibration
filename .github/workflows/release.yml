@@ -53,7 +53,9 @@ jobs:
           npm --prefix web-src ci
           npm --prefix web-src run typecheck
           npm --prefix web-src run build
+          npm --prefix web-src run verify:build
           git --git-dir="$PWD/.git" --work-tree="$PWD" diff --exit-code -- \
+            xgc_camera_calibration/web/build-receipt.json \
             xgc_camera_calibration/web/intrinsic/app.js \
             xgc_camera_calibration/web/intrinsic/styles.css \
             xgc_camera_calibration/web/extrinsic/app.js \

@@ -88,7 +88,8 @@
           },
           "rosLogDir": {
             "type": "string",
-            "default": "/var/lib/xgc2/ros/log/camera-tf"
+            "default": "",
+            "description": "Explicit ROS directory override; empty uses process-owned ephemeral runtime storage."
           },
           "resolvedExtrinsicJson": {
             "type": "string",

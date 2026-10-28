@@ -4,21 +4,22 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "tsc --noEmit && vite build --mode intrinsic && node scripts/minify.mjs intrinsic && vite build --mode extrinsic && node scripts/minify.mjs extrinsic",
+    "build": "tsc --noEmit && vite build --mode intrinsic && node scripts/minify.mjs intrinsic && vite build --mode extrinsic && node scripts/minify.mjs extrinsic && node scripts/build-receipt.mjs",
     "check:ui-policy": "xgc2-style-policy --root src",
-    "typecheck": "tsc --noEmit --pretty false"
+    "typecheck": "tsc --noEmit --pretty false",
+    "verify:build": "node scripts/build-receipt.mjs --verify"
   },
   "dependencies": {
-    "@xgc2/ui-react": "https://github.com/XGC-Team/xgc2-ui/releases/download/v0.17.0/xgc2-ui-react-0.17.0.tgz",
+    "@xgc2/ui-react": "https://github.com/XGC-Team/xgc2-ui/releases/download/v0.18.19/xgc2-ui-react-0.18.19.tgz",
     "react": "19.2.1",
     "react-dom": "19.2.1"
   },
   "devDependencies": {
-    "@xgc2/ui-policy": "https://github.com/XGC-Team/xgc2-ui/releases/download/policy-v0.17.0/xgc2-ui-policy-0.17.0.tgz",
     "@types/node": "22.20.1",
     "@types/react": "19.2.7",
     "@types/react-dom": "19.2.3",
     "@vitejs/plugin-react": "5.1.1",
+    "@xgc2/ui-policy": "https://github.com/XGC-Team/xgc2-ui/releases/download/policy-v0.18.19/xgc2-ui-policy-0.18.19.tgz",
     "esbuild": "0.28.2",
     "typescript": "5.9.3",
     "vite": "7.3.6"

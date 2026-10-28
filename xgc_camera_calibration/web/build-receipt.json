@@ -1,0 +1,98 @@
+{
+  "schemaVersion": 1,
+  "builder": "npm run build",
+  "source": [
+    {
+      "path": "web-src/package-lock.json",
+      "sha256": "65b1314ace215a7451bfa7abee98b32982e3916e5a063b862da7689c6a8df953"
+    },
+    {
+      "path": "web-src/package.json",
+      "sha256": "25f366e67274a0283c4d30fbff2113304e08dd7d64d256b9195197b73ad928e1"
+    },
+    {
+      "path": "web-src/scripts/build-receipt.mjs",
+      "sha256": "fd16d1bd3e7e5574f3a202154448dac05c44a8cf13ba9fec2f52b2d48786d02f"
+    },
+    {
+      "path": "web-src/scripts/minify.mjs",
+      "sha256": "358c35240a52b7e2e5152d09590002e240ab26466d97cda092aec8f7dbc33305"
+    },
+    {
+      "path": "web-src/src/extrinsic-legacy.ts",
+      "sha256": "47895e9a64063cbbe179ac377ee416332f66cb547747410f82b4e3bfcf337005"
+    },
+    {
+      "path": "web-src/src/globals.d.ts",
+      "sha256": "aea23a1f65c613e5d1a4d795c7a3e8864aadbce0135cbcf5b1b079178b4ca1ac"
+    },
+    {
+      "path": "web-src/src/intrinsic-legacy.ts",
+      "sha256": "01707fa75f4b80351d459bc41867237b36343f027b925f202cb02cdef2d1713b"
+    },
+    {
+      "path": "web-src/src/main.tsx",
+      "sha256": "3d551ff93ccc38df1e548bf0f24742525b8461c98e9dd4d5785f8b8beaf295cf"
+    },
+    {
+      "path": "web-src/src/styles.css",
+      "sha256": "6af90da4b5fa7183bc4efcc62d201edfc37f96238a5307b1b6c3073a8344cf83"
+    },
+    {
+      "path": "web-src/tsconfig.json",
+      "sha256": "6df2cce92cbe6f41c324ca2a277290b176aa3483ac1e100a5606b459a0baa7c7"
+    },
+    {
+      "path": "web-src/vite.config.ts",
+      "sha256": "e43bb65b5a716d214227146aedd1d3abfc87a0936a7ff97debda23eb93e90275"
+    }
+  ],
+  "dependencies": {
+    "@xgc2/ui-react": {
+      "specifier": "https://github.com/XGC-Team/xgc2-ui/releases/download/v0.18.19/xgc2-ui-react-0.18.19.tgz",
+      "lockedVersion": "0.18.19",
+      "installedVersion": "0.18.19",
+      "lockIntegrity": "sha512-Wk/80GD3Lj9dTQRy3iwxVuGaVauEtQxtadx9Z2zVkbZHOQcirvi/sVke9cv6oxhgHPY8UIJ2bSecN7GUHPNudA==",
+      "installedFilesSha256": "f4b26f74be13cfaa2b1868140dcb8ae6fc8a8d82564dc113f326472c712a9089"
+    },
+    "@xgc2/ui-policy": {
+      "specifier": "https://github.com/XGC-Team/xgc2-ui/releases/download/policy-v0.18.19/xgc2-ui-policy-0.18.19.tgz",
+      "lockedVersion": "0.18.19",
+      "installedVersion": "0.18.19",
+      "lockIntegrity": "sha512-2y5igXDs3170j1+fdRbW1MvWGNv6cttylj3dIwgrJwbvI1ryjTsXbkLxlq2DYtCTKkt6IIF8AfW/5VSF7qdCOQ==",
+      "installedFilesSha256": "8fa6ce3dd900e912a892c02ba8baa1854dacf77a5f62ed552c01e171d96a7c15"
+    },
+    "react": {
+      "specifier": "19.2.1",
+      "lockedVersion": "19.2.1",
+      "installedVersion": "19.2.1",
+      "lockIntegrity": "sha512-DGrYcCWK7tvYMnWh79yrPHt+vdx9tY+1gPZa7nJQtO/p8bLTDaHp4dzwEhQB7pZ4Xe3ok4XKuEPrVuc+wlpkmw==",
+      "installedFilesSha256": "d878baf67ff0109294a99cb20d71b4f28b9e13b3b89e9822360c29f338db3fea"
+    },
+    "react-dom": {
+      "specifier": "19.2.1",
+      "lockedVersion": "19.2.1",
+      "installedVersion": "19.2.1",
+      "lockIntegrity": "sha512-ibrK8llX2a4eOskq1mXKu/TGZj9qzomO+sNfO98M6d9zIPOEhlBkMkBUBLd1vgS0gQsLDBzA+8jJBVXDnfHmJg==",
+      "installedFilesSha256": "888c10559631f984925da2c11a8684d53b41f5194516199ab33a6051de7d55a4"
+    }
+  },
+  "artifacts": [
+    {
+      "path": "xgc_camera_calibration/web/extrinsic/app.js",
+      "sha256": "672d19fb1ed87d1bad10f4cf102e51097a565b4693bd49da815cb7f7e23f1713"
+    },
+    {
+      "path": "xgc_camera_calibration/web/extrinsic/styles.css",
+      "sha256": "84b7fd04aeae9c662750346e0d736a9af956e748a28c7981b8d3f6f57fa26e6e"
+    },
+    {
+      "path": "xgc_camera_calibration/web/intrinsic/app.js",
+      "sha256": "f4e3826bdd7c1e7686862041580f3aa359bcef25c47a78452272e966baae06ef"
+    },
+    {
+      "path": "xgc_camera_calibration/web/intrinsic/styles.css",
+      "sha256": "84b7fd04aeae9c662750346e0d736a9af956e748a28c7981b8d3f6f57fa26e6e"
+    }
+  ]
+}

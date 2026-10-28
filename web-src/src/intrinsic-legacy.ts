@@ -5,6 +5,7 @@ const el = (id) => document.getElementById(id);
 let autoRunning = false;
 let pollInFlight = false;
 let events = null, retryTimer = null, retryCeiling = 250, disposed = false;
+let visibilityEpoch = 0;
 let displayedImageSequence = 0;
 let pendingImageSequence = 0;
 let imageRefreshInFlight = false;
@@ -170,17 +171,22 @@ function applyState(s) {
 }
 
 async function poll() {
-  if (pollInFlight) return;
+  if (disposed || document.hidden || pollInFlight) return;
+  const epoch = visibilityEpoch;
   pollInFlight = true;
   try {
     const res = await fetch("api/v1/intrinsic/state", { cache: "no-store" });
     if (!res.ok) throw new Error("Calibration service unavailable");
-    applyState(await res.json());
+    const value = await res.json();
+    if (!disposed && !document.hidden && epoch === visibilityEpoch) applyState(value);
   } catch (err) {
-    el("conn").textContent = "disconnected";
-    el("conn").className = "legacy-state-source pill pill-off";
+    if (!disposed && !document.hidden && epoch === visibilityEpoch) {
+      el("conn").textContent = "disconnected";
+      el("conn").className = "legacy-state-source pill pill-off";
+    }
   } finally {
     pollInFlight = false;
+    if (!disposed && !document.hidden && epoch !== visibilityEpoch) void poll();
   }
 }
 
@@ -192,7 +198,8 @@ function queueImageRefresh(detection, imageReady) {
 }
 
 async function refreshImage() {
-  if (imageRefreshInFlight || pendingImageSequence <= displayedImageSequence) return;
+  if (disposed || document.hidden || imageRefreshInFlight || pendingImageSequence <= displayedImageSequence) return;
+  const epoch = visibilityEpoch;
   const sequence = pendingImageSequence;
   let updated = false;
   imageRefreshInFlight = true;
@@ -202,7 +209,9 @@ async function refreshImage() {
       { cache: "no-store" },
     );
     if (!response.ok) return;
-    const nextUrl = URL.createObjectURL(await response.blob());
+    const blob = await response.blob();
+    if (disposed || document.hidden || epoch !== visibilityEpoch) return;
+    const nextUrl = URL.createObjectURL(blob);
     const previousUrl = displayedImageUrl;
     el("stream").src = nextUrl;
     displayedImageUrl = nextUrl;
@@ -213,7 +222,7 @@ async function refreshImage() {
     // Keep the last complete detection frame visible and retry on the next poll.
   } finally {
     imageRefreshInFlight = false;
-    if (updated && pendingImageSequence > displayedImageSequence) void refreshImage();
+    if (!disposed && !document.hidden && pendingImageSequence > displayedImageSequence && (updated || epoch !== visibilityEpoch)) void refreshImage();
   }
 }
 
@@ -411,10 +420,11 @@ function initScene() {
 }
 
 function connectEvents() {
-  if (disposed) return;
+  if (disposed || document.hidden || events) return;
   const connection = new EventSource("api/v1/intrinsic/events");
   events = connection;
   connection.addEventListener("state", (event) => {
+    if (events !== connection || disposed || document.hidden) return;
     retryCeiling = 250;
     applyState(JSON.parse(event.data));
   });
@@ -431,13 +441,29 @@ function connectEvents() {
 
 wireButtons();
 initScene();
-poll();
-connectEvents();
+function suspendEvents() {
+  visibilityEpoch++;
+  const previous = events;
+  events = null;
+  previous?.close();
+  clearTimeout(retryTimer);
+  retryTimer = null;
+}
+function visibilityChanged() {
+  if (disposed) return;
+  if (document.hidden) { suspendEvents(); return; }
+  void poll();
+  connectEvents();
+}
+document.addEventListener("visibilitychange", visibilityChanged);
 window.addEventListener("pagehide", () => {
   disposed = true;
-  events?.close();
-  clearTimeout(retryTimer);
+  suspendEvents();
   if (displayedImageUrl) URL.revokeObjectURL(displayedImageUrl);
+  displayedImageUrl = "";
+  displayedImageSequence = 0;
 });
+window.addEventListener("pageshow", () => { disposed = false; visibilityChanged(); });
+visibilityChanged();
 
 export {}

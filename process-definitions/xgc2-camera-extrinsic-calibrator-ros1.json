@@ -144,7 +144,8 @@
           },
           "rosLogDir": {
             "type": "string",
-            "default": "/tmp/xgc2/ros/log/camera-calibration"
+            "default": "",
+            "description": "Explicit ROS directory override; empty uses process-owned ephemeral runtime storage."
           },
           "frameRolesJson": {
             "type": "string",

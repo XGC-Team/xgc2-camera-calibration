@@ -31,6 +31,7 @@ const state = { server:null, frameImage:null, display:null, points:[], candidate
 const pageEpoch = `page-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 let nextID = 0, loadVersion = 0, mutationEpoch = 0;
 let events = null, retryTimer = null, retryCeiling = 250, lastImageStamp = null;
+let visibilityEpoch = 0;
 const uniqueID = () => `${pageEpoch}-${++nextID}`;
 
 function showBanner(element,message) {
@@ -140,7 +141,7 @@ function fitCanvas() {
   }
 }
 async function loadFrame(path="api/v1/image.jpg",sample=null,force=false) {
-  if ((state.frameLoading && !force) || !state.server) return;
+  if (state.disposed || document.hidden || (state.frameLoading && !force) || !state.server) return;
   const version=++loadVersion;
   const session=state.server.sampling_session_id, epoch=state.frameEpoch;
   state.frameLoading=true;let url;
@@ -148,7 +149,7 @@ async function loadFrame(path="api/v1/image.jpg",sample=null,force=false) {
     const response=await fetch(path,{cache:"no-store",signal:state.controller.signal});
     if (!response.ok) throw new Error(`Camera image unavailable (${response.status})`);
     url=URL.createObjectURL(await response.blob());const image=new Image();image.src=url;await image.decode();
-    if (state.disposed || epoch!==state.frameEpoch || session!==state.server?.sampling_session_id) return;
+    if (state.disposed || document.hidden || epoch!==state.frameEpoch || session!==state.server?.sampling_session_id) return;
     state.frameImage=image;
     state.display=sample?.display || {id:uniqueID(),source_id:state.server.source.source_id,source_epoch:pageEpoch,
       width:image.naturalWidth,height:image.naturalHeight,clock_domain:"browser-performance",
@@ -158,11 +159,11 @@ async function loadFrame(path="api/v1/image.jpg",sample=null,force=false) {
   finally { if (url) URL.revokeObjectURL(url);if(version===loadVersion) state.frameLoading=false; }
 }
 async function refreshState() {
-  if (state.busy || state.stateLoading) return;
-  state.stateLoading=true;const epoch=mutationEpoch;
-  try { const server=await api("api/v1/state");if(epoch===mutationEpoch) renderState(server); }
-  catch(error) { if (!state.disposed) showBanner(ui.error,error.message); }
-  finally { state.stateLoading=false; }
+  if (state.disposed || document.hidden || state.busy || state.stateLoading) return;
+  state.stateLoading=true;const epoch=mutationEpoch, visibility=visibilityEpoch;
+  try { const server=await api("api/v1/state");if(!document.hidden && visibility===visibilityEpoch && epoch===mutationEpoch) renderState(server); }
+  catch(error) { if (!state.disposed && !document.hidden && visibility===visibilityEpoch) showBanner(ui.error,error.message); }
+  finally { state.stateLoading=false;if(!state.disposed && !document.hidden && visibility!==visibilityEpoch) void refreshState(); }
 }
 async function action(operation) {
   if (state.busy || state.disposed) return;
@@ -239,10 +240,11 @@ ui.remove.addEventListener("click",()=>{const point=state.points.at(-1);if(point
 ui.clear.addEventListener("click",()=>mutate("clear"));ui.solve.addEventListener("click",solve);
 window.addEventListener("resize",fitCanvas);
 function connectEvents() {
-  if(state.disposed) return;
+  if(state.disposed || document.hidden || events) return;
   const connection=new EventSource("api/v1/events");
   events=connection;
   connection.addEventListener("state",event=>{
+    if(events!==connection || state.disposed || document.hidden) return;
     retryCeiling=250;
     const server=JSON.parse(event.data);
     if(state.busy) {state.pendingState=server;return;}
@@ -262,11 +264,23 @@ function connectEvents() {
     retryCeiling=Math.min(30000,retryCeiling*2);
   };
 }
-void refreshState();
-connectEvents();
+function suspendEvents() {
+  visibilityEpoch++;state.frameEpoch++;
+  const previous=events;events=null;previous?.close();
+  clearTimeout(retryTimer);retryTimer=null;
+}
+function visibilityChanged() {
+  if(state.disposed) return;
+  if(document.hidden) {suspendEvents();return;}
+  lastImageStamp=null;
+  void refreshState();connectEvents();
+}
+document.addEventListener("visibilitychange",visibilityChanged);
 window.addEventListener("pagehide",()=>{
-  state.disposed=true;state.frameEpoch++;state.controller.abort();events?.close();clearTimeout(retryTimer);
+  state.disposed=true;suspendEvents();state.controller.abort();
   if(state.pending) void fetch("api/v1/samples/cancel",{method:"POST",keepalive:true,
     headers:{"Content-Type":"application/json"},body:JSON.stringify({sampling_session_id:state.pending.session,sample_id:state.pending.id})}).catch(()=>undefined);
 });
+window.addEventListener("pageshow",()=>{state.disposed=false;state.controller=new AbortController();visibilityChanged();});
+visibilityChanged();
 export {}
