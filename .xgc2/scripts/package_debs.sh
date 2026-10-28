@@ -36,7 +36,10 @@ mkdir -p "${PACKAGE_ROOT}" "${OUTPUT_DIR}"
 
 copy_path() {
   local source="$1"
-  if [[ ! -e "${source}" ]]; then return; fi
+  if [[ ! -e "${source}" ]]; then
+    echo "required install path is missing: ${source}" >&2
+    return 1
+  fi
   local relative="${source#${INSTALL_ROOT}}"
   mkdir -p "${PACKAGE_ROOT}$(dirname "${relative}")"
   cp -a "${source}" "${PACKAGE_ROOT}${relative}"
@@ -67,9 +70,23 @@ Description: Independent intrinsic and fixed-world-camera extrinsic calibration 
 EOF
 install -m 0644 "${REPO_ROOT}/LICENSE" "${PACKAGE_ROOT}/usr/share/doc/${PACKAGE_NAME}/copyright"
 
-test -f "${PACKAGE_ROOT}${PREFIX}/lib/python3/dist-packages/xgc_camera_calibration/solver.py"
-test -f "${PACKAGE_ROOT}${PREFIX}/share/xgc_camera_calibration/web/intrinsic/index.html"
-test -f "${PACKAGE_ROOT}${PREFIX}/share/xgc_camera_calibration/web/extrinsic/index.html"
+require_file() {
+  if [[ ! -s "$1" ]]; then
+    echo "required package file is missing or empty: $1" >&2
+    return 1
+  fi
+}
+for module in solver extrinsic_resolver intrinsic_solver media_snapshot web_service; do
+  require_file "${PACKAGE_ROOT}${PREFIX}/lib/python3/dist-packages/xgc_camera_calibration/${module}.py"
+done
+for executable in extrinsic_calibrator_web.py intrinsic_calibrator_web.py extrinsic_tf_publisher.py gazebo_camera_from_extrinsic.py resolve_extrinsic.py render_asset.py resolve_intrinsic.sh validate-scene-replay-asset.sh; do
+  require_file "${PACKAGE_ROOT}${PREFIX}/lib/xgc_camera_calibration/${executable}"
+done
+for page in extrinsic intrinsic; do
+  for asset in index.html app.js styles.css; do
+    require_file "${PACKAGE_ROOT}${PREFIX}/share/xgc_camera_calibration/web/${page}/${asset}"
+  done
+done
 find "${PACKAGE_ROOT}" -type d -name __pycache__ -prune -exec rm -rf {} +
 find "${PACKAGE_ROOT}" -type d -exec chmod 0755 {} +
 find "${PACKAGE_ROOT}" -type f -exec chmod 0644 {} +

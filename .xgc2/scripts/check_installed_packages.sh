@@ -3,8 +3,10 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PREFIX="/opt/ros/${ROS_DISTRO:-noetic}"
+export ROS_MASTER_URI="${ROS_MASTER_URI:-http://127.0.0.1:11311}"
 source "${PREFIX}/setup.bash"
 python3 "${SCRIPT_DIR}/check_python_xrpc.py"
+python3 "${SCRIPT_DIR}/check_python_opencv.py"
 dpkg -s ros-noetic-xgc2-camera-calibration >/dev/null
 for definition in xgc2-camera-extrinsic-calibrator-ros1 xgc2-camera-extrinsic-tf-ros1 xgc2-camera-intrinsic-calibrator-ros1; do
   test -s "/usr/share/xgc2/process-definitions/${definition}.json"
