@@ -117,6 +117,7 @@ class GazeboCameraControl:
         self.model_name = str(model_name)
         self.board_center = tuple(float(x) for x in board_center)
         self._lock = threading.RLock()
+        self._state_listeners = set()
         self.world = _SimulationWorld(endpoint, runtime=runtime, timeout=connection_timeout,
                                       local_target=local_target)
         self._reference = None
@@ -128,6 +129,20 @@ class GazeboCameraControl:
         self._applied_instance = None
         self._board_profile = board_profile
         self.world.peer.connected = self._connected
+
+    def subscribe_state(self, callback):
+        release_peer = self.world.peer.subscribe_state(callback)
+        with self._lock:
+            self._state_listeners.add(callback)
+        def release():
+            with self._lock:
+                self._state_listeners.discard(callback)
+            release_peer()
+        return release
+
+    def _state_changed_locked(self):
+        for callback in tuple(self._state_listeners):
+            callback()
 
     def _select_board(self, client):
         profile = self._board_profile
@@ -216,10 +231,12 @@ class GazeboCameraControl:
             self._desired_pose = copy.deepcopy(pose)
             self._desired_revision += 1
             revision = self._desired_revision
+            self._state_changed_locked()
         self._apply_confirmed(pose, self.world.client)
         with self._lock:
             self._applied_revision = revision
             self._applied_instance = self.world.peer.status()["instance_id"]
+            self._state_changed_locked()
 
     def _apply_confirmed(self, pose, client):
         self.world.mutate("/v1/entities/" + quote(self.model_name, safe="") + "/state",
@@ -230,6 +247,7 @@ class GazeboCameraControl:
             raise RuntimeError("camera entity was replaced during pose application")
         with self._lock:
             self._latest_pose = copy.deepcopy(entity["state"]["pose"])
+            self._state_changed_locked()
 
     def goto(self, position, yaw_offset=0.0, pitch_offset=0.0, roll=0.0):
         quaternion = look_at_orientation(position, self.board_center,

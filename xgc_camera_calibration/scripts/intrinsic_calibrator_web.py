@@ -131,7 +131,6 @@ def main():
                     "camera_info": {"received": media["camera_info_received"]},
                     "world": camera.status() if camera is not None else {"reason": "not_configured", "pose_available": False}}
         def activate_peers():
-            snapshot_client.peer.activate()
             if camera is not None:
                 camera.world.peer.activate()
         bind_address = str(parameters.get("~bind_address", "127.0.0.1"))

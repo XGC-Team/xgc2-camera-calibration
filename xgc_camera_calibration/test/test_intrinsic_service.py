@@ -437,6 +437,51 @@ class FakeCameraControl:
 
 class IntrinsicServiceTest(unittest.TestCase):
 
+    def test_observation_follows_replaced_source_and_joins_each_lease(self):
+        class Source:
+            def __init__(self):
+                self.listeners = set()
+
+            def subscribe_state(self, callback):
+                self.listeners.add(callback)
+                return lambda: self.listeners.remove(callback)
+
+            def changed(self):
+                for callback in tuple(self.listeners):
+                    callback()
+
+        with tempfile.TemporaryDirectory() as directory:
+            service = make_service(Path(directory) / "intrinsics.yaml")
+            first, second = Source(), Source()
+            notices = []
+            release = service.subscribe_state(lambda: notices.append("changed"))
+            service.attach_camera_control(first)
+            self.assertEqual((len(notices), len(first.listeners)), (1, 1))
+            first.changed()
+            self.assertEqual(len(notices), 2)
+            service.attach_camera_control(second)
+            self.assertEqual((len(first.listeners), len(second.listeners), len(notices)), (0, 1, 3))
+            first.changed()
+            second.changed()
+            self.assertEqual(len(notices), 4)
+            release()
+            release()
+            second.changed()
+            self.assertEqual((len(notices), len(second.listeners), len(service._state_listeners)), (4, 0, 0))
+
+    def test_failed_command_still_reports_acknowledged_action(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = make_service(Path(directory) / "intrinsics.yaml")
+            service.action = {"name": "auto", "status": "failed"}
+            notices = []
+            release = service.subscribe_state(lambda: notices.append(service.action))
+            try:
+                with self.assertRaises(ApiError):
+                    service.calibrate()
+                self.assertEqual(notices, [None])
+            finally:
+                release()
+
     def test_validation_resolves_core_document_without_result_files(self):
         with tempfile.TemporaryDirectory() as directory:
             service = make_service(Path(directory) / "intrinsics.yaml")
@@ -664,7 +709,6 @@ class IntrinsicServiceTest(unittest.TestCase):
         self.assertNotIn('parameters.get("~auto_capture", not bool(', source)
         web_source = WEB_SERVICE_SOURCE.read_text(encoding="utf-8")
         self.assertNotIn("service.start_auto_capture(", source)
-        self.assertIn("intrinsic.start_auto_capture, intrinsic.live_capture_interval", web_source)
         self.assertIn("_resume_auto_capture_interval_locked()", web_source)
         self.assertIn("start_auto_capture(interval=interval)", web_source)
         self.assertEqual(DEFAULT_AUTO_CAPTURE_INTERVAL_SECONDS, 0.2)
@@ -1532,9 +1576,15 @@ class IntrinsicServiceTest(unittest.TestCase):
             weak = make_diagnostic_result(
                 (frame.shape[1], frame.shape[0]), 3, rank_deficient=True
             )
-            with patch.object(intrinsic_solver, "calibrate_intrinsic", return_value=weak):
-                with self.assertRaises(ApiError) as caught:
-                    service.calibrate()
+            notices = []
+            release = service.subscribe_state(lambda: notices.append(service.session_revision))
+            try:
+                with patch.object(intrinsic_solver, "calibrate_intrinsic", return_value=weak):
+                    with self.assertRaises(ApiError) as caught:
+                        service.calibrate()
+                self.assertEqual(notices, [service.session_revision])
+            finally:
+                release()
             self.assertEqual(caught.exception.status, int(HTTPStatus.UNPROCESSABLE_ENTITY))
             self.assertEqual(
                 caught.exception.details["code"], "intrinsic_candidate_unstable"
@@ -2091,6 +2141,331 @@ class IntrinsicServiceTest(unittest.TestCase):
             self.assertFalse(state["detection"]["accepted"])
             self.assertEqual(state["evidence"]["sample_count"], 0)
             self.assertEqual(state["recovery"]["last_error"], "evidence disk unavailable")
+
+    def test_visible_demand_shares_detector_and_reveal_joins_retired_capture(self):
+        for observer_count in (1, 16):
+            with self.subTest(observers=observer_count), tempfile.TemporaryDirectory() as directory:
+                service = make_service(Path(directory) / "intrinsics.yaml")
+                service.attach_frame_capture(lambda: None)
+                entered, second, release = threading.Event(), threading.Event(), threading.Event()
+                finished = threading.Event()
+                work = {"calls": 0, "active": 0, "peak": 0}
+                retire = None
+
+                def capture():
+                    with service.lock:
+                        work["calls"] += 1
+                        work["active"] += 1
+                        work["peak"] = max(work["peak"], work["active"])
+                        count = work["calls"]
+                    entered.set()
+                    if count >= 2:
+                        second.set()
+                    try:
+                        if not release.wait(3):
+                            raise RuntimeError("controlled capture did not join")
+                    finally:
+                        with service.lock:
+                            work["active"] -= 1
+
+                def park_last():
+                    try:
+                        service.release_live_capture()
+                    finally:
+                        finished.set()
+
+                try:
+                    with patch.object(service, "_capture_frame", side_effect=capture):
+                        for _ in range(observer_count):
+                            service.retain_live_capture(0.05)
+                        self.assertTrue(entered.wait(1))
+                        original = service._auto_capture_thread
+                        for _ in range(observer_count - 1):
+                            service.release_live_capture()
+                        self.assertIs(service._auto_capture_thread, original)
+                        retire = threading.Thread(target=park_last)
+                        retire.start()
+                        self.assertTrue(service._auto_capture_stop.wait(1))
+                        self.assertFalse(finished.is_set())
+                        service.retain_live_capture(0.05)
+                        self.assertIs(service._auto_capture_thread, original)
+                        self.assertEqual(work["calls"], 1)
+                        release.set()
+                        self.assertTrue(finished.wait(1))
+                        retire.join(1)
+                        self.assertTrue(second.wait(1))
+                        self.assertIsNot(service._auto_capture_thread, original)
+                        service.release_live_capture()
+                        self.assertIsNone(service._auto_capture_thread)
+                        with service.lock:
+                            baseline = work["calls"]
+                            self.assertEqual((work["active"], work["peak"]), (0, 1))
+                        sleep(0.12)
+                        self.assertEqual(work["calls"], baseline)
+                finally:
+                    release.set()
+                    if retire is not None:
+                        retire.join(2)
+                    service.stop_auto_capture()
+
+    def test_explicit_pause_survives_reconnect_and_resume_owns_collection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = make_service(Path(directory) / "intrinsics.yaml")
+            service.attach_frame_capture(lambda: None)
+            first, second = threading.Event(), threading.Event()
+            calls = []
+
+            def capture():
+                calls.append(1)
+                first.set()
+                if len(calls) >= 2:
+                    second.set()
+
+            try:
+                with patch.object(service, "_capture_frame", side_effect=capture):
+                    service.retain_live_capture(0.05)
+                    self.assertTrue(first.wait(1))
+                    service.stop_auto_capture()
+                    service.release_live_capture()
+                    before = len(calls)
+                    service.retain_live_capture(0.05)
+                    sleep(0.12)
+                    self.assertEqual(len(calls), before)
+                    self.assertIsNone(service._auto_capture_thread)
+                    self.assertTrue(service.start_auto_capture(0.05)["auto_capture"]["enabled"])
+                    self.assertTrue(second.wait(1))
+                    service.release_live_capture()
+                    self.assertIsNotNone(service._auto_capture_thread)
+                    service.stop_auto_capture()
+                    before = len(calls)
+                    sleep(0.12)
+                    self.assertEqual(len(calls), before)
+            finally:
+                service.stop_auto_capture()
+
+    def test_recording_retains_only_its_own_capture_and_respects_pause(self):
+        for mode in ("park", "hidden", "paused"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                service = make_service(Path(directory) / "intrinsics.yaml")
+                service.views = service.views[:1]
+                service.attach_frame_capture(lambda: None)
+                entered, finish, captured = (threading.Event() for _ in range(3))
+                calls, result = [], {}
+
+                class Camera:
+                    def goto(self, *_args):
+                        entered.set()
+                        if not finish.wait(3):
+                            raise RuntimeError("controlled recording was not released")
+
+                    def reset(self):
+                        pass
+
+                    def current(self):
+                        return None
+
+                def capture():
+                    calls.append(1)
+                    with service.lock:
+                        service._display = np.zeros((24, 32, 3), dtype=np.uint8)
+                    captured.set()
+
+                def record():
+                    try:
+                        result.update(service.record_references(settle=0))
+                    except Exception as error:
+                        result["error"] = error
+
+                service.attach_camera_control(Camera())
+                if mode == "paused":
+                    service.stop_auto_capture()
+                worker = None
+                try:
+                    with patch.object(service, "_capture_frame", side_effect=capture):
+                        if mode == "park":
+                            service.retain_live_capture(0.05)
+                            self.assertTrue(captured.wait(1))
+                            captured.clear()
+                        worker = threading.Thread(target=record)
+                        worker.start()
+                        self.assertTrue(entered.wait(2))
+                        if mode == "park":
+                            service.release_live_capture()
+                        if mode == "paused":
+                            self.assertEqual(calls, [])
+                        else:
+                            self.assertTrue(captured.wait(1))
+                        finish.set()
+                        worker.join(2)
+                        self.assertFalse(worker.is_alive())
+                        self.assertNotIn("error", result)
+                        self.assertEqual(result["saved"], 1)
+                        self.assertIsNone(service._auto_capture_thread)
+                        if mode == "paused":
+                            self.assertEqual(len(calls), 1)
+                            self.assertTrue(service._auto_capture_paused)
+                        baseline = len(calls)
+                        sleep(0.12)
+                        self.assertEqual(len(calls), baseline)
+                finally:
+                    finish.set()
+                    if worker is not None:
+                        worker.join(3)
+                    service.stop_auto_capture()
+
+    def test_accepted_sweep_retains_detector_until_its_completion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = make_service(Path(directory) / "intrinsics.yaml")
+            self.attach_native_work(service, directory)
+            service.attach_camera_control(FakeCameraControl())
+            service.attach_frame_capture(lambda: None)
+            first, second = threading.Event(), threading.Event()
+            sweep_entered, finish_sweep = threading.Event(), threading.Event()
+            calls = []
+
+            def capture():
+                calls.append(1)
+                first.set()
+                if len(calls) >= 2:
+                    second.set()
+
+            def sweep(_camera, _settle, _detection_timeout):
+                sweep_entered.set()
+                if not finish_sweep.wait(3):
+                    raise RuntimeError("controlled sweep was not released")
+                with service.lock:
+                    service.action = {"name": "auto_run", "status": "succeeded"}
+
+            try:
+                with patch.object(service, "_capture_frame", side_effect=capture), \
+                     patch.object(service, "_run_auto_sweep", side_effect=sweep):
+                    service.retain_live_capture(0.05)
+                    self.assertTrue(first.wait(1))
+                    self.assertTrue(service.auto_run(settle=0, detection_timeout=1)["accepted"])
+                    self.assertTrue(sweep_entered.wait(1))
+                    future = service._auto_run_future
+                    service.release_live_capture()
+                    self.assertEqual(service.action["status"], "running")
+                    self.assertIsNotNone(service._auto_capture_thread)
+                    self.assertTrue(second.wait(1))
+                    finish_sweep.set()
+                    future.result(timeout=2)
+                    self.assertEqual(service.action["status"], "succeeded")
+                    self.assertIsNone(service._auto_capture_thread)
+                    before = len(calls)
+                    sleep(0.12)
+                    self.assertEqual(len(calls), before)
+            finally:
+                finish_sweep.set()
+                service.stop_auto_capture()
+
+    def test_sweep_is_its_own_demand_without_a_view_and_does_not_undo_pause(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = make_service(Path(directory) / "intrinsics.yaml")
+            self.attach_native_work(service, directory)
+            service.attach_camera_control(FakeCameraControl())
+            service.attach_frame_capture(lambda: None)
+            service.live_capture_interval = 0.05
+            captured, sweep_entered, finish_sweep = (threading.Event() for _ in range(3))
+            calls = []
+
+            def capture():
+                calls.append(1)
+                captured.set()
+
+            def sweep(_camera, _settle, _detection_timeout):
+                sweep_entered.set()
+                if not finish_sweep.wait(3):
+                    raise RuntimeError("controlled sweep was not released")
+                with service.lock:
+                    service.action = {"name": "auto_run", "status": "succeeded"}
+
+            try:
+                with patch.object(service, "_capture_frame", side_effect=capture), \
+                     patch.object(service, "_run_auto_sweep", side_effect=sweep):
+                    self.assertTrue(service.auto_run(settle=0, detection_timeout=1)["accepted"])
+                    future = service._auto_run_future
+                    self.assertTrue(sweep_entered.wait(1))
+                    self.assertTrue(captured.wait(1))
+                    self.assertEqual(service._auto_capture_observers, 0)
+                    self.assertFalse(service._auto_capture_requested)
+                    finish_sweep.set()
+                    future.result(timeout=2)
+                    self.assertIsNone(service._auto_capture_thread)
+                    before = len(calls)
+                    sleep(0.12)
+                    self.assertEqual(len(calls), before)
+                    service.stop_auto_capture()
+                    with self.assertRaises(ApiError) as caught:
+                        service.auto_run(settle=0, detection_timeout=1)
+                    self.assertEqual(caught.exception.status, int(HTTPStatus.SERVICE_UNAVAILABLE))
+                    self.assertEqual(len(calls), before)
+                    self.assertIsNone(service._auto_capture_thread)
+            finally:
+                finish_sweep.set()
+                service.stop_auto_capture()
+
+    def test_sweep_admitted_during_last_view_retirement_joins_before_capture(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = make_service(Path(directory) / "intrinsics.yaml")
+            self.attach_native_work(service, directory)
+            service.attach_camera_control(FakeCameraControl())
+            service.attach_frame_capture(lambda: None)
+            entered, release_capture, next_capture, sweep_entered, finish_sweep = (threading.Event() for _ in range(5))
+            work = {"calls": 0, "active": 0, "peak": 0}
+            retire = None
+
+            def capture():
+                with service.lock:
+                    work["calls"] += 1
+                    work["active"] += 1
+                    work["peak"] = max(work["peak"], work["active"])
+                    count = work["calls"]
+                try:
+                    if count == 1:
+                        entered.set()
+                        if not release_capture.wait(3):
+                            raise RuntimeError("controlled capture was not released")
+                    else:
+                        next_capture.set()
+                finally:
+                    with service.lock:
+                        work["active"] -= 1
+
+            def sweep(_camera, _settle, _detection_timeout):
+                sweep_entered.set()
+                if not finish_sweep.wait(3):
+                    raise RuntimeError("controlled sweep was not released")
+                with service.lock:
+                    service.action = {"name": "auto_run", "status": "succeeded"}
+
+            try:
+                with patch.object(service, "_capture_frame", side_effect=capture), \
+                     patch.object(service, "_run_auto_sweep", side_effect=sweep):
+                    service.retain_live_capture(0.05)
+                    self.assertTrue(entered.wait(1))
+                    retire = threading.Thread(target=service.release_live_capture)
+                    retire.start()
+                    self.assertTrue(service._auto_capture_stop.wait(1))
+                    self.assertTrue(service.auto_run(settle=0, detection_timeout=1)["accepted"])
+                    future = service._auto_run_future
+                    self.assertFalse(sweep_entered.is_set())
+                    self.assertEqual(work["calls"], 1)
+                    release_capture.set()
+                    retire.join(2)
+                    self.assertFalse(retire.is_alive())
+                    self.assertTrue(sweep_entered.wait(1))
+                    self.assertTrue(next_capture.wait(1))
+                    finish_sweep.set()
+                    future.result(timeout=2)
+                    self.assertEqual((work["active"], work["peak"]), (0, 1))
+                    self.assertIsNone(service._auto_capture_thread)
+            finally:
+                release_capture.set()
+                finish_sweep.set()
+                if retire is not None:
+                    retire.join(2)
+                service.stop_auto_capture()
 
     def test_continuous_detection_keeps_running_after_coverage_is_ready(self):
         with tempfile.TemporaryDirectory() as directory:

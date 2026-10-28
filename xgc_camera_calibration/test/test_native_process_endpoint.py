@@ -11,6 +11,7 @@ import subprocess
 import sys
 import urllib.error
 import urllib.request
+from xmlrpc.client import ServerProxy
 from pathlib import Path
 import tempfile
 import threading
@@ -181,10 +182,11 @@ class NativeProcessEndpointTest(unittest.TestCase):
             for capture in captures:
                 with self.assertRaises(MediaSnapshotError):
                     capture.result(timeout=6)
-        deadline = time.monotonic() + 2
-        while not media.status()['ready'] and time.monotonic() < deadline:
-            time.sleep(.01)
-        self.assertTrue(media.status()['ready'])
+        # These are only one-shot capture users. Their final physical join
+        # releases discovery instead of retaining a ready peer indefinitely.
+        self.assertFalse(media.status()['ready'])
+        self.assertEqual(media.status()['reason'], 'not_requested')
+        self.assertIsNone(media.peer._thread)
         self.assertEqual(media.status()['connect_attempts'], 1)
 
     def test_early_not_ready_describe_replies_use_exponential_backoff(self):
@@ -206,6 +208,44 @@ class NativeProcessEndpointTest(unittest.TestCase):
             self.assertFalse(media.status()['ready'])
             self.assertLessEqual(media.status()['connect_attempts'], 3)
             self.assertGreaterEqual(media.status()['connect_attempts'], 2)
+            media.close()
+
+    def test_missing_media_waits_on_change_and_last_detector_stop_wakes_it(self):
+        from xgc_camera_calibration.intrinsic_service import IntrinsicCalibrationService
+        media = MediaSnapshotClient(str(self.root / 'absent.sock'), 'usb_cam', local_target='local-test')
+        service = IntrinsicCalibrationService(board_size=(7, 5), square=.2,
+            output_file=str(self.root / 'intrinsics.yaml'), camera_name='camera', media_source='usb_cam')
+        service.attach_frame_capture(lambda: None)
+        service.capture_peer = media.peer
+        release = media.peer.retain()
+        waited, entered = [], threading.Event()
+        original_wait = media.peer._condition.wait
+        def wait(timeout=None):
+            if threading.current_thread().name == 'intrinsic-live-detection':
+                waited.append(timeout)
+                entered.set()
+            return original_wait(timeout)
+        try:
+            deadline = time.monotonic() + 2
+            while media.status()['reason'] != 'waiting_socket' and time.monotonic() < deadline:
+                time.sleep(.005)
+            self.assertEqual(media.status()['reason'], 'waiting_socket')
+            with patch.object(media.peer._condition, 'wait', side_effect=wait):
+                service.retain_live_capture(.05)
+                self.assertTrue(entered.wait(1))
+                time.sleep(.65)
+                self.assertEqual(waited, [None])
+                service.release_live_capture()
+                self.assertIsNone(service._auto_capture_thread)
+            release()
+            self.assertIsNone(media.peer._thread)
+            print('T15_MISSING_MEDIA_WAIT ' + json.dumps({
+                'detector_condition_waits': len(waited), 'timed_waits': sum(value is not None for value in waited),
+                'peer_owners_after_join': media.peer._owners, 'peer_thread_after_join': media.peer._thread is not None,
+            }, sort_keys=True))
+        finally:
+            service.stop_auto_capture()
+            release()
             media.close()
 
     def test_node_arguments_forward_socket_and_target(self):
@@ -252,6 +292,7 @@ class NativeProcessEndpointTest(unittest.TestCase):
         source.ready_condition = threading.Condition(source.lock)
         source.optical_frame = 'test-camera-optical'
         source.camera_info = None
+        source._state_listeners = set()
         source._readiness_stopping = False
         self.assertTrue(source.wait_ready(0))
         info = SimpleNamespace(K=[500, 0, 320, 0, 500, 240, 0, 0, 1], D=[0, 0, 0, 0, 0],
@@ -265,6 +306,232 @@ class NativeProcessEndpointTest(unittest.TestCase):
         self.assertIsNotNone(source.camera_info)
         source.stop_readiness()
         self.assertFalse(source.wait_ready(0))
+
+    def test_extrinsic_state_freshness_notifies_on_real_deadline_and_joins(self):
+        path = Path(__file__).parents[1] / 'scripts/extrinsic_calibrator_web.py'
+        spec = importlib.util.spec_from_file_location('extrinsic_state_expiry_test', path)
+        entry = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(entry)
+        source = entry.RosCalibrationSource('', 'phy', 'test-camera',
+            parameters={'~pose_coordinate_source': 'experiment-world',
+                        '~child_frame': 'test-camera-optical', '~pose_max_age': 0.15},
+            frozen_extrinsic={'targetCoordinates': {'worldOffset': [0, 0, 0]}})
+        clock = SimpleNamespace(is_rostime_initialized=lambda: True, is_wallclock=lambda: True)
+        fake_ros = SimpleNamespace(rostime=clock, Time=SimpleNamespace(
+            now=lambda: SimpleNamespace(to_sec=time.time)))
+        notifications = []
+        with patch.object(entry, 'rospy', fake_ros):
+            release = source.subscribe_state(lambda: notifications.append(time.monotonic()))
+            try:
+                time.sleep(0.2)
+                self.assertEqual(notifications, [])
+                stamp = time.time()
+                message = SimpleNamespace(pose=SimpleNamespace(position=SimpleNamespace(x=1., y=2., z=3.)),
+                    header=SimpleNamespace(frame_id='world', stamp=SimpleNamespace(to_sec=lambda: stamp)))
+                source._marker_callback('board')(message)
+                self.assertEqual(len(notifications), 1)
+                deadline = time.monotonic() + 1
+                while len(notifications) < 2 and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertEqual(len(notifications), 2)
+                self.assertEqual(source._state_freshness[1], ())
+            finally:
+                release()
+            self.assertIsNone(source._state_thread)
+            self.assertEqual(source._state_listeners, set())
+            before = len(notifications)
+            time.sleep(0.2)
+            self.assertEqual(len(notifications), before)
+
+    def test_extrinsic_state_freshness_tracks_sim_clock_edges_without_polling(self):
+        path = Path(__file__).parents[1] / 'scripts/extrinsic_calibrator_web.py'
+        spec = importlib.util.spec_from_file_location('extrinsic_state_clock_test', path)
+        entry = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(entry)
+        source = entry.RosCalibrationSource('', 'phy', 'test-camera',
+            parameters={'~pose_coordinate_source': 'experiment-world',
+                        '~child_frame': 'test-camera-optical', '~pose_max_age': 3.0},
+            frozen_extrinsic={'targetCoordinates': {'worldOffset': [0, 0, 0]}})
+        clock_value = [10.]
+        subscriptions = []
+        class Subscriber:
+            def __init__(self, _topic, _kind, callback, **_kwargs):
+                self.callback, self.closed = callback, False
+                subscriptions.append(self)
+            def unregister(self):
+                self.closed = True
+        fake_ros = SimpleNamespace(rostime=SimpleNamespace(
+            is_rostime_initialized=lambda: True, is_wallclock=lambda: False),
+            Time=SimpleNamespace(now=lambda: SimpleNamespace(to_sec=lambda: clock_value[0])),
+            Subscriber=Subscriber)
+        notifications = []
+        with patch.object(entry, 'rospy', fake_ros):
+            release = source.subscribe_state(lambda: notifications.append(clock_value[0]))
+            try:
+                stamp = 10.
+                message = SimpleNamespace(pose=SimpleNamespace(position=SimpleNamespace(x=1., y=2., z=3.)),
+                    header=SimpleNamespace(frame_id='world', stamp=SimpleNamespace(to_sec=lambda: stamp)))
+                source._marker_callback('board')(message)
+                self.assertEqual(len(subscriptions), 1)
+                self.assertEqual(notifications, [10.])
+                for value in (10.1, 11., 12.9):
+                    clock_value[0] = value
+                    subscriptions[0].callback(SimpleNamespace(clock=SimpleNamespace(to_sec=lambda: value)))
+                self.assertEqual(notifications, [10.])
+                clock_value[0] = 13.1
+                subscriptions[0].callback(SimpleNamespace(clock=SimpleNamespace(to_sec=lambda: 13.1)))
+                self.assertEqual(notifications, [10., 13.1])
+                self.assertEqual(source._state_freshness[1], ())
+            finally:
+                release()
+            self.assertTrue(subscriptions[0].closed)
+            self.assertIsNone(source._state_thread)
+
+    def test_extrinsic_observer_admission_failure_joins_expiry_owner(self):
+        path = Path(__file__).parents[1] / 'scripts/extrinsic_calibrator_web.py'
+        spec = importlib.util.spec_from_file_location('extrinsic_state_admission_test', path)
+        entry = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(entry)
+        source = entry.RosCalibrationSource('', 'phy', 'test-camera',
+            parameters={'~pose_coordinate_source': 'experiment-world',
+                        '~child_frame': 'test-camera-optical'},
+            frozen_extrinsic={'targetCoordinates': {'worldOffset': [0, 0, 0]}})
+        source.snapshot_client = SimpleNamespace(subscribe_state=MagicMock(side_effect=RuntimeError('admission failed')))
+        fake_ros = SimpleNamespace(rostime=SimpleNamespace(is_rostime_initialized=lambda: False))
+        with patch.object(entry, 'rospy', fake_ros):
+            with self.assertRaisesRegex(RuntimeError, 'admission failed'):
+                source.subscribe_state(lambda: None)
+        self.assertEqual(source._state_listeners, set())
+        self.assertIsNone(source._state_thread)
+
+    def test_last_ros_observer_joins_inflight_callback_before_reveal(self):
+        path = Path(__file__).parents[1] / 'scripts/extrinsic_calibrator_web.py'
+        spec = importlib.util.spec_from_file_location('extrinsic_source_join_test', path)
+        entry = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(entry)
+        source = entry.RosCalibrationSource('', 'phy', 'test-camera',
+            parameters={'~pose_coordinate_source': 'experiment-world',
+                        '~child_frame': 'test-camera-optical', '~trackers': ['board']},
+            frozen_extrinsic={'targetCoordinates': {'worldOffset': [0, 0, 0]}})
+        subscribers = []
+        class Subscriber:
+            def __init__(self, _topic, _kind, callback, **_kwargs):
+                self.callback, self.closed = callback, False
+                subscribers.append(self)
+            def unregister(self):
+                self.closed = True
+        fake_ros = SimpleNamespace(rostime=SimpleNamespace(is_rostime_initialized=lambda: False),
+                                   Subscriber=Subscriber)
+        entered, finish = threading.Event(), threading.Event()
+        def held(_message):
+            entered.set()
+            if not finish.wait(3):
+                raise RuntimeError('controlled ROS callback was not released')
+        with patch.object(entry, 'rospy', fake_ros), patch.object(source, '_camera_info_callback', side_effect=held):
+            source.start_ros()
+            self.assertEqual(subscribers, [])
+            release = source.subscribe_state(lambda: None)
+            self.assertEqual(len(subscribers), 3)
+            worker = threading.Thread(target=subscribers[0].callback, args=(object(),))
+            worker.start()
+            self.assertTrue(entered.wait(1))
+            retired, revealed, result = threading.Event(), threading.Event(), {}
+            retire = threading.Thread(target=lambda: (release(), retired.set()))
+            def reveal():
+                result['release'] = source.subscribe_state(lambda: None)
+                revealed.set()
+            successor = threading.Thread(target=reveal)
+            try:
+                retire.start()
+                deadline = time.monotonic() + 1
+                while not source._ros_retiring and time.monotonic() < deadline:
+                    time.sleep(.005)
+                self.assertTrue(source._ros_retiring)
+                self.assertTrue(all(subscriber.closed for subscriber in subscribers))
+                successor.start()
+                self.assertFalse(retired.wait(.05))
+                self.assertFalse(revealed.is_set())
+                self.assertEqual(len(subscribers), 3)
+                finish.set()
+                worker.join(2)
+                retire.join(2)
+                successor.join(2)
+                self.assertTrue(retired.is_set())
+                self.assertTrue(revealed.is_set())
+                self.assertEqual(len(subscribers), 6)
+                result['release']()
+                self.assertTrue(all(subscriber.closed for subscriber in subscribers))
+                self.assertEqual((source._ros_users, source._ros_callbacks), (0, 0))
+                self.assertIsNone(source._state_thread)
+                observer = source.subscribe_state(lambda: None)
+                operation = source.retain_source()
+                observer()
+                self.assertEqual(source._ros_users, 1)
+                self.assertTrue(all(not subscriber.closed for subscriber in subscribers[-3:]))
+                self.assertIsNone(source._state_thread)
+                operation()
+                self.assertTrue(all(subscriber.closed for subscriber in subscribers))
+                self.assertEqual(source._ros_users, 0)
+            finally:
+                finish.set()
+                worker.join(2)
+                retire.join(2)
+                if successor.ident is not None:
+                    successor.join(2)
+                if 'release' in result:
+                    result['release']()
+
+    def test_repeated_marker_keeps_one_real_expiry_without_reprojection(self):
+        path = Path(__file__).parents[1] / 'scripts/extrinsic_calibrator_web.py'
+        spec = importlib.util.spec_from_file_location('extrinsic_state_extension_test', path)
+        entry = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(entry)
+        source = entry.RosCalibrationSource('', 'phy', 'test-camera',
+            parameters={'~pose_coordinate_source': 'experiment-world',
+                        '~child_frame': 'test-camera-optical', '~pose_max_age': 0.5},
+            frozen_extrinsic={'targetCoordinates': {'worldOffset': [0, 0, 0]}})
+        class Subscriber:
+            def __init__(self, *_args, **_kwargs):
+                self.closed = False
+            def unregister(self):
+                self.closed = True
+        fake_ros = SimpleNamespace(rostime=SimpleNamespace(
+            is_rostime_initialized=lambda: True, is_wallclock=lambda: False),
+            Time=SimpleNamespace(now=lambda: SimpleNamespace(to_sec=lambda: 10.)),
+            Subscriber=Subscriber)
+        message = SimpleNamespace(pose=SimpleNamespace(position=SimpleNamespace(x=1., y=2., z=3.)),
+            header=SimpleNamespace(frame_id='world', stamp=SimpleNamespace(to_sec=lambda: 10.)))
+        notifications, computations = [], []
+        original = source._freshness_locked
+        def freshness(*args, **kwargs):
+            computations.append(threading.current_thread().name)
+            return original(*args, **kwargs)
+        with patch.object(entry, 'rospy', fake_ros), patch.object(source, '_freshness_locked', side_effect=freshness):
+            release = source.subscribe_state(lambda: notifications.append(source._state_freshness))
+            try:
+                source._marker_callback('board')(message)
+                first_receipt = source.marker_receipts['board'][0]
+                time.sleep(0.03)
+                baseline = len(computations)
+                for _ in range(20):
+                    source._marker_callback('board')(message)
+                    time.sleep(0.005)
+                self.assertEqual(len(notifications), 1)
+                self.assertEqual(len(computations), baseline)
+                time.sleep(max(0., first_receipt + 0.52 - time.monotonic()))
+                # The first deadline was superseded by later receipts; it
+                # must not make the owner compute an unchanged projection.
+                self.assertEqual(len(notifications), 1)
+                self.assertEqual(len(computations), baseline)
+                deadline = time.monotonic() + 1
+                while len(notifications) == 1 and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertEqual(len(notifications), 2)
+                self.assertEqual(source._state_freshness[1], ())
+                self.assertEqual(len(computations), baseline + 1)
+            finally:
+                release()
+        self.assertIsNone(source._state_thread)
 
     def test_extrinsic_describe_survives_ros_clock_initialization_window(self):
         path = Path(__file__).parents[1] / 'scripts/extrinsic_calibrator_web.py'
@@ -601,6 +868,113 @@ finally:
                 and self.describe(client)['facts']['peers']['media']['ready'], process=process)
         self.until(lambda: len(replacement.requests) >= 1)
         self.assertEqual(self.request(extrinsic[3], '/api/v1/freeze', {})['frame']['frame_id'], 'usb_cam_optical_frame')
+
+    def test_extrinsic_views_and_accepted_freeze_own_real_ros_and_media_until_join(self):
+        from xgc2_xrpc import multipart
+        self.start_master()
+        process, client, port = self.start_helper('extrinsic')
+        self.until(lambda: self.describe(client)['ready'], process=process)
+        self.publishers()
+        media = self.start_media('edge-observed')
+        topics = ('/usb_cam/camera_info', '/usb_cam/image_raw/compressed', '/vrpn_client_node/body/pose')
+        def subscribers():
+            with ServerProxy(self.env['ROS_MASTER_URI']) as master:
+                code, _message, state = master.getSystemState('/xgc_t15_observer_test')
+            self.assertEqual(code, 1)
+            return {name: tuple(nodes) for name, nodes in state[1]}
+        def owns_topics():
+            current = subscribers()
+            return all(any('xgc_camera_extrinsic_calibrator_web' in node for node in current.get(topic, ()))
+                       for topic in topics)
+        def no_topics():
+            current = subscribers()
+            return all(not any('xgc_camera_extrinsic_calibrator_web' in node for node in current.get(topic, ()))
+                       for topic in topics)
+        def owned_topic_count():
+            current = subscribers()
+            return sum(sum('xgc_camera_extrinsic_calibrator_web' in node for node in current.get(topic, ()))
+                       for topic in topics)
+        self.until(no_topics)
+        first = self.viewer('extrinsic', port)
+        second = self.viewer('extrinsic', port)
+        self.assertEqual(first.readline(), b'id: 1\n')
+        self.assertEqual(second.readline(), b'id: 1\n')
+        self.until(owns_topics, process=process)
+        self.until(lambda: self.state('extrinsic', port)['source']['camera_info_received'], process=process)
+        self.until(lambda: self.state('extrinsic', port)['source']['world_pose_available'], process=process)
+        self.until(lambda: self.describe(client)['facts']['peers']['media']['ready'], process=process)
+        self.assertEqual(self.describe(client)['facts']['peers']['media']['connect_attempts'], 1)
+        active_subscribers = owned_topic_count()
+        self.assertEqual(active_subscribers, 3)
+        state = self.state('extrinsic', port)
+        self.assertNotIn('camera_info_connected', state['source'])
+        self.assertEqual(set(state['peers']['camera_info']), {'received'})
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        def held_capture(value):
+            entered.set()
+            if not release.wait(5):
+                raise RuntimeError('controlled Media capture was not released')
+            raw = media.raw if value['includeRgb'] else b''
+            metadata = {**media.metadata, 'snapshotId': media.snapshot_ids[-1],
+                        'jpegBytes': len(media.jpeg), 'rgbBytes': len(raw)}
+            return multipart(metadata, media.jpeg, raw)
+        media.custom_capture = held_capture
+        captures_before = len(media.requests)
+        result = {}
+        def freeze():
+            try:
+                result['value'] = self.request(port, '/api/v1/freeze', {})
+            except Exception as error:
+                result['error'] = error
+        worker = threading.Thread(target=freeze)
+        worker.start()
+        try:
+            self.assertTrue(entered.wait(3))
+            first.close()
+            second.close()
+            self.assertTrue(owns_topics(), 'accepted freeze lost its ROS source on park')
+            release.set()
+            worker.join(5)
+            self.assertFalse(worker.is_alive())
+            self.assertNotIn('error', result)
+            self.assertEqual(result['value']['frame']['frame_id'], 'usb_cam_optical_frame')
+            freeze_captures = len(media.requests) - captures_before
+            self.assertEqual(freeze_captures, 1)
+            self.assertEqual(media.deleted, media.snapshot_ids)
+            self.until(no_topics, process=process)
+            parked_subscribers = owned_topic_count()
+            self.assertEqual(parked_subscribers, 0)
+            self.until(lambda: self.describe(client)['facts']['peers']['media']['reason'] == 'not_requested')
+            parked = self.describe(client)['facts']['peers']['media']['connect_attempts']
+            self.stop_peer(media)
+            media = self.start_media('edge-revealed')
+            time.sleep(.3)
+            hidden_attempts = self.describe(client)['facts']['peers']['media']['connect_attempts']
+            self.assertEqual(hidden_attempts, parked)
+            self.assertEqual(len(media.requests), 0)
+            self.assertTrue(no_topics())
+            reveal = self.viewer('extrinsic', port)
+            self.assertEqual(reveal.readline(), b'id: 1\n')
+            self.until(owns_topics, process=process)
+            self.until(lambda: self.describe(client)['facts']['peers']['media']['instance_id'] == 'edge-revealed'
+                       and self.describe(client)['facts']['peers']['media']['ready'])
+            revealed_attempts = self.describe(client)['facts']['peers']['media']['connect_attempts']
+            self.assertEqual(revealed_attempts - parked, 1)
+            self.until(lambda: self.state('extrinsic', port)['source']['camera_info_received'], process=process)
+            self.until(lambda: self.state('extrinsic', port)['source']['world_pose_available'], process=process)
+            reveal.close()
+            self.until(no_topics, process=process)
+            print('T15_EXTRINSIC_NATIVE_WORK ' + json.dumps({
+                'visible_readers': 2, 'ros_subscriptions_active': active_subscribers,
+                'ros_subscriptions_parked': parked_subscribers, 'accepted_freeze_captures': freeze_captures,
+                'hidden_discovery_attempt_delta': hidden_attempts - parked,
+                'reveal_discovery_attempt_delta': revealed_attempts - parked,
+                'replacement_media_captures': len(media.requests),
+            }, sort_keys=True))
+        finally:
+            release.set()
+            worker.join(5)
 
     def test_world_created_late_replays_board_and_latest_pose_once_per_instance(self):
         self.board_assets()

@@ -484,35 +484,38 @@ class WebCalibrationServiceTest(unittest.TestCase):
         from xgc_camera_calibration.intrinsic_validation import ideal_intrinsic_parameters
         source_path = Path(__file__).resolve().parents[1] / "scripts" / "extrinsic_calibrator_web.py"
         cls = next(node for node in ast.parse(source_path.read_text()).body if isinstance(node, ast.ClassDef) and node.name == "RosCalibrationSource")
-        methods = [node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name in ("_marker_callback", "observe_marker", "_observation_context")]
+        methods = [node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name in ("_marker_callback", "_observe_marker", "_observation_context")]
         clock = SimpleNamespace(monotonic=lambda: 100., time=lambda: 123456.)
         namespace = {"MarkerObservation": MarkerObservation, "ApiError": ApiError, "replace": replace,
             "uuid": uuid, "time": clock, "pose_is_fresh": pose_is_fresh,
             "coordinate_provenance": coordinate_provenance, "ideal_intrinsic_parameters": ideal_intrinsic_parameters,
-            "rospy": SimpleNamespace(Time=SimpleNamespace(now=lambda:SimpleNamespace(to_sec=lambda:12.34)))}
+            "rospy": SimpleNamespace(Time=SimpleNamespace(now=lambda:SimpleNamespace(to_sec=lambda:12.34)),
+                                     rostime=SimpleNamespace(is_rostime_initialized=lambda:False))}
         exec(compile(ast.Module(body=methods,type_ignores=[]),str(source_path),"exec"),namespace)
         # CameraInfo is the model authority even when no ROS preview or helper
         # native capture has run. Browser image bytes are validated at commit.
         source = SimpleNamespace(lock=threading.RLock(),marker_latest={},marker_receipts={},pose_max_age=2.,
             use_camera_info=True,camera_info=(self.intrinsic,self.distortion,(640,480),"camera-optical"),
-            camera_info_topic="/camera/camera_info",pose_coordinate_source="raw-vrpn",pose_world_offset=(10.,-5.,2.))
+            camera_info_topic="/camera/camera_info",pose_coordinate_source="raw-vrpn",pose_world_offset=(10.,-5.,2.),
+            _refresh_freshness_locked=lambda:None, _wake_for_deadline_locked=lambda _deadline:None,
+            _retain_state_clock=lambda:None)
         source._observation_context=MethodType(namespace["_observation_context"],source)
         callback=namespace["_marker_callback"](source,"one")
         def message(position):
             return SimpleNamespace(pose=SimpleNamespace(position=SimpleNamespace(x=position[0],y=position[1],z=position[2])),
                 header=SimpleNamespace(frame_id="world",stamp=SimpleNamespace(to_sec=lambda:12.34)))
         callback(message((1.,2.,3.)))
-        first=namespace["observe_marker"](source,"one",640,480,"world")["marker"]
+        first=namespace["_observe_marker"](source,"one",640,480,"world")["marker"]
         callback(message((4.,5.,6.)))
-        second=namespace["observe_marker"](source,"one",640,480,"world")["marker"]
+        second=namespace["_observe_marker"](source,"one",640,480,"world")["marker"]
         self.assertEqual(first.position,(11.,-3.,5.));self.assertEqual(first.source_position,(1.,2.,3.))
         self.assertEqual(second.position,(14.,0.,8.));self.assertNotEqual(first.observation_id,second.observation_id)
         self.assertEqual((first.source_stamp_sec,first.received_at_sec,first.received_monotonic_sec),(12.34,123456.,100.))
         with self.assertRaisesRegex(ApiError,"Camera intrinsics are 640x480"):
-            namespace["observe_marker"](source,"one",320,240,"world")
+            namespace["_observe_marker"](source,"one",320,240,"world")
         clock.monotonic=lambda:104.
         with self.assertRaisesRegex(ApiError,"fresh"):
-            namespace["observe_marker"](source,"one",640,480,"world")
+            namespace["_observe_marker"](source,"one",640,480,"world")
 
     def test_http_native_4k_image_commit_review_and_tamper_rejection(self):
         # Real service transport, real codec decode and native >2MiB image; no ROS.

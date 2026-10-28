@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import json
 import math
@@ -211,7 +212,29 @@ class CalibrationService:
         self.candidate_id: Optional[str] = None
         self.candidate_points: Optional[Sequence[Dict[str, Any]]] = None
         self.candidate_metadata = None
+        self._state_listeners = set()
         self.samples = SampleCollection(source, parent_frame, self.lock, self._samples_changed)
+
+    def subscribe_state(self, callback):
+        with self.lock:
+            self._state_listeners.add(callback)
+        subscribe = getattr(self.source, "subscribe_state", None)
+        try:
+            release_source = subscribe(callback) if callable(subscribe) else None
+        except BaseException:
+            with self.lock:
+                self._state_listeners.discard(callback)
+            raise
+        def release():
+            with self.lock:
+                self._state_listeners.discard(callback)
+            if release_source is not None:
+                release_source()
+        return release
+
+    def _state_changed_locked(self):
+        for callback in tuple(self._state_listeners):
+            callback()
 
     def _samples_changed(self) -> None:
         self.result = None
@@ -219,6 +242,7 @@ class CalibrationService:
         self.candidate_id = None
         self.candidate_points = None
         self.candidate_metadata = None
+        self._state_changed_locked()
 
     def begin_sample(self, request):
         return self.samples.begin(request)
@@ -293,7 +317,7 @@ class CalibrationService:
                     }
                     for marker in sorted(frozen.markers.values(), key=lambda item: item.name)
                 ]
-            return payload
+            return copy.deepcopy(payload)
 
     def freeze(self) -> Dict[str, Any]:
         snapshot = self.source.freeze(self.parent_frame)
@@ -333,12 +357,16 @@ class CalibrationService:
             self.generation += 1
             self.frozen = snapshot
             self.frozen_jpeg = encoded
+            self._state_changed_locked()
         return self.state()
 
     def live(self) -> Dict[str, Any]:
         with self.lock:
+            changed = self.frozen is not None or self.frozen_jpeg is not None
             self.frozen = None
             self.frozen_jpeg = None
+            if changed:
+                self._state_changed_locked()
         return self.state()
 
     def image_jpeg(self) -> bytes:
@@ -413,6 +441,7 @@ class CalibrationService:
                 "sampling_session_id": self.samples.session_id, "dataset_revision": self.samples.revision,
                 "image_topic": self.source.image_topic, "pose_prefix": self.source.pose_prefix,
             }, allow_nan=False))
+            self._state_changed_locked()
             return payload
 
 
@@ -435,7 +464,8 @@ class CalibrationHttpServer:
     def __init__(self, address, service, web_root, *, frame_ancestors,
                  allowed_origins=(), logger=None, intrinsic_service=None,
                  runtime=None, limits=None, upload_timeout=30.0, rpc_socket=None, target_id=None,
-                 validation_workers=2, lifecycle=None, peer_status=None, activate_peers=None):
+                 validation_workers=2, lifecycle=None, peer_status=None, activate_peers=None,
+                 peer_status_for_state=None):
         if service is None and intrinsic_service is None:
             raise ValueError("at least one of service / intrinsic_service is required")
         root = Path(web_root).resolve()
@@ -447,6 +477,7 @@ class CalibrationHttpServer:
         self.service, self.intrinsic_service = service, intrinsic_service
         self.lifecycle = lifecycle
         self.peer_status = peer_status or (lambda: {})
+        self.peer_status_for_state = peer_status_for_state
         self.activate_peers = activate_peers or (lambda: None)
         self.web_root = root
         self.frame_ancestors = frame_ancestors.strip() or "'self'"
@@ -468,6 +499,11 @@ class CalibrationHttpServer:
         self._owns_runtime = runtime is None
         self._closed = False
         self._stopping = False
+        # The one intrinsic detector belongs to this existing server, not to
+        # each event response. A replacement waits for the prior physical join.
+        self._live_capture_viewers = 0
+        self._live_capture_owner = None
+        self._live_capture_retirement = None
         self.router = AppRouter(client_max_size=self.limits.body_bytes)
         self.router.add_route("*", "/{path:.*}", self._handle)
         self.host = Host.from_app(self.router.app, address=address,
@@ -663,32 +699,156 @@ class CalibrationHttpServer:
             raise ApiError(404, "Extrinsic calibration is not enabled")
         return self.service
 
+    def _retain_state_observation(self, domain):
+        if self._live_capture_owner is None:
+            previous = self._live_capture_retirement
+            cohort = {"active": True, "state": None, "payload": None, "revision": 0,
+                      "tick": asyncio.get_running_loop().create_future(), "error": None, "pump": None,
+                      "changed": asyncio.Event(), "subscriptions": []}
+            loop = asyncio.get_running_loop()
+
+            def changed():
+                if cohort["active"]:
+                    try:
+                        loop.call_soon_threadsafe(cohort["changed"].set)
+                    except RuntimeError:
+                        pass
+
+            async def acquire():
+                if previous is not None:
+                    await asyncio.shield(previous)
+                if not cohort["active"]:
+                    return False
+                def subscribe_sources():
+                    for source in (domain, self.lifecycle):
+                        subscribe = getattr(source, "subscribe_state", None)
+                        if callable(subscribe):
+                            cohort["subscriptions"].append(subscribe(changed))
+                await self._domain(subscribe_sources)
+                if not cohort["active"]:
+                    return False
+                self.activate_peers()
+                interval = getattr(domain, "live_capture_interval", None) if domain is self.intrinsic_service else None
+                retained = interval is not None
+                if retained:
+                    await self._domain(domain.retain_live_capture, interval)
+                if cohort["active"]:
+                    cohort["changed"].set()
+                    cohort["pump"] = asyncio.create_task(self._pump_state(domain, cohort))
+                return retained
+
+            self._live_capture_owner = (asyncio.create_task(acquire()), cohort)
+        self._live_capture_viewers += 1
+        return self._live_capture_owner
+
+    @staticmethod
+    def _wake_intrinsic_observers(cohort):
+        tick = cohort["tick"]
+        cohort["tick"] = asyncio.get_running_loop().create_future()
+        if not tick.done():
+            tick.set_result(None)
+
+    async def _pump_state(self, domain, cohort):
+        """Project only source changes, once for all current event readers."""
+        try:
+            while cohort["active"]:
+                await cohort["changed"].wait()
+                cohort["changed"].clear()
+                if not cohort["active"]:
+                    break
+                state = await self._domain(self._state, domain)
+                if not cohort["active"]:
+                    break
+                if state != cohort["state"]:
+                    payload = json.dumps(state, separators=(",", ":"), allow_nan=False).encode()
+                    # Domain state snapshots are detached under their owner lock.
+                    cohort["state"] = state
+                    if payload != cohort["payload"]:
+                        cohort["payload"] = payload
+                        cohort["revision"] += 1
+                        self._wake_intrinsic_observers(cohort)
+        except Exception as error:
+            cohort["error"] = error
+        finally:
+            self._wake_intrinsic_observers(cohort)
+
+    def _release_state_observation(self, domain, owner):
+        if self._live_capture_owner is not owner or self._live_capture_viewers <= 0:
+            raise RuntimeError("intrinsic observation is not retained")
+        self._live_capture_viewers -= 1
+        if self._live_capture_viewers:
+            return None
+        self._live_capture_owner = None
+        acquired, cohort = owner
+        cohort["active"] = False
+        cohort["changed"].set()
+
+        async def retire():
+            try:
+                retained = await asyncio.shield(acquired)
+            except Exception:
+                retained = False
+            try:
+                pump = cohort["pump"]
+                if pump is not None:
+                    await asyncio.shield(pump)
+            finally:
+                try:
+                    if cohort["subscriptions"]:
+                        def release_sources():
+                            for release in reversed(cohort["subscriptions"]):
+                                release()
+                        await self._domain(release_sources)
+                finally:
+                    if retained:
+                        await self._domain(domain.release_live_capture)
+
+        retirement = asyncio.create_task(retire())
+        # The task remains owned even if the request is cancelled a second
+        # time while its physical detector join is still in progress.
+        retirement.add_done_callback(lambda task: task.exception() if not task.cancelled() else None)
+        self._live_capture_retirement = retirement
+        return retirement
+
     async def _events(self, request):
-        intrinsic = self.intrinsic_service
-        self.activate_peers()
-        if intrinsic is not None and getattr(intrinsic, "live_capture_interval", None) is not None:
-            await self._domain(intrinsic.start_auto_capture, intrinsic.live_capture_interval)
+        domain = self.intrinsic_service or self.service
         response = RawStreamResponse(max_bytes=self.limits.response_bytes, headers={**self._headers(request),
                                                "Content-Type": "text/event-stream"})
-        await response.prepare(request)
-        request[_RESPONSE_STARTED] = True
         if request.method == "HEAD":
+            await response.prepare(request)
+            request[_RESPONSE_STARTED] = True
             await response.write_eof()
             return response
-        previous, event_id = b"", 0
-        while True:
-            state = await self._domain(self._state, intrinsic or self.service)
-            payload = json.dumps(state, separators=(",", ":"), allow_nan=False).encode()
-            if payload != previous:
-                event_id += 1
-                await response.write("id: {}\nevent: state\ndata: ".format(event_id).encode()
-                                     + payload + b"\n\n")
-                previous = payload
-            await asyncio.sleep(0.1)
+        owner = None
+        try:
+            owner = self._retain_state_observation(domain)
+            await asyncio.shield(owner[0])
+            await response.prepare(request)
+            request[_RESPONSE_STARTED] = True
+            event_id = 0
+            cohort = owner[1]
+            revision = 0
+            while request.transport is not None and not request.transport.is_closing():
+                if cohort["error"] is not None:
+                    raise cohort["error"]
+                if cohort["revision"] != revision:
+                    revision = cohort["revision"]
+                    event_id += 1
+                    await response.write("id: {}\nevent: state\ndata: ".format(event_id).encode()
+                                         + cohort["payload"] + b"\n\n")
+                else:
+                    await asyncio.shield(cohort["tick"])
+        finally:
+            if owner is not None:
+                retirement = self._release_state_observation(domain, owner)
+                if retirement is not None:
+                    await asyncio.shield(retirement)
+        return response
 
     def _state(self, domain):
         state = domain.state()
-        state["peers"] = self.peer_status()
+        state["peers"] = (self.peer_status_for_state(state) if self.peer_status_for_state is not None
+                          else self.peer_status())
         if self.lifecycle is not None:
             state["ready"] = self.lifecycle.wait_ready(0)
         return state

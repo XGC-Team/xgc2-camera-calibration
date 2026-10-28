@@ -8,6 +8,7 @@ import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
+from unittest.mock import patch
 
 from xgc2_xrpc import Client, Endpoint, Fault, Host, Limits, Runtime, ServiceRef
 from xgc_camera_calibration.media_snapshot import CameraMetadataClient, MediaSnapshotClient
@@ -81,6 +82,263 @@ class NativeWebTransportTest(unittest.TestCase):
         self.assertTrue(server.runtime.closed)
         self.assertEqual(len(server.host._jobs), 0)
         self.assertEqual(len(server.host._active), 0)
+
+    def test_intrinsic_event_readers_share_detector_and_last_disconnect_joins(self):
+        service = IntrinsicCalibrationService(board_size=(7, 5), square=0.2,
+            output_file=str(self.root / "intrinsics.yaml"), camera_name="camera", media_source="camera")
+        service.live_capture_interval = 0.05
+        service.attach_frame_capture(lambda: None)
+        captures = []
+        started = threading.Event()
+
+        def capture():
+            captures.append(1)
+            started.set()
+
+        def wait_until(predicate):
+            deadline = time.monotonic() + 2
+            while not predicate() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(predicate())
+
+        first = second = None
+        with patch.object(service, "_capture_frame", side_effect=capture):
+            server = self.server(intrinsic_service=service)
+            try:
+                head = urllib.request.Request(self.url(server, "/api/v1/intrinsic/events"), method="HEAD")
+                with urllib.request.urlopen(head, timeout=1) as response:
+                    self.assertEqual(response.read(), b"")
+                self.assertEqual(captures, [])
+                first = urllib.request.urlopen(self.url(server, "/api/v1/intrinsic/events"), timeout=1)
+                self.assertEqual(first.readline(), b"id: 1\n")
+                self.assertTrue(started.wait(1))
+                detector = service._auto_capture_thread
+                second = urllib.request.urlopen(self.url(server, "/api/v1/intrinsic/events"), timeout=1)
+                self.assertEqual(second.readline(), b"id: 1\n")
+                wait_until(lambda: server._live_capture_viewers == 2)
+                self.assertEqual(service._auto_capture_observers, 1)
+                self.assertIs(service._auto_capture_thread, detector)
+                first.close()
+                wait_until(lambda: server._live_capture_viewers == 1)
+                self.assertIs(service._auto_capture_thread, detector)
+                second.close()
+                wait_until(lambda: server._live_capture_viewers == 0
+                    and server._live_capture_retirement is not None
+                    and server._live_capture_retirement.done())
+                self.assertEqual(service._auto_capture_observers, 0)
+                self.assertIsNone(service._auto_capture_thread)
+                baseline = len(captures)
+                time.sleep(0.12)
+                self.assertEqual(len(captures), baseline)
+            finally:
+                if first is not None: first.close()
+                if second is not None: second.close()
+                service.stop_auto_capture()
+                server.close()
+
+    def test_intrinsic_rapid_reveal_waits_for_retired_capture_to_join(self):
+        service = IntrinsicCalibrationService(board_size=(7, 5), square=0.2,
+            output_file=str(self.root / "intrinsics.yaml"), camera_name="camera", media_source="camera")
+        service.live_capture_interval = 0.05
+        service.attach_frame_capture(lambda: None)
+        entered, release, opened = threading.Event(), threading.Event(), threading.Event()
+        calls = []
+        result = {}
+
+        def capture():
+            calls.append(1)
+            entered.set()
+            if not release.wait(3):
+                raise RuntimeError("controlled capture was not released")
+
+        def reveal():
+            try:
+                result["response"] = urllib.request.urlopen(
+                    self.url(server, "/api/v1/intrinsic/events"), timeout=3)
+            except Exception as error:
+                result["error"] = error
+            finally:
+                opened.set()
+
+        first = None
+        worker = None
+        with patch.object(service, "_capture_frame", side_effect=capture):
+            server = self.server(intrinsic_service=service)
+            try:
+                first = urllib.request.urlopen(self.url(server, "/api/v1/intrinsic/events"), timeout=1)
+                self.assertEqual(first.readline(), b"id: 1\n")
+                self.assertTrue(entered.wait(1))
+                first.close()
+                deadline = time.monotonic() + 2
+                while service._auto_capture_retiring is None and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertIsNotNone(service._auto_capture_retiring)
+                worker = threading.Thread(target=reveal)
+                worker.start()
+                time.sleep(0.1)
+                self.assertFalse(opened.is_set())
+                self.assertEqual(len(calls), 1)
+                release.set()
+                self.assertTrue(opened.wait(2))
+                self.assertNotIn("error", result)
+                self.assertEqual(result["response"].readline(), b"id: 1\n")
+                result["response"].close()
+                deadline = time.monotonic() + 2
+                while (server._live_capture_viewers or service._auto_capture_thread is not None) and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertEqual(server._live_capture_viewers, 0)
+                self.assertIsNone(service._auto_capture_thread)
+            finally:
+                release.set()
+                if first is not None: first.close()
+                if worker is not None: worker.join(3)
+                if "response" in result: result["response"].close()
+                service.stop_auto_capture()
+                server.close()
+
+    def test_intrinsic_and_extrinsic_readers_share_changed_only_state(self):
+        class Domain:
+            live_capture_interval = None
+            def __init__(self):
+                self.calls = 0
+                self.phase = "collecting"
+                self.lock = threading.RLock()
+                self.listeners = set()
+            def state(self):
+                with self.lock:
+                    self.calls += 1
+                    return {"phase": self.phase, "image_ready": False}
+            def subscribe_state(self, callback):
+                with self.lock:
+                    self.listeners.add(callback)
+                def release():
+                    with self.lock:
+                        self.listeners.discard(callback)
+                return release
+            def change(self, value):
+                with self.lock:
+                    if self.phase == value:
+                        return
+                    self.phase = value
+                    for callback in tuple(self.listeners):
+                        callback()
+
+        def event(stream, identity, phase):
+            self.assertEqual(stream.readline(), ("id: {}\n".format(identity)).encode())
+            self.assertEqual(stream.readline(), b"event: state\n")
+            self.assertIn(('"phase":"{}"'.format(phase)).encode(), stream.readline())
+            self.assertEqual(stream.readline(), b"\n")
+
+        for intrinsic in (True, False):
+            with self.subTest(intrinsic=intrinsic):
+                domain = Domain()
+                activations = []
+                server = (self.server(intrinsic_service=domain, activate_peers=lambda: activations.append(1))
+                          if intrinsic else self.server(domain, activate_peers=lambda: activations.append(1)))
+                path = "/api/v1/intrinsic/events" if intrinsic else "/api/v1/events"
+                first = second = revealed = None
+                encode = json.dumps
+                try:
+                    with patch("xgc_camera_calibration.web_service.json.dumps", wraps=encode) as encoded:
+                        first = urllib.request.urlopen(self.url(server, path), timeout=2)
+                        event(first, 1, "collecting")
+                        second = urllib.request.urlopen(self.url(server, path), timeout=2)
+                        event(second, 1, "collecting")
+                        self.assertEqual(activations, [1])
+                        initial = (domain.calls, encoded.call_count)
+                        time.sleep(0.35)
+                        self.assertEqual((domain.calls, encoded.call_count), (1, 1))
+                        domain.change("collecting")
+                        self.assertEqual((domain.calls, encoded.call_count), (1, 1))
+                        domain.change("solving")
+                        event(first, 2, "solving")
+                        event(second, 2, "solving")
+                        self.assertEqual((domain.calls, encoded.call_count), (2, 2))
+                        changed = (domain.calls, encoded.call_count)
+                        first.close()
+                        second.close()
+                        deadline = time.monotonic() + 2
+                        while (server._live_capture_viewers or server._live_capture_retirement is None
+                               or not server._live_capture_retirement.done()) and time.monotonic() < deadline:
+                            time.sleep(0.01)
+                        self.assertEqual(server._live_capture_viewers, 0)
+                        self.assertTrue(server._live_capture_retirement.done())
+                        self.assertEqual(len(domain.listeners), 0)
+                        joined_listeners = len(domain.listeners)
+                        domain.change("complete")
+                        time.sleep(0.15)
+                        self.assertEqual((domain.calls, encoded.call_count), (2, 2))
+                        parked = (domain.calls, encoded.call_count)
+                        revealed = urllib.request.urlopen(self.url(server, path), timeout=2)
+                        event(revealed, 1, "complete")
+                        self.assertEqual((domain.calls, encoded.call_count), (3, 3))
+                        print('T15_HTTP_STATE_WORK ' + json.dumps({
+                            'mode': 'intrinsic' if intrinsic else 'extrinsic', 'visible_readers': 2,
+                            'initial_projection_encode': initial,
+                            'changed_projection_encode_delta': [changed[i] - initial[i] for i in range(2)],
+                            'hidden_projection_encode_delta': [parked[i] - changed[i] for i in range(2)],
+                            'reveal_projection_encode_delta': [domain.calls - parked[0], encoded.call_count - parked[1]],
+                            'source_listeners_after_join': joined_listeners,
+                        }, sort_keys=True))
+                finally:
+                    if first is not None: first.close()
+                    if second is not None: second.close()
+                    if revealed is not None: revealed.close()
+                    server.close()
+
+    def test_state_change_during_initial_projection_is_not_lost(self):
+        class Domain:
+            live_capture_interval = None
+            def __init__(self):
+                self.phase = "old"
+                self.entered, self.release = threading.Event(), threading.Event()
+                self.listeners = set()
+                self.calls = 0
+            def subscribe_state(self, callback):
+                self.listeners.add(callback)
+                return lambda: self.listeners.discard(callback)
+            def state(self):
+                self.calls += 1
+                if self.calls == 1:
+                    self.entered.set()
+                    if not self.release.wait(3):
+                        raise RuntimeError("controlled state projection was not released")
+                return {"phase": self.phase}
+            def change(self):
+                self.phase = "current"
+                for callback in tuple(self.listeners):
+                    callback()
+
+        domain = Domain()
+        server = self.server(intrinsic_service=domain)
+        result = {}
+        def open_stream():
+            try:
+                result["response"] = urllib.request.urlopen(self.url(server, "/api/v1/intrinsic/events"), timeout=3)
+            except Exception as error:
+                result["error"] = error
+        worker = threading.Thread(target=open_stream)
+        worker.start()
+        try:
+            self.assertTrue(domain.entered.wait(2))
+            self.assertEqual(len(domain.listeners), 1)
+            domain.change()
+            domain.release.set()
+            worker.join(3)
+            self.assertFalse(worker.is_alive())
+            self.assertNotIn("error", result)
+            stream = result["response"]
+            self.assertEqual(stream.readline(), b"id: 1\n")
+            self.assertEqual(stream.readline(), b"event: state\n")
+            self.assertIn(b'"phase":"current"', stream.readline())
+            self.assertEqual(stream.readline(), b"\n")
+            stream.close()
+        finally:
+            domain.release.set()
+            worker.join(3)
+            if "response" in result:
+                result["response"].close()
+            server.close()
 
     def test_cancelled_work_keeps_slot_until_real_completion_and_close_can_retry(self):
         entered, release, complete = threading.Event(), threading.Event(), threading.Event()

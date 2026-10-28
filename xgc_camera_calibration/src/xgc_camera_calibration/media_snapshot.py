@@ -13,8 +13,10 @@ from __future__ import annotations
 import json
 import math
 import re
+import threading
 import time
 import uuid
+from contextlib import contextmanager
 from email import policy
 from email.parser import BytesParser
 from dataclasses import dataclass
@@ -172,6 +174,46 @@ class MediaSnapshotClient:
         self._source_instance = None
         self._source_available = False
         self._capture_error = None
+        self._state_lock = threading.RLock()
+        self._state_listeners = set()
+
+    def subscribe_state(self, callback):
+        release_demand = self.peer.retain()
+        try:
+            release_peer = self.peer.subscribe_state(callback)
+        except BaseException:
+            release_demand()
+            raise
+        with self._state_lock:
+            self._state_listeners.add(callback)
+        def release():
+            with self._state_lock:
+                self._state_listeners.discard(callback)
+            try:
+                release_peer()
+            finally:
+                release_demand()
+        return release
+
+    @contextmanager
+    def _using_peer(self):
+        release = self.peer.retain()
+        try:
+            yield
+        finally:
+            release()
+
+    def _set_capture_state(self, *, metadata=None, instance=None, available, error):
+        with self._state_lock:
+            before = (self._source_metadata, self._source_instance, self._source_available, self._capture_error)
+            if metadata is not None:
+                self._source_metadata = metadata
+                self._source_instance = instance
+            self._source_available, self._capture_error = available, error
+            after = (self._source_metadata, self._source_instance, self._source_available, self._capture_error)
+            if before != after:
+                for callback in tuple(self._state_listeners):
+                    callback()
 
     @property
     def client(self):
@@ -182,12 +224,13 @@ class MediaSnapshotClient:
 
     def status(self):
         value = self.peer.status()
-        source = self._source_metadata if self._source_instance == value["instance_id"] and value["ready"] else {}
-        return {**value, "source_id": self.source_id,
-                "source_available": bool(value["ready"] and self._source_available and source),
-                "capture_error": self._capture_error,
-                "camera_info_received": bool(source.get("camera_info_received")),
-                "width": source.get("width"), "height": source.get("height")}
+        with self._state_lock:
+            source = self._source_metadata if self._source_instance == value["instance_id"] and value["ready"] else {}
+            return {**value, "source_id": self.source_id,
+                    "source_available": bool(value["ready"] and self._source_available and source),
+                    "capture_error": self._capture_error,
+                    "camera_info_received": bool(source.get("camera_info_received")),
+                    "width": source.get("width"), "height": source.get("height")}
 
     def close(self):
         if self._closed:
@@ -200,6 +243,10 @@ class MediaSnapshotClient:
         self._closed = True
 
     def health(self):
+        with self._using_peer():
+            return self._health()
+
+    def _health(self):
         try:
             payload = self.client.json("/v1/health", method="GET", timeout=self.timeout_seconds)
         except (Fault, TransportError, OSError, TimeoutError) as error:
@@ -213,7 +260,8 @@ class MediaSnapshotClient:
         return payload
 
     def capture(self):
-        return self._capture(include_rgb=True, maximum_pixels=None)
+        with self._using_peer():
+            return self._capture(include_rgb=True, maximum_pixels=None)
 
     def _camera_metadata_client(self):
         """Use the source owner's observed ref, never construct its endpoint."""
@@ -231,7 +279,18 @@ class MediaSnapshotClient:
                 "source_id": self.source_id}
 
     def apply(self, calibration):
+        with self._using_peer():
+            try:
+                return self._apply(calibration)
+            finally:
+                if self._metadata_client is not None:
+                    self._metadata_client.close()
+                    self._metadata_client = None
+                    self._metadata_instance = None
+
+    def _apply(self, calibration):
         # Explicit user mutation only. A failed apply is never retried/replayed.
+        self.client
         instance = self.peer.status()["instance_id"]
         if self._metadata_client is None or instance != self._metadata_instance:
             if self._metadata_client is not None:
@@ -249,7 +308,8 @@ class MediaSnapshotClient:
     def capture_detection(self, maximum_pixels=640 * 480):
         if not isinstance(maximum_pixels, int) or isinstance(maximum_pixels, bool) or maximum_pixels < 4096:
             raise ValueError("maximum detection pixels must be an integer of at least 4096")
-        return self._capture(include_rgb=False, maximum_pixels=maximum_pixels)
+        with self._using_peer():
+            return self._capture(include_rgb=False, maximum_pixels=maximum_pixels)
 
     def _parts(self, response, include_rgb):
         # Python's maintained MIME parser owns binary framing. The SDK bounds
@@ -321,10 +381,9 @@ class MediaSnapshotClient:
             peer = self.peer.status()
             if not peer["ready"] or peer["instance_id"] != client.instance_id:
                 raise MediaSnapshotError("media peer changed during capture")
-            self._source_metadata = {"width": parsed["width"], "height": parsed["height"],
-                                     "camera_info_received": parsed["camera_matrix"] is not None}
-            self._source_instance = client.instance_id
-            self._source_available, self._capture_error = True, None
+            self._set_capture_state(metadata={"width": parsed["width"], "height": parsed["height"],
+                                              "camera_info_received": parsed["camera_matrix"] is not None},
+                                    instance=client.instance_id, available=True, error=None)
             return MediaSnapshot(id=parsed["id"], source_id=parsed["source_id"], frame_id=parsed["frame_id"],
                 timestamp_nanoseconds=parsed["timestamp_nanoseconds"], width=parsed["width"],
                 height=parsed["height"], camera_matrix=None if parsed["camera_matrix"] is None else
@@ -338,10 +397,10 @@ class MediaSnapshotClient:
             # transport cause, not a claim that capture never happened.
             if not isinstance(error, Fault):
                 self.peer.invalidate(error)
-            self._source_available, self._capture_error = False, str(error)
+            self._set_capture_state(available=False, error=str(error))
             raise MediaSnapshotError("media edge capture is unavailable") from error
         except MediaSnapshotError as error:
-            self._source_available, self._capture_error = False, str(error)
+            self._set_capture_state(available=False, error=str(error))
             raise
         finally:
             if cleanup_id is not None:

@@ -360,6 +360,13 @@ class IntrinsicCalibrationService:
         self._auto_run_future = None
         self._auto_capture_thread: Optional[threading.Thread] = None
         self._auto_capture_stop = threading.Event()
+        # Display observation and an explicit collection command are separate
+        # owners of the same detector. A stopped thread remains owned until it
+        # actually joins, so a rapid reveal cannot overlap its successor.
+        self._auto_capture_observers = 0
+        self._auto_capture_paused = False
+        self._auto_capture_retiring: Optional[threading.Thread] = None
+        self._state_listeners = set()
         self._auto_capture_requested = False
         self._auto_capture_interval = 0.0
         self._auto_capture_error: Optional[str] = None
@@ -373,10 +380,62 @@ class IntrinsicCalibrationService:
         self._solve_future = None
         self._work_runtime = None
         self._work_owner = None
+        self._state_subscriptions = {}
         self._load_refs()
         self._load_recovery()
 
     # -- guide wiring ---------------------------------------------------------
+    def subscribe_state(self, callback):
+        # A lease has its own identity even if the same callback is retained
+        # twice. Attached source owners may change while a lease is active.
+        def listener():
+            callback()
+
+        with self.lock:
+            self._state_listeners.add(listener)
+            subscriptions = {}
+            try:
+                for name, source in (("metadata", self._metadata_application), ("camera", self.camera)):
+                    subscribe = getattr(source, "subscribe_state", None)
+                    if callable(subscribe):
+                        subscriptions[name] = subscribe(listener)
+                self._state_subscriptions[listener] = subscriptions
+            except BaseException:
+                for unsubscribe in reversed(list(subscriptions.values())):
+                    unsubscribe()
+                self._state_listeners.discard(listener)
+                raise
+
+        def release():
+            with self.lock:
+                self._state_listeners.discard(listener)
+                subscriptions = self._state_subscriptions.pop(listener, {})
+                for unsubscribe in reversed(list(subscriptions.values())):
+                    unsubscribe()
+        return release
+
+    def _state_changed_locked(self):
+        for callback in tuple(self._state_listeners):
+            callback()
+
+    def _replace_state_source_locked(self, name, source):
+        subscribe = getattr(source, "subscribe_state", None)
+        replacements = {}
+        try:
+            if callable(subscribe):
+                for listener in self._state_listeners:
+                    replacements[listener] = subscribe(listener)
+        except BaseException:
+            for unsubscribe in replacements.values():
+                unsubscribe()
+            raise
+        for listener, subscriptions in self._state_subscriptions.items():
+            previous = subscriptions.pop(name, None)
+            if listener in replacements:
+                subscriptions[name] = replacements[listener]
+            if previous is not None:
+                previous()
+
     def attach_work_runtime(self, runtime, owner, *, validation_workers=2) -> None:
         """Bind background computation to the process owner's fixed XRPC pool."""
         if runtime.blocking_workers < 2:
@@ -394,7 +453,10 @@ class IntrinsicCalibrationService:
     def attach_camera_control(self, camera: Any) -> None:
         """Attach an optional sim camera adapter (goto/reset/current pose)."""
         with self.lock:
-            self.camera = camera
+            if self.camera is not camera:
+                self._replace_state_source_locked("camera", camera)
+                self.camera = camera
+                self._state_changed_locked()
 
     def attach_frame_capture(self, capture: Callable[[], np.ndarray]) -> None:
         """Attach an immutable Media Edge snapshot transaction."""
@@ -406,7 +468,9 @@ class IntrinsicCalibrationService:
         with self.lock:
             if self._metadata_application is not None:
                 raise RuntimeError("camera metadata application already has an owner")
+            self._replace_state_source_locked("metadata", application)
             self._metadata_application = application
+            self._state_changed_locked()
 
     def apply_metadata(self, candidate_id: str) -> Dict[str, Any]:
         """Apply one reviewed candidate as ephemeral CameraInfo estimates."""
@@ -428,6 +492,7 @@ class IntrinsicCalibrationService:
             # attempt fence and never turn a repeated browser request into a
             # second mutation. The source owner retains its authoritative receipt.
             self._metadata_attempted_candidate = candidate_id
+            self._state_changed_locked()
             result = self.candidate_result
             calibration = {"scope": "calibration-metadata", "model": "plumb_bob",
                 "width": result.image_size[0], "height": result.image_size[1],
@@ -438,6 +503,7 @@ class IntrinsicCalibrationService:
             except Exception as error:
                 raise ApiError(HTTPStatus.BAD_GATEWAY, "CameraInfo metadata apply was not confirmed: {}".format(error)) from error
             self._metadata_receipt = {**receipt, "candidate_id": candidate_id}
+            self._state_changed_locked()
             return copy.deepcopy(self._metadata_receipt)
 
     def _coverage_state_locked(self) -> Tuple[List[Dict[str, Any]], bool]:
@@ -484,60 +550,126 @@ class IntrinsicCalibrationService:
             return float(self._auto_capture_interval)
         return DEFAULT_AUTO_CAPTURE_INTERVAL_SECONDS
 
-    def start_auto_capture(self, interval: float = 0.0) -> Dict[str, Any]:
-        """Continuously inspect snapshots from either camera origin.
+    def _capture_wanted_locked(self) -> bool:
+        return not self._auto_capture_paused and bool(
+            self._auto_capture_requested
+            or self._auto_capture_observers
+            or (self.action is not None and self.action.get("status") == "running")
+            or self._recording
+        )
 
-        Live playback remains WebRTC. This lower-rate loop is the one shared
-        simulation/physical detection path: ``process_frame`` replaces the one
-        in-memory annotated preview and stores only corner coordinates for
-        accepted samples. Reaching full coverage stops sample growth, not live
-        detection; the result surface must continue to follow the moving camera.
-        """
+    def _start_detector_locked(self) -> None:
+        if self._auto_capture_retiring is not None:
+            return
+        current = self._auto_capture_thread
+        if current is not None and current.is_alive():
+            return
+        if self.frame_capture is None:
+            raise ApiError(HTTPStatus.SERVICE_UNAVAILABLE, "No calibration frame source is available")
+        self._auto_capture_error = None
+        self._auto_capture_completed = False
+        self._auto_capture_stop.clear()
+        thread = threading.Thread(target=self._run_auto_capture,
+                                  name="intrinsic-live-detection", daemon=True)
+        self._auto_capture_thread = thread
+        try:
+            # Publish and start under the same owner lock: concurrent demand
+            # cannot mistake a not-yet-started thread for a missing detector.
+            thread.start()
+            self._state_changed_locked()
+        except RuntimeError as error:
+            self._auto_capture_thread = None
+            self._auto_capture_error = str(error) or "Could not start auto capture"
+            self._state_changed_locked()
+            raise ApiError(HTTPStatus.INTERNAL_SERVER_ERROR,
+                           "Could not start continuous intrinsic detection") from error
+
+    def _join_retired_detector(self, thread: Optional[threading.Thread]) -> None:
+        if thread is None or thread is threading.current_thread():
+            return
+        thread.join()
+        with self.lock:
+            if self._auto_capture_retiring is not thread:
+                return
+            self._auto_capture_retiring = None
+            if self._capture_wanted_locked():
+                self._start_detector_locked()
+
+    def _retire_detector_if_unneeded(self) -> None:
+        with self.lock:
+            if self._capture_wanted_locked():
+                return
+            thread = self._auto_capture_retiring or self._auto_capture_thread
+            if thread is not None:
+                was_stopped = self._auto_capture_stop.is_set()
+                self._auto_capture_stop.set()
+                wake = getattr(getattr(self, "capture_peer", None), "wake_waiters", None)
+                if callable(wake):
+                    wake()
+                self._auto_capture_retiring = thread
+                if not was_stopped:
+                    self._state_changed_locked()
+        self._join_retired_detector(thread)
+
+    def retain_live_capture(self, interval: float) -> None:
+        """Retain one visible observer without changing an explicit Pause."""
         interval = float(interval)
         if not 0.0 <= interval <= 10.0:
-            raise ApiError(
-                HTTPStatus.UNPROCESSABLE_ENTITY,
-                "detection interval must be between 0 and 10 seconds",
-            )
+            raise ApiError(HTTPStatus.UNPROCESSABLE_ENTITY,
+                           "detection interval must be between 0 and 10 seconds")
+        with self.lock:
+            self._auto_capture_observers += 1
+            try:
+                if not self._auto_capture_paused:
+                    if not self._auto_capture_requested and self._auto_capture_thread is None:
+                        self._auto_capture_interval = interval
+                    self._start_detector_locked()
+            except BaseException:
+                self._auto_capture_observers -= 1
+                raise
+
+    def release_live_capture(self) -> None:
+        """Release presentation demand and join its last optional detector."""
+        with self.lock:
+            if self._auto_capture_observers <= 0:
+                raise RuntimeError("intrinsic live capture observation is not retained")
+            self._auto_capture_observers -= 1
+        self._retire_detector_if_unneeded()
+
+    def start_auto_capture(self, interval: float = 0.0) -> Dict[str, Any]:
+        """Accept an explicit continuous-collection intent until Pause."""
+        interval = float(interval)
+        if not 0.0 <= interval <= 10.0:
+            raise ApiError(HTTPStatus.UNPROCESSABLE_ENTITY,
+                           "detection interval must be between 0 and 10 seconds")
         with self.lock:
             if self.frame_capture is None:
-                raise ApiError(
-                    HTTPStatus.SERVICE_UNAVAILABLE,
-                    "No calibration frame source is available",
-                )
+                raise ApiError(HTTPStatus.SERVICE_UNAVAILABLE, "No calibration frame source is available")
+            before = self._auto_capture_document_locked()
+            previous_thread = self._auto_capture_thread
             self._auto_capture_requested = True
+            self._auto_capture_paused = False
             self._auto_capture_interval = interval
-            current = self._auto_capture_thread
-            if current is not None and current.is_alive():
-                return {"ok": True, "auto_capture": self._auto_capture_document_locked()}
-            self._auto_capture_error = None
-            self._auto_capture_completed = False
-            self._auto_capture_stop.clear()
-            thread = threading.Thread(
-                target=self._run_auto_capture,
-                name="intrinsic-live-detection",
-                daemon=True,
-            )
-            self._auto_capture_thread = thread
-        try:
-            thread.start()
-        except RuntimeError as error:
-            with self.lock:
-                self._auto_capture_thread = None
-                self._auto_capture_error = str(error) or "Could not start auto capture"
-            raise ApiError(
-                HTTPStatus.INTERNAL_SERVER_ERROR,
-                "Could not start continuous intrinsic detection",
-            ) from error
+            retiring = self._auto_capture_retiring
+            self._start_detector_locked()
+            if previous_thread is self._auto_capture_thread and before != self._auto_capture_document_locked():
+                self._state_changed_locked()
+        # A Resume accepted during retirement joins the old physical capture
+        # before exposing the replacement. Other camera instances are independent.
+        self._join_retired_detector(retiring)
         with self.lock:
             return {"ok": True, "auto_capture": self._auto_capture_document_locked()}
 
     def _run_auto_capture(self) -> None:
         next_capture_at = time.monotonic()
         retry_ceiling = .25
+        peer = getattr(self, "capture_peer", None)
+        release_peer = None
         try:
+            retain = getattr(peer, "retain", None)
+            if callable(retain):
+                release_peer = retain()
             while not self._auto_capture_stop.is_set():
-                peer = getattr(self, "capture_peer", None)
                 if peer is not None and not peer.wait_available(self._auto_capture_stop):
                     break
                 failed = False
@@ -546,13 +678,19 @@ class IntrinsicCalibrationService:
                 except Exception as error:
                     failed = True
                     with self.lock:
-                        self._auto_capture_error = str(error) or error.__class__.__name__
+                        value = str(error) or error.__class__.__name__
+                        if self._auto_capture_error != value:
+                            self._auto_capture_error = value
+                            self._state_changed_locked()
                 else:
                     retry_ceiling = .25
                     with self.lock:
+                        previous = (self._auto_capture_error, self._auto_capture_completed)
                         self._auto_capture_error = None
                         _bars, complete = self._coverage_state_locked()
                         self._auto_capture_completed = bool(complete)
+                        if previous != (self._auto_capture_error, self._auto_capture_completed):
+                            self._state_changed_locked()
                 if failed:
                     if self._auto_capture_stop.wait(random.uniform(0, retry_ceiling)):
                         break
@@ -572,23 +710,37 @@ class IntrinsicCalibrationService:
                 if self._auto_capture_stop.wait(wait):
                     break
         finally:
-            with self.lock:
-                if self._auto_capture_thread is threading.current_thread():
-                    self._auto_capture_thread = None
+            try:
+                if release_peer is not None:
+                    release_peer()
+            finally:
+                with self.lock:
+                    if self._auto_capture_thread is threading.current_thread():
+                        before = self._auto_capture_document_locked()
+                        self._auto_capture_thread = None
+                        if before != self._auto_capture_document_locked():
+                            self._state_changed_locked()
 
     def stop_auto_capture(self) -> Dict[str, Any]:
         with self.lock:
-            thread = self._auto_capture_thread
+            before = self._auto_capture_document_locked()
+            action_running = self.action is not None and self.action.get("status") == "running"
             self._auto_capture_requested = False
-            self._auto_capture_stop.set()
-            if self.action is not None and self.action.get("status") == "running":
+            self._auto_capture_paused = True
+            if action_running:
                 self.action.update(status="failed", error="Continuous detection stopped")
                 self._detection_condition.notify_all()
-        if thread is not None and thread is not threading.current_thread():
-            thread.join()
+            thread = self._auto_capture_retiring or self._auto_capture_thread
+            if thread is not None:
+                self._auto_capture_stop.set()
+                wake = getattr(getattr(self, "capture_peer", None), "wake_waiters", None)
+                if callable(wake):
+                    wake()
+                self._auto_capture_retiring = thread
+            if action_running or before != self._auto_capture_document_locked():
+                self._state_changed_locked()
+        self._join_retired_detector(thread)
         with self.lock:
-            if self._auto_capture_thread is not None and not self._auto_capture_thread.is_alive():
-                self._auto_capture_thread = None
             return {"ok": True, "auto_capture": self._auto_capture_document_locked()}
 
     def _load_refs(self) -> None:
@@ -1308,7 +1460,10 @@ class IntrinsicCalibrationService:
     def _save_ref(self, index: int, jpeg: bytes) -> None:
         if self.references_dir:
             self._write_evidence_file(Path(self.references_dir) / "{}.jpg".format(index), jpeg)
+        first = index not in self.refs
         self.refs[index] = jpeg
+        if first:
+            self._state_changed_locked()
 
     @staticmethod
     def _write_evidence_file(path: Path, payload: bytes) -> None:
@@ -2035,6 +2190,7 @@ class IntrinsicCalibrationService:
                 }
             self._display = display
             self._detection_condition.notify_all()
+            self._state_changed_locked()
 
     @staticmethod
     def _decode_adaptive_aprilgrid_frame(
@@ -2254,7 +2410,7 @@ class IntrinsicCalibrationService:
                     "image_size": list(self.image_size) if self.image_size is not None else None,
                     "solve_frozen": self._solve_running(),
                 }
-            return document
+            return copy.deepcopy(document)
 
     # -- sim camera guidance actions -----------------------------------------
     def _require_idle_locked(self) -> None:
@@ -2272,6 +2428,7 @@ class IntrinsicCalibrationService:
         # the next deliberate mutation, which also acknowledges the failure.
         if self.action is not None and self.action.get("status") in ("failed", "succeeded"):
             self.action = None
+            self._state_changed_locked()
 
     def _clear_session_locked(self) -> None:
         self._remove_checkpoint_locked()
@@ -2387,12 +2544,15 @@ class IntrinsicCalibrationService:
                 camera.goto(
                     view["position"], view["yaw_offset"], view["pitch_offset"], view["roll"]
                 )
+                with self.lock:
+                    self._state_changed_locked()
             except Exception:
                 self._target_capture_phase = "idle"
                 self._target_expected_pose = None
                 self._target_pose_ack_enabled = False
                 raise
             self._acknowledge_target_pose_locked(index)
+            self._state_changed_locked()
         return {"ok": True, "name": view["name"]}
 
     def reset_pose(self) -> Dict[str, Any]:
@@ -2405,6 +2565,7 @@ class IntrinsicCalibrationService:
             self._target_expected_pose = None
             self._target_pose_ack_enabled = False
             camera.reset()
+            self._state_changed_locked()
         return {"ok": True}
 
     def auto_run(self, settle: float = 1.3, detection_timeout: float = 2.0) -> Dict[str, Any]:
@@ -2421,17 +2582,22 @@ class IntrinsicCalibrationService:
         with self.lock:
             self._require_idle_locked()
             camera = self._require_camera()
-            detector = self._auto_capture_thread
-            if detector is None or not detector.is_alive() or self._auto_capture_stop.is_set():
+            if self._auto_capture_paused:
                 raise ApiError(
                     HTTPStatus.SERVICE_UNAVAILABLE,
-                    "Continuous intrinsic detection is not running",
+                    "Continuous intrinsic detection is paused",
                 )
+            if self.frame_capture is None:
+                raise ApiError(HTTPStatus.SERVICE_UNAVAILABLE, "No calibration frame source is available")
             if self._work_runtime is None or self._work_owner is None:
                 raise ApiError(HTTPStatus.SERVICE_UNAVAILABLE, "No process execution owner")
             if self._work_runtime.blocking_workers < 3:
                 raise ApiError(HTTPStatus.SERVICE_UNAVAILABLE,
                     "Automatic sweep requires separate sweep, solve and state capacity")
+            if self._auto_capture_thread is None and not self._auto_capture_requested:
+                interval = getattr(self, "live_capture_interval", None)
+                self._auto_capture_interval = (float(interval) if interval is not None
+                                               else self._resume_auto_capture_interval_locked())
             self._clear_session_locked()
             self.action = {
                 "name": "auto_run",
@@ -2440,15 +2606,41 @@ class IntrinsicCalibrationService:
                 "target_name": None,
                 "error": None,
             }
+            self._state_changed_locked()
             try:
                 self._auto_run_future = self._work_runtime.submit_blocking(
-                    self._work_owner, self._run_auto_sweep, camera,
+                    self._work_owner, self._run_auto_sweep_owned, camera,
                     float(settle), float(detection_timeout))
             except Exception as error:
                 self.action.update(status="failed", error="Computation capacity is unavailable")
+                self._state_changed_locked()
                 raise ApiError(HTTPStatus.TOO_MANY_REQUESTS,
                     "Could not admit the automatic coverage sweep") from error
             return {"accepted": True, "action": dict(self.action)}
+
+    def _run_auto_sweep_owned(self, camera: Any, settle: float, detection_timeout: float) -> None:
+        try:
+            with self.lock:
+                retiring = self._auto_capture_retiring
+            self._join_retired_detector(retiring)
+            with self.lock:
+                if self.action is None or self.action.get("status") != "running":
+                    return
+                # A sweep is its own accepted demand, even if its last display
+                # parked between the command and the domain admission.
+                self._start_detector_locked()
+            self._run_auto_sweep(camera, settle, detection_timeout)
+        except Exception as error:
+            with self.lock:
+                if self.action is not None and self.action.get("status") == "running":
+                    self.action.update(status="failed", error=str(error) or error.__class__.__name__)
+                    self._auto_run_future = None
+                    self._detection_condition.notify_all()
+                    self._state_changed_locked()
+        finally:
+            # A sweep remains an independent owner while all displays park;
+            # its completion releases the detector if nobody else needs it.
+            self._retire_detector_if_unneeded()
 
     def _run_auto_sweep(self, camera: Any, settle: float, detection_timeout: float) -> None:
         try:
@@ -2459,6 +2651,7 @@ class IntrinsicCalibrationService:
                     self.action["target_index"] = index
                     self.action["target_name"] = view["name"]
                     self._begin_target_move_locked(index, allow_frame_ack=False)
+                    self._state_changed_locked()
                 camera.goto(
                     view["position"], view["yaw_offset"], view["pitch_offset"], view["roll"]
                 )
@@ -2487,6 +2680,7 @@ class IntrinsicCalibrationService:
                 self._target_capture_epoch += 1
                 self._target_expected_pose = None
                 self._target_pose_ack_enabled = False
+                self._state_changed_locked()
             return
         try:
             with self.lock:
@@ -2517,6 +2711,7 @@ class IntrinsicCalibrationService:
                 self._target_capture_epoch += 1
                 self._target_expected_pose = None
                 self._target_pose_ack_enabled = False
+                self._state_changed_locked()
         except Exception as error:
             with self.lock:
                 self.action = {
@@ -2531,6 +2726,7 @@ class IntrinsicCalibrationService:
                 self._target_capture_epoch += 1
                 self._target_expected_pose = None
                 self._target_pose_ack_enabled = False
+                self._state_changed_locked()
 
     def _wait_for_target_detection(self, index: int, timeout: float) -> bool:
         deadline = time.monotonic() + timeout
@@ -2553,11 +2749,29 @@ class IntrinsicCalibrationService:
             self._require_idle_locked()
             camera = self._require_camera()
             self._recording = True
+            retiring = self._auto_capture_retiring
+            try:
+                if not self._auto_capture_paused:
+                    if self._auto_capture_thread is None:
+                        self._auto_capture_interval = self._resume_auto_capture_interval_locked()
+                    self._start_detector_locked()
+            except BaseException:
+                self._recording = False
+                raise
         saved = 0
         try:
+            # A recording is its own accepted demand, including when a prior
+            # display detector is still physically retiring.
+            self._join_retired_detector(retiring)
             for index, view in enumerate(self.views):
                 camera.goto(view["position"], view["yaw_offset"], view["pitch_offset"], view["roll"])
                 time.sleep(settle)
+                with self.lock:
+                    paused = self._auto_capture_paused
+                if paused:
+                    # Recording explicitly requests this frame; a single
+                    # capture does not resume paused continuous detection.
+                    self._capture_frame()
                 with self.lock:
                     display = None if self._display is None else self._display.copy()
                 if display is not None:
@@ -2570,7 +2784,10 @@ class IntrinsicCalibrationService:
         finally:
             with self.lock:
                 self._recording = False
-            self.reset()
+            try:
+                self.reset()
+            finally:
+                self._retire_detector_if_unneeded()
         return {"ok": True, "saved": saved}
 
     def _new_capture_path(self) -> Path:
@@ -2645,13 +2862,17 @@ class IntrinsicCalibrationService:
                    "session_revision": self.session_revision, "collection_revision": self.collection_revision,
                    "completed": 0, "total": len(self.image_points), "error": None}
             self._solve_job = job
+            self._state_changed_locked()
             def progress(stage, completed, total):
                 if time.monotonic() >= deadline:
                     raise CalibrationError("Calibration computation exceeded its 30 minute deadline; samples retained")
                 with self.lock:
                     if self._solve_job is not job:
                         raise CalibrationError("Calibration session changed; result discarded")
+                    previous = (job["stage"], job["completed"], job["total"])
                     job.update(stage=stage, completed=completed, total=total)
+                    if previous != (stage, completed, total):
+                        self._state_changed_locked()
             frozen._solve_progress = progress
             self._persist_capture_manifest_locked()
             def work():
@@ -2679,9 +2900,11 @@ class IntrinsicCalibrationService:
                                 json.dumps(self._candidate_diagnostics_full, allow_nan=False).encode())
                     except Exception as cause:
                         job.update(status="failed", error="Could not persist solve result: " + str(cause))
+                    self._state_changed_locked()
             if self._work_runtime is None or self._work_owner is None:
                 job.update(status="failed", stage="admission", error="No process execution owner")
                 self._persist_capture_manifest_locked()
+                self._state_changed_locked()
                 raise ApiError(HTTPStatus.SERVICE_UNAVAILABLE, "No process execution owner")
             try:
                 # submit_blocking reserves a real fixed slot before acceptance.
@@ -2690,6 +2913,7 @@ class IntrinsicCalibrationService:
             except Exception as cause:
                 job.update(status="failed", stage="admission", error="Computation admission failed")
                 self._persist_capture_manifest_locked()
+                self._state_changed_locked()
                 raise ApiError(HTTPStatus.TOO_MANY_REQUESTS, "Computation capacity is unavailable") from cause
             return {"accepted": True, "job": dict(job)}
 
@@ -2699,7 +2923,14 @@ class IntrinsicCalibrationService:
             with self.lock:
                 if not _auto_run:
                     self._require_idle_locked()
-                return self._calibrate_locked()
+                revision = self.session_revision
+                try:
+                    return self._calibrate_locked()
+                finally:
+                    # An unstable candidate is still current even if its
+                    # validation reports an error to the caller.
+                    if self.session_revision != revision:
+                        self._state_changed_locked()
         receipt = self.start_candidate(_auto_run=_auto_run)
         if not receipt.get("accepted"):
             return receipt
@@ -2727,6 +2958,7 @@ class IntrinsicCalibrationService:
             self._candidate_error = None
             self._evidence_bundle_path = None
             self.session_revision += 1
+            self._state_changed_locked()
         return self.state()
 
     def _candidate_save_assessment_locked(self) -> Tuple[Dict[str, Any], List[str]]:
@@ -3016,6 +3248,7 @@ class IntrinsicCalibrationService:
             self.action = None
             restart_auto_capture = self._auto_capture_requested
             auto_capture_interval = self._auto_capture_interval
+            self._state_changed_locked()
         if restart_auto_capture:
             self.start_auto_capture(auto_capture_interval)
         return self.state()

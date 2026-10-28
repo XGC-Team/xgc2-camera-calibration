@@ -68,6 +68,7 @@ class RosMasterBinding:
         self._own_ready = False
         self._status = {"available": False, "reason": "waiting_master", "uri": self.uri,
                         "run_id": None, "pid": None, "connect_attempts": 0}
+        self._state_listeners = set()
         self._last_log = None
         self._suppressed = 0
         self._previous_signals = {}
@@ -84,9 +85,26 @@ class RosMasterBinding:
         with self._condition:
             return dict(self._status)
 
+    def subscribe_state(self, callback):
+        with self._condition:
+            self._state_listeners.add(callback)
+        def release():
+            with self._condition:
+                self._state_listeners.discard(callback)
+        return release
+
+    def _state_changed_locked(self):
+        for callback in tuple(self._state_listeners):
+            callback()
+
+    def _update_status_locked(self, **values):
+        if any(self._status.get(key) != value for key, value in values.items()):
+            self._status.update(values)
+            self._state_changed_locked()
+
     def _probe(self):
         with self._condition:
-            self._status["connect_attempts"] += 1
+            self._update_status_locked(connect_attempts=self._status["connect_attempts"] + 1)
         with ServerProxy(self.uri, transport=_DeadlineTransport()) as master:
             code, _message, pid = master.getPid("/" + self.node_name)
             run_code, _message, run_id = master.getParam("/" + self.node_name, "/run_id")
@@ -96,7 +114,7 @@ class RosMasterBinding:
 
     def _unavailable(self, error):
         with self._condition:
-            self._status.update(available=False, reason="master_unavailable")
+            self._update_status_locked(available=False, reason="master_unavailable")
             self._condition.notify_all()
         now = time.monotonic()
         if self._last_log is None or now - self._last_log >= 10:
@@ -125,7 +143,7 @@ class RosMasterBinding:
             if self._stop.is_set():
                 return False
             with self._condition:
-                self._status.update(available=True, reason="available", pid=identity[0], run_id=identity[1])
+                self._update_status_locked(available=True, reason="available", pid=identity[0], run_id=identity[1])
                 self._condition.notify_all()
             self._thread = threading.Thread(target=self._monitor, name="ros-master-binding")
             self._thread.start()
@@ -134,7 +152,9 @@ class RosMasterBinding:
 
     def mark_ready(self):
         with self._condition:
-            self._own_ready = True
+            if not self._own_ready:
+                self._own_ready = True
+                self._state_changed_locked()
             self._condition.notify_all()
 
     def wait_ready(self, timeout):
@@ -144,8 +164,10 @@ class RosMasterBinding:
             return not self._stop.is_set() and self._own_ready and self._status["available"]
 
     def stop_readiness(self):
-        self._stop.set()
         with self._condition:
+            if not self._stop.is_set():
+                self._stop.set()
+                self._state_changed_locked()
             self._condition.notify_all()
 
     def _monitor(self):
@@ -160,12 +182,12 @@ class RosMasterBinding:
                 continue
             if identity != self._identity:
                 with self._condition:
-                    self._status.update(available=False, reason="master_replaced")
+                    self._update_status_locked(available=False, reason="master_replaced")
                 self.stop_readiness()
                 rospy.signal_shutdown("ROS master was replaced")
                 return
             with self._condition:
-                self._status.update(available=True, reason="available")
+                self._update_status_locked(available=True, reason="available")
                 self._condition.notify_all()
             delay, ceiling = 10.0, .25
 

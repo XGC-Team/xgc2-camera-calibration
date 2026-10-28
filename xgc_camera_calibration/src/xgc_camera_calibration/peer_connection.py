@@ -40,10 +40,15 @@ class UnixPeer:
         self._condition = threading.Condition()
         self._thread = None
         self._stop = False
+        self._closed = False
+        self._retiring = False
+        self._owners = 0
+        self._permanent = False
         self._invalid = False
         self._wake_read = self._wake_write = self._watch_fd = None
         self._state = {"reachable": False, "ready": False, "reason": "not_requested",
                        "instance_id": None, "connect_attempts": 0}
+        self._state_listeners = set()
         self._last_log = None
         self._suppressed = 0
 
@@ -51,9 +56,25 @@ class UnixPeer:
         with self._condition:
             return dict(self._state)
 
-    def activate(self):
+    def subscribe_state(self, callback):
         with self._condition:
-            if self._stop or self._thread is not None:
+            self._state_listeners.add(callback)
+        def release():
+            with self._condition:
+                self._state_listeners.discard(callback)
+        return release
+
+    def _update_state_locked(self, **values):
+        if any(self._state.get(key) != value for key, value in values.items()):
+            self._state.update(values)
+            for callback in tuple(self._state_listeners):
+                callback()
+
+    def _activate(self):
+        with self._condition:
+            while self._retiring:
+                self._condition.wait()
+            if self._closed or self._thread is not None:
                 return
             libc = ctypes.CDLL(None, use_errno=True)
             descriptor = libc.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)
@@ -69,6 +90,68 @@ class UnixPeer:
             self._thread = threading.Thread(target=self._run, name=self.reference.service + "-peer")
             self._thread.start()
 
+    def activate(self):
+        """Retain an explicitly process-owned peer until close."""
+        with self._condition:
+            while self._retiring:
+                self._condition.wait()
+            if self._closed:
+                return
+            self._permanent = True
+        self._activate()
+
+    def retain(self):
+        """Keep discovery and its client only for a real source user."""
+        with self._condition:
+            while self._retiring:
+                self._condition.wait()
+            if self._closed:
+                raise PeerUnavailable(self.reference.service + " is stopped")
+            self._owners += 1
+        try:
+            self._activate()
+        except BaseException:
+            self._release()
+            raise
+        released = False
+        def release():
+            nonlocal released
+            with self._condition:
+                if released:
+                    return
+                released = True
+            self._release()
+        return release
+
+    def _release(self):
+        with self._condition:
+            if self._owners <= 0:
+                raise RuntimeError("peer source demand is not retained")
+            self._owners -= 1
+            if self._owners or self._permanent or self._closed:
+                return
+            self._retiring = True
+            self._stop = True
+            self._update_state_locked(reachable=False, ready=False, reason="not_requested", instance_id=None)
+            self._condition.notify_all()
+            thread = self._thread
+        self._wake()
+        try:
+            if thread is not None:
+                thread.join()
+            for descriptor in (self._watch_fd, self._wake_read, self._wake_write):
+                if descriptor is not None:
+                    os.close(descriptor)
+        finally:
+            with self._condition:
+                self._thread = None
+                self._watch_fd = self._wake_read = self._wake_write = None
+                self._invalid = False
+                self._update_state_locked(reachable=False, ready=False, reason="not_requested", instance_id=None)
+                self._stop = False
+                self._retiring = False
+                self._condition.notify_all()
+
     def _wake(self, *_args):
         try:
             os.write(self._wake_write, b"x")
@@ -76,7 +159,7 @@ class UnixPeer:
             pass
 
     def require_client(self, timeout_seconds=0):
-        self.activate()
+        self._activate()
         with self._condition:
             if timeout_seconds > 0:
                 # A capture worker may be the first consumer after startup.
@@ -90,17 +173,21 @@ class UnixPeer:
     def invalidate(self, error):
         with self._condition:
             self._invalid = True
-            self._state.update(reachable=False, ready=False, reason=str(error))
+            self._update_state_locked(reachable=False, ready=False, reason=str(error))
             self._condition.notify_all()
         self._wake()
 
     def wait_available(self, stop):
         """Wait only in the capture worker; never in init, status or a handler."""
-        self.activate()
+        self._activate()
         with self._condition:
             while not self._stop and not stop.is_set() and not self._state["ready"]:
-                self._condition.wait(.5)
+                self._condition.wait()
             return not self._stop and not stop.is_set()
+
+    def wake_waiters(self):
+        with self._condition:
+            self._condition.notify_all()
 
     def _failure(self, error):
         now = time.monotonic()
@@ -111,7 +198,7 @@ class UnixPeer:
         else:
             self._suppressed += 1
         with self._condition:
-            self._state.update(reachable=False, ready=False, reason=str(error))
+            self._update_state_locked(reachable=False, ready=False, reason=str(error))
             self._condition.notify_all()
 
     def _socket_events(self):
@@ -142,7 +229,7 @@ class UnixPeer:
                     if old is not None:
                         old.close()
                     with self._condition:
-                        self._state.update(reachable=False, ready=False, reason="disconnected")
+                        self._update_state_locked(reachable=False, ready=False, reason="disconnected")
                         self._invalid = False
                         self._condition.notify_all()
                     # A socket appearance is an event, not another retry timer.
@@ -159,7 +246,7 @@ class UnixPeer:
                             raise ValueError("peer discovery differs from its granted endpoint")
                         self.description = document
                         with self._condition:
-                            self._state.update(reachable=True, instance_id=observed.instance_id, reason="waiting_ready")
+                            self._update_state_locked(reachable=True, instance_id=observed.instance_id, reason="waiting_ready")
                         if document["ready"] is True:
                             client = Client.from_service(observed, runtime=self.runtime,
                                 local_target=self.local_target, limits=self.limits)
@@ -171,7 +258,7 @@ class UnixPeer:
                                 raise
                             with self._condition:
                                 self.client = client
-                                self._state.update(ready=True, reason="available")
+                                self._update_state_locked(ready=True, reason="available")
                                 self._condition.notify_all()
                             ceiling = .25
                             self._last_log, self._suppressed = None, 0
@@ -189,7 +276,7 @@ class UnixPeer:
                 now = time.monotonic()
                 if self.client is None and pending is None and not missing and now >= retry_at:
                     with self._condition:
-                        self._state["connect_attempts"] += 1
+                        self._update_state_locked(connect_attempts=self._state["connect_attempts"] + 1)
                     pending = self.runtime.submit(discovery.call_async(
                         "/v1/describe?wait_ready_ms=30000", method="GET", timeout=32.0))
                     pending.add_done_callback(self._wake)
@@ -211,8 +298,13 @@ class UnixPeer:
 
     def close(self):
         with self._condition:
+            while self._retiring:
+                self._condition.wait()
+            if self._closed:
+                return
+            self._closed = True
             self._stop = True
-            self._state.update(ready=False, reason="stopped")
+            self._update_state_locked(ready=False, reason="stopped")
             self._condition.notify_all()
         self._wake()
         if self._thread is not None:

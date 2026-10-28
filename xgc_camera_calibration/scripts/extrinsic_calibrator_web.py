@@ -15,6 +15,7 @@ import rospkg
 import rospy
 from xgc2_xrpc import Runtime
 from geometry_msgs.msg import PoseStamped
+from rosgraph_msgs.msg import Clock
 from sensor_msgs.msg import CameraInfo, CompressedImage
 
 from xgc_camera_calibration.pose_freshness import pose_is_fresh
@@ -133,27 +134,283 @@ class RosCalibrationSource:
         self.image_subscriber = None
         self._latest_image = None
         self._preview_received = None
+        self._state_listeners = set()
+        self._state_condition = threading.Condition(self.lock)
+        self._state_thread = None
+        self._state_stopping = False
+        self._state_freshness = None
+        self._state_deadline = None
+        self._clock_bounds = (float("-inf"), float("inf"))
+        self._state_clock_subscriber = None
+        self._state_clock_retiring = False
+        self._ros_started = False
+        self._ros_users = 0
+        self._ros_retiring = False
+        self._ros_generation = 0
+        self._ros_callbacks = 0
+
+    def _guard_ros_callback(self, generation, callback):
+        def guarded(message):
+            with self._state_condition:
+                if generation != self._ros_generation or self._ros_retiring:
+                    return
+                self._ros_callbacks += 1
+            try:
+                callback(message)
+            finally:
+                with self._state_condition:
+                    self._ros_callbacks -= 1
+                    self._state_condition.notify_all()
+        return guarded
+
+    def _start_ros_locked(self):
+        self._ros_generation += 1
+        generation = self._ros_generation
+        guard = lambda callback: self._guard_ros_callback(generation, callback)
+        try:
+            self.info_subscriber = rospy.Subscriber(self.camera_info_topic, CameraInfo,
+                guard(self._camera_info_callback), queue_size=1)
+            self.preview_subscriber = rospy.Subscriber(self.preview_image_topic, CompressedImage,
+                guard(self._preview_callback), queue_size=1, buff_size=2**20)
+            if self.snapshot_client is None and self.image_topic != self.preview_image_topic:
+                self.image_subscriber = rospy.Subscriber(self.image_topic, CompressedImage,
+                    guard(self._image_callback), queue_size=1, buff_size=2**20)
+            for name in sorted(self.tracker_filter):
+                topic = self.pose_prefix + "/" + name + "/pose"
+                self.marker_subscribers[topic] = rospy.Subscriber(topic, PoseStamped,
+                    guard(self._marker_callback(name)), queue_size=1)
+        except BaseException:
+            self._ros_generation += 1
+            subscribers = [self.info_subscriber, self.preview_subscriber, self.image_subscriber]
+            subscribers += list(self.marker_subscribers.values())
+            self.info_subscriber = self.preview_subscriber = self.image_subscriber = None
+            self.marker_subscribers = {}
+            for subscriber in subscribers:
+                if subscriber is not None:
+                    subscriber.unregister()
+            raise
+
+    def retain_source(self):
+        with self._state_condition:
+            while self._ros_retiring:
+                self._state_condition.wait()
+            if self._readiness_stopping:
+                raise RuntimeError("calibration source is stopping")
+            self._ros_users += 1
+            try:
+                if self._ros_started and self._ros_users == 1:
+                    self._start_ros_locked()
+            except BaseException:
+                self._ros_users -= 1
+                raise
+        released = False
+        def release():
+            nonlocal released
+            with self._state_condition:
+                if released:
+                    return
+                released = True
+                self._ros_users -= 1
+                if self._ros_users:
+                    return
+                self._ros_retiring = True
+                self._ros_generation += 1
+                subscribers = [self.info_subscriber, self.preview_subscriber, self.image_subscriber]
+                subscribers += list(self.marker_subscribers.values())
+                self.info_subscriber = self.preview_subscriber = self.image_subscriber = None
+                self.marker_subscribers = {}
+            try:
+                for subscriber in subscribers:
+                    if subscriber is not None:
+                        subscriber.unregister()
+                with self._state_condition:
+                    self._state_condition.wait_for(lambda: self._ros_callbacks == 0)
+                    self.camera_info = None
+                    self.preview_jpeg = self.preview_stamp_sec = self._preview_received = None
+                    self._latest_image = None
+                    self.source_size = None
+                    self.marker_latest.clear()
+                    self.marker_receipts.clear()
+            finally:
+                with self._state_condition:
+                    self._ros_retiring = False
+                    self._state_condition.notify_all()
+        return release
+
+    def subscribe_state(self, callback):
+        release_source = self.retain_source()
+        try:
+            with self._state_condition:
+                while self._state_stopping and self._state_thread is not None:
+                    self._state_condition.wait()
+                self._state_listeners.add(callback)
+                if self._state_thread is None:
+                    try:
+                        self._state_stopping = False
+                        self._state_freshness = self._freshness_locked()
+                        self._state_deadline = None
+                        self._state_thread = threading.Thread(target=self._state_expiry_loop,
+                                                              name="calibration-state-expiry")
+                        self._state_thread.start()
+                    except BaseException:
+                        self._state_thread = None
+                        self._state_listeners.discard(callback)
+                        raise
+        except BaseException:
+            release_source()
+            raise
+        release_media = None
+        released = False
+        def release():
+            nonlocal released
+            with self._state_condition:
+                if released:
+                    return
+                released = True
+                self._state_listeners.discard(callback)
+                if self._state_listeners:
+                    thread = clock = None
+                else:
+                    self._state_stopping = True
+                    self._state_condition.notify_all()
+                    thread, clock = self._state_thread, self._state_clock_subscriber
+                    self._state_clock_subscriber = None
+            try:
+                if release_media is not None:
+                    release_media()
+            finally:
+                try:
+                    if clock is not None:
+                        clock.unregister()
+                finally:
+                    if thread is not None and thread is not threading.current_thread():
+                        thread.join()
+                    with self._state_condition:
+                        if thread is not None and self._state_thread is thread:
+                            self._state_thread = None
+                            self._state_condition.notify_all()
+                    release_source()
+        try:
+            release_media = self.snapshot_client.subscribe_state(callback) if self.snapshot_client else None
+            self._retain_state_clock()
+        except BaseException:
+            release()
+            raise
+        return release
+
+    def _retain_state_clock(self):
+        with self._state_condition:
+            while self._state_clock_retiring and self._state_listeners:
+                self._state_condition.wait()
+            now = time.monotonic()
+            if (not self._state_listeners or self._state_clock_subscriber is not None
+                    or not any(now - received <= self.pose_max_age and math.isfinite(stamp) and stamp > 0
+                               for received, stamp in self.marker_receipts.values())
+                    or not rospy.rostime.is_rostime_initialized() or rospy.rostime.is_wallclock()):
+                return
+            self._state_clock_subscriber = rospy.Subscriber("/clock", Clock,
+                self._guard_ros_callback(self._ros_generation, self._state_clock), queue_size=1)
+
+    def _state_changed_locked(self):
+        for callback in tuple(self._state_listeners):
+            callback()
+
+    def _wake_for_deadline_locked(self, deadline):
+        # Extending a deadline never needs to wake the expiry owner. It will
+        # recheck its old deadline and re-arm without projecting stale state.
+        if (self._state_listeners and
+                (self._state_deadline is None or deadline < self._state_deadline - 0.000001)):
+            self._state_condition.notify_all()
+
+    def _freshness_locked(self, ros_now=None):
+        wall_now = time.monotonic()
+        if ros_now is None:
+            ros_now = rospy.Time.now().to_sec() if rospy.rostime.is_rostime_initialized() else 0.0
+        preview = self._preview_received is not None and wall_now - self._preview_received <= self.freeze_image_timeout
+        names = tuple(sorted(name for name in self.marker_latest
+            if pose_is_fresh(self.marker_receipts.get(name), wall_now, ros_now, self.pose_max_age)))
+        boundaries = [boundary for received, stamped in self.marker_receipts.values()
+                      if wall_now - received <= self.pose_max_age and stamped > 0
+                      for boundary in (stamped, float(np.nextafter(stamped + self.pose_max_age, np.inf)))]
+        self._clock_bounds = (max((value for value in boundaries if value <= ros_now), default=float("-inf")),
+                              min((value for value in boundaries if value > ros_now), default=float("inf")))
+        return preview, names
+
+    def _refresh_freshness_locked(self, ros_now=None):
+        if not self._state_listeners:
+            return
+        current = self._freshness_locked(ros_now)
+        if current != self._state_freshness:
+            self._state_freshness = current
+            self._state_changed_locked()
+
+    def _state_clock(self, message):
+        value = message.clock.to_sec()
+        with self.lock:
+            lower, upper = self._clock_bounds
+            if value < lower or value >= upper:
+                self._refresh_freshness_locked(value)
+                self._state_condition.notify_all()
+
+    def _state_expiry_loop(self):
+        while True:
+            retired_clock = None
+            with self._state_condition:
+                if self._state_stopping:
+                    return
+                now = time.monotonic()
+                if (self._state_clock_subscriber is not None
+                        and not any(now - received <= self.pose_max_age and math.isfinite(stamp) and stamp > 0
+                                    for received, stamp in self.marker_receipts.values())):
+                    retired_clock = self._state_clock_subscriber
+                    self._state_clock_subscriber = None
+                    self._state_clock_retiring = True
+                preview, names = self._state_freshness
+                names = set(names)
+                deadlines = []
+                if preview and self._preview_received is not None:
+                    deadlines.append(self._preview_received + self.freeze_image_timeout + 0.001)
+                wall_clock = rospy.rostime.is_rostime_initialized() and rospy.rostime.is_wallclock()
+                ros_now = rospy.Time.now().to_sec() if wall_clock else 0.0
+                for name, (received, stamped) in self.marker_receipts.items():
+                    wall_end = received + self.pose_max_age + 0.001
+                    if name in names or (self._state_clock_subscriber is not None and wall_end > now):
+                        deadlines.append(wall_end)
+                    if wall_clock and math.isfinite(stamped) and stamped > 0 and now - received <= self.pose_max_age:
+                        if name in names:
+                            deadlines.append(now + stamped + self.pose_max_age - ros_now + 0.001)
+                        elif ros_now < stamped:
+                            deadlines.append(now + stamped - ros_now + 0.001)
+                        elif ros_now <= stamped + self.pose_max_age:
+                            deadlines.append(now)
+                if retired_clock is None:
+                    deadline = min(deadlines) if deadlines else None
+                    if deadline is not None and deadline <= now:
+                        # This is a current fact crossing its own deadline,
+                        # not a periodic state snapshot or an obsolete timer.
+                        self._refresh_freshness_locked()
+                        continue
+                    self._state_deadline = deadline
+                    self._state_condition.wait(None if deadline is None else deadline - now)
+                else:
+                    self._state_deadline = None
+            if retired_clock is not None:
+                try:
+                    retired_clock.unregister()
+                finally:
+                    with self._state_condition:
+                        self._state_clock_retiring = False
+                        self._state_condition.notify_all()
 
     def start_ros(self):
-        self.info_subscriber = rospy.Subscriber(self.camera_info_topic, CameraInfo,
-            self._camera_info_callback, queue_size=1)
-        self.preview_subscriber = rospy.Subscriber(self.preview_image_topic, CompressedImage,
-            self._preview_callback, queue_size=1, buff_size=2**20)
-        if self.snapshot_client is None and self.image_topic != self.preview_image_topic:
-            self.image_subscriber = rospy.Subscriber(self.image_topic, CompressedImage,
-                self._image_callback, queue_size=1, buff_size=2**20)
-        # ROS1 has no wildcard subscription or topic-list watch. The run supplies
-        # its tracker names; normal publisher updates handle late/restarted peers.
-        for name in sorted(self.tracker_filter):
-            topic = self.pose_prefix + "/" + name + "/pose"
-            self.marker_subscribers[topic] = rospy.Subscriber(topic, PoseStamped,
-                self._marker_callback(name), queue_size=1)
+        with self._state_condition:
+            self._ros_started = True
+            if self._ros_users:
+                self._start_ros_locked()
+        self._retain_state_clock()
 
     def close(self):
         self.stop_readiness()
-        for subscriber in [self.info_subscriber, self.preview_subscriber, self.image_subscriber] + list(self.marker_subscribers.values()):
-            if subscriber is not None:
-                subscriber.unregister()
 
     def _image_callback(self, message):
         with self.lock:
@@ -178,6 +435,8 @@ class RosCalibrationSource:
             (stamp if not stamp.is_zero() else rospy.Time.now()).to_sec()
         )
         with self.lock:
+            previous_stamp = self.preview_stamp_sec
+            previous_received = self._preview_received
             self.preview_jpeg = payload
             self._preview_received = time.monotonic()
             if self.image_topic == self.preview_image_topic:
@@ -187,6 +446,12 @@ class RosCalibrationSource:
             except ApiError:
                 self.source_size = None
             self.preview_stamp_sec = stamp_sec
+            if previous_stamp != stamp_sec:
+                self._state_changed_locked()
+            if (previous_received is None
+                    or self._preview_received - previous_received > self.freeze_image_timeout):
+                self._refresh_freshness_locked()
+            self._wake_for_deadline_locked(self._preview_received + self.freeze_image_timeout + 0.001)
 
     def _marker_callback(self, name):
         def callback(message):
@@ -201,8 +466,24 @@ class RosCalibrationSource:
                 received_monotonic_sec=time.monotonic(),
             )
             with self.lock:
+                previous = self.marker_receipts.get(name)
                 self.marker_latest[name] = observation
                 self.marker_receipts[name] = (observation.received_monotonic_sec, observation.source_stamp_sec)
+                if (previous is None or previous[1] != observation.source_stamp_sec
+                        or observation.received_monotonic_sec - previous[0] > self.pose_max_age):
+                    self._refresh_freshness_locked()
+                deadline = observation.received_monotonic_sec + self.pose_max_age + 0.001
+                if (rospy.rostime.is_rostime_initialized() and rospy.rostime.is_wallclock()
+                        and math.isfinite(observation.source_stamp_sec) and observation.source_stamp_sec > 0):
+                    ros_now = rospy.Time.now().to_sec()
+                    if observation.source_stamp_sec > ros_now:
+                        deadline = min(deadline, observation.received_monotonic_sec
+                                       + observation.source_stamp_sec - ros_now + 0.001)
+                    elif ros_now <= observation.source_stamp_sec + self.pose_max_age:
+                        deadline = min(deadline, observation.received_monotonic_sec
+                                       + observation.source_stamp_sec + self.pose_max_age - ros_now + 0.001)
+                self._wake_for_deadline_locked(deadline)
+            self._retain_state_clock()
 
         return callback
 
@@ -245,7 +526,6 @@ class RosCalibrationSource:
                 "intrinsic_ready": not self.use_camera_info or self.camera_info is not None,
                 "camera_info_topic": self.camera_info_topic,
                 "camera_info_received": self.camera_info is not None,
-                "camera_info_connected": bool(self.info_subscriber and self.info_subscriber.get_num_connections()),
                 "world_pose_available": bool(marker_names),
                 "media": media,
                 "marker_count": len(marker_names),
@@ -254,6 +534,18 @@ class RosCalibrationSource:
             }
 
     def freeze(self, parent_frame):
+        release_media = self.snapshot_client.peer.retain() if self.snapshot_client is not None else None
+        try:
+            release = self.retain_source()
+            try:
+                return self._freeze(parent_frame)
+            finally:
+                release()
+        finally:
+            if release_media is not None:
+                release_media()
+
+    def _freeze(self, parent_frame):
         if self.snapshot_client is not None:
             try:
                 snapshot = self.snapshot_client.capture()
@@ -291,7 +583,10 @@ class RosCalibrationSource:
                 or matrix[0, 0] <= 0 or matrix[1, 1] <= 0):
             return
         with self.lock:
+            first = self.camera_info is None
             self.camera_info = (matrix, distortion, (message.width, message.height), message.header.frame_id)
+            if first:
+                self._state_changed_locked()
 
     def wait_ready(self, timeout):
         with self.lock:
@@ -317,6 +612,13 @@ class RosCalibrationSource:
                              pose_coordinates=context["pose_coordinates"])
 
     def observe_marker(self, marker, width, height, parent_frame):
+        release = self.retain_source()
+        try:
+            return self._observe_marker(marker, width, height, parent_frame)
+        finally:
+            release()
+
+    def _observe_marker(self, marker, width, height, parent_frame):
         # Metadata and latest pose only: the browser already owns the clicked
         # image. Never capture another frame to reinterpret its pixels.
         # The selected intrinsic model owns dimensions. A browser-owned frame
@@ -444,11 +746,12 @@ def main():
         http_port = int(parameters.get("~http_port", 8765))
         if not 1 <= http_port <= 65535:
             raise ValueError("~http_port must be between 1 and 65535")
-        def peer_status():
-            status = source.status()
+        def peer_status_from_source(status):
             return {"ros_master": binding.status(), "media": status["media"],
-                    "camera_info": {"received": status["camera_info_received"], "connected": status["camera_info_connected"]},
+                    "camera_info": {"received": status["camera_info_received"]},
                     "world": {"pose_available": status["world_pose_available"], "marker_count": status["marker_count"]}}
+        def peer_status():
+            return peer_status_from_source(source.status())
         server = CalibrationHttpServer(
             (bind_address, http_port),
             service,
@@ -467,7 +770,7 @@ def main():
             target_id=target_id,
             rpc_socket=socket_path,
             lifecycle=binding, peer_status=peer_status,
-            activate_peers=snapshot_client.peer.activate if snapshot_client is not None else None,
+            peer_status_for_state=lambda state: peer_status_from_source(state["source"]),
         )
         server.start()
         if not binding.initialize():
