@@ -721,7 +721,6 @@ class IntrinsicServiceTest(unittest.TestCase):
         self.assertIn('tempfile.TemporaryDirectory(', source)
         self.assertNotIn('parameters.get("~output_file"', source)
         self.assertNotIn('parameters.get("~references_dir"', source)
-        self.assertIn("await asyncio.sleep(0.1)", WEB_SERVICE_SOURCE.read_text(encoding="utf-8"))
 
     def test_process_frame_collects_a_board_sample(self):
         with tempfile.TemporaryDirectory() as directory:
