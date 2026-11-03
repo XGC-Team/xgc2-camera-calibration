@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/lib/xgc2/xrpc/python/bin/python3
 """ROS1 camera/pose adapter and HTTP entrypoint for extrinsic calibration."""
 
 import sys

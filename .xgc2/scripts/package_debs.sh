@@ -62,7 +62,7 @@ Section: misc
 Priority: optional
 Architecture: ${ARCH}
 Maintainer: XGC2 <dev@xiaokang.ink>
-Depends: python3 (>= 3.8), python3-numpy, python3-opencv, python3-rospkg, python3-yaml, ros-noetic-gazebo-msgs, ros-noetic-geometry-msgs, ros-noetic-rosbash, ros-noetic-roslaunch, ros-noetic-rospy, ros-noetic-sensor-msgs, ros-noetic-tf, ros-noetic-tf2-ros
+Depends: python3 (>= 3.8), python3-numpy, python3-opencv, python3-rospkg, python3-yaml, python3-xgc2-xrpc (>= 0.2.1), ros-noetic-gazebo-msgs, ros-noetic-geometry-msgs, ros-noetic-rosbash, ros-noetic-roslaunch, ros-noetic-rospy, ros-noetic-sensor-msgs, ros-noetic-tf, ros-noetic-tf2-ros
 Conflicts: ros-noetic-xgc-camera-calibration
 Description: Independent intrinsic and fixed-world-camera extrinsic calibration for ROS Noetic
 EOF

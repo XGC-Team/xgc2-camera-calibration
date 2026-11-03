@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Require the released Python SDK 0.2.1 on the interpreter path (build script wheel, runtime image)."""
+"""Require the released Python SDK 0.2.1 in the selected environment."""
 from importlib.metadata import version
 from xgc2_xrpc.http import Context
 

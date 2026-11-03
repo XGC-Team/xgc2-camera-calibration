@@ -14,6 +14,7 @@
   <exec_depend>python3-opencv</exec_depend>
   <exec_depend>python3-rospkg</exec_depend>
   <exec_depend>python3-yaml</exec_depend>
+  <exec_depend version_gte="0.2.1">python3-xgc2-xrpc</exec_depend>
   <exec_depend>rosbash</exec_depend>
   <exec_depend>roslaunch</exec_depend>
   <exec_depend>rospy</exec_depend>

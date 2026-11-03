@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/lib/xgc2/xrpc/python/bin/python3
 """Publish the immutable camera pose supplied by Core for this Run."""
 import sys
 import math

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/lib/xgc2/xrpc/python/bin/python3
 """ROS1 pose-control adapter and Media Edge entrypoint for intrinsics.
 
 Live imagery belongs to the browser WebRTC session. Simulation requests an

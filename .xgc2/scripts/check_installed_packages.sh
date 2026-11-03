@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PREFIX="/opt/ros/${ROS_DISTRO:-noetic}"
 export ROS_MASTER_URI="${ROS_MASTER_URI:-http://127.0.0.1:11311}"
 source "${PREFIX}/setup.bash"
-python3 "${SCRIPT_DIR}/check_python_xrpc.py"
+/usr/lib/xgc2/xrpc/python/bin/python3 "${SCRIPT_DIR}/check_python_xrpc.py"
 python3 "${SCRIPT_DIR}/check_python_opencv.py"
 dpkg -s ros-noetic-xgc2-camera-calibration >/dev/null
 for definition in xgc2-camera-extrinsic-calibrator-ros1 xgc2-camera-extrinsic-tf-ros1 xgc2-camera-intrinsic-calibrator-ros1; do
@@ -20,7 +20,7 @@ for page in extrinsic intrinsic; do
     test -f "${PREFIX}/share/xgc_camera_calibration/web/${page}/${asset}"
   done
 done
-python3 -c 'from xgc_camera_calibration.extrinsic_resolver import decode_frozen; from xgc_camera_calibration.intrinsic_solver import calibrate_intrinsic; from xgc_camera_calibration.media_snapshot import MediaSnapshotClient; from xgc_camera_calibration.solver import solve_extrinsic; from xgc_camera_calibration.web_service import CalibrationHttpServer'
+/usr/lib/xgc2/xrpc/python/bin/python3 -c 'from xgc_camera_calibration.extrinsic_resolver import decode_frozen; from xgc_camera_calibration.intrinsic_solver import calibrate_intrinsic; from xgc_camera_calibration.media_snapshot import MediaSnapshotClient; from xgc_camera_calibration.solver import solve_extrinsic; from xgc_camera_calibration.web_service import CalibrationHttpServer'
 
 RUNTIME="$(mktemp -d)"
 ROSCORE_PID=""
@@ -89,7 +89,7 @@ rosparam list >/dev/null
 
 # Discovery and health fixture only; no camera frame or calibration is fabricated.
 MEDIA_EDGE_RPC_SOCKET="${RUNTIME}/media-edge.sock"
-python3 - "${MEDIA_EDGE_RPC_SOCKET}" <<'PYMEDIA' >"${RUNTIME}/media-edge.log" 2>&1 &
+/usr/lib/xgc2/xrpc/python/bin/python3 - "${MEDIA_EDGE_RPC_SOCKET}" <<'PYMEDIA' >"${RUNTIME}/media-edge.log" 2>&1 &
 import signal, sys, threading
 from xgc2_xrpc import Host, Runtime
 path = sys.argv[1]
@@ -132,7 +132,7 @@ EXTRINSIC_PID="$!"
   _media_edge_rpc_socket:="${MEDIA_EDGE_RPC_SOCKET}" _media_source_id:=package_smoke _snapshot_timeout:=1 _auto_capture:=false \
   _http_port:="${INTRINSIC_PORT}" _calibration_mode:=sim _camera_name:=package_smoke >"${RUNTIME}/intrinsic.log" 2>&1 &
 INTRINSIC_PID="$!"
-python3 - "${RUNTIME}" "${EXTRINSIC_PORT}" "${INTRINSIC_PORT}" <<'PYCHECK'
+/usr/lib/xgc2/xrpc/python/bin/python3 - "${RUNTIME}" "${EXTRINSIC_PORT}" "${INTRINSIC_PORT}" <<'PYCHECK'
 import json, sys, time, urllib.request
 from pathlib import Path
 from xgc2_xrpc import Client, Endpoint, Runtime, ServiceRef
