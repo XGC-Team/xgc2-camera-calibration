@@ -63,5 +63,9 @@ release:
   ref: main
   workflow: release.yml
   ci_workflow: ci.yml
+  requires:
+  - xgc2-xrpc
+  dependency_policy:
+    xgc2-xrpc: verify
   apt_versions:
     focal: 0.4.0-5
