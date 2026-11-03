@@ -66,7 +66,9 @@ docker run "${docker_args[@]}" \
     fi
     /usr/lib/xgc2/xrpc/python/bin/python3 /workspace/repo/.xgc2/scripts/check_python_xrpc.py
     python3 /workspace/repo/.xgc2/scripts/check_python_opencv.py
-    catkin_make -j1 -DCMAKE_BUILD_TYPE=RelWithDebInfo -DPYTHON_EXECUTABLE=/usr/lib/xgc2/xrpc/python/bin/python3
+    catkin_make -j1 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+      -DPYTHON_EXECUTABLE=/usr/lib/xgc2/xrpc/python/bin/python3 \
+      -DNOSETESTS="/usr/lib/xgc2/xrpc/python/bin/python3 /usr/bin/nosetests3"
     ROS_HOME=/workspace/work/ros-home ROS_LOG_DIR=/workspace/work/ros-log catkin_make -j1 run_tests
     catkin_test_results --verbose
     DESTDIR=/workspace/work/install-root catkin_make -j1 install -DCMAKE_INSTALL_PREFIX=/opt/ros/noetic -DCATKIN_ENABLE_TESTING=OFF
