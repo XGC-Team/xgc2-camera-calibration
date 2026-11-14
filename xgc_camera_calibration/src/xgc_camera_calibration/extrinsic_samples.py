@@ -210,7 +210,7 @@ class SampleCollection:
             if len(world) != 3 or len(raw) != 3:
                 raise ApiError(409, "Marker observation position is invalid")
             pose = {"observation_id": observed.observation_id, "frame_id": observed.frame_id,
-                    "source_stamp_sec": finite(observed.source_stamp_sec, "pose source stamp"), "source_clock": "ros",
+                    "source_stamp_sec": finite(observed.source_stamp_sec, "pose source stamp"), "source_clock": observed.source_clock,
                     "received_at_sec": finite(observed.received_at_sec, "pose received time"), "received_clock": "unix",
                     "received_monotonic_sec": finite(observed.received_monotonic_sec, "pose receipt")}
             if not pose["observation_id"]:

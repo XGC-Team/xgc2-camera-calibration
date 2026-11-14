@@ -16,3 +16,9 @@ class PoseFreshnessTest(unittest.TestCase):
     def test_missing_receipt_and_clock_reset_are_rejected(self):
         self.assertFalse(pose_is_fresh(None, 100., 12., 2.))
         self.assertFalse(pose_is_fresh((101., 12.), 100., 12., 2.))
+
+
+class VrpnClockFreshnessTest(unittest.TestCase):
+    def test_raw_source_time_does_not_need_to_equal_host_wall_time(self):
+        self.assertTrue(pose_is_fresh((100., 43200.), 100.1, 86400., 2., source_clock="vrpn"))
+        self.assertFalse(pose_is_fresh((100., 43200.), 103., 86400., 2., source_clock="vrpn"))
