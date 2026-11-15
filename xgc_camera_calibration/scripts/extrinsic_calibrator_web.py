@@ -2,6 +2,7 @@
 """ROS1 camera/pose adapter and HTTP entrypoint for extrinsic calibration."""
 
 import sys
+import json
 import threading
 import time
 import math
@@ -73,8 +74,25 @@ class RosCalibrationSource:
         selected = Path(str(intrinsic_file).strip()) if str(intrinsic_file).strip() else None
         if selected is not None and (not selected.is_absolute() or not selected.is_file()):
             raise ValueError("intrinsic_file must be an explicit absolute input file")
-        self.use_camera_info = selected is None
-        if selected is None:
+        asset_payload = parameters.get("~intrinsic_asset_json", "null")
+        # ROS private arguments are YAML-decoded by NodeParameters. A JSON
+        # object therefore already arrives as a dict (and JSON null as None).
+        # str(dict) is Python repr, not JSON; do not feed it back to json.loads.
+        self.intrinsic_asset = json.loads(asset_payload) if isinstance(asset_payload, str) else asset_payload
+        if self.intrinsic_asset is not None and not isinstance(self.intrinsic_asset, dict):
+            raise ValueError("intrinsic_asset_json must contain a calibration asset object or null")
+        self.use_camera_info = selected is None and self.intrinsic_asset is None
+        if self.intrinsic_asset is not None:
+            from xgc_camera_calibration.asset_document import render
+            import yaml
+            if self.intrinsic_asset.get("camera", {}).get("sourceId") != camera_name:
+                raise ValueError("selected intrinsic asset camera differs from this camera")
+            intrinsic_document = yaml.safe_load(render(self.intrinsic_asset, "camera_info_yaml"))
+            self.intrinsic_file = ""
+            self.intrinsic_provenance = {"intrinsic_source": "calibration-asset",
+                "distortion_model": intrinsic_document["distortion_model"]}
+            self.intrinsic_matrix, self.intrinsic_distortion, self.intrinsic_size = intrinsic_parameters(intrinsic_document)
+        elif selected is None:
             self.intrinsic_file = ""
             self.intrinsic_matrix = None
             self.intrinsic_distortion = None
@@ -121,6 +139,16 @@ class RosCalibrationSource:
             self.tracker_filter = {
                 item.strip() for item in str(tracker_value).split(",") if item.strip()
             }
+        self.pose_transport = str(parameters.get("~pose_transport", "ros"))
+        if self.pose_transport not in ("ros", "zenoh"):
+            raise ValueError("pose_transport must be ros or zenoh")
+        self.pose_zenoh_endpoint = str(parameters.get("~pose_zenoh_endpoint", ""))
+        self.pose_zenoh_source = str(parameters.get("~pose_zenoh_source", ""))
+        self.pose_sensor = int(parameters.get("~pose_sensor", 0))
+        if self.pose_transport == "zenoh" and (not self.pose_zenoh_endpoint or
+                not self.pose_zenoh_source or self.pose_sensor < 0):
+            raise ValueError("Zenoh poses require endpoint, source and sensor")
+        self._zenoh_poses = None
         self.preview_jpeg = None
         self.preview_stamp_sec = None
         self.marker_latest = {}
@@ -175,10 +203,21 @@ class RosCalibrationSource:
             if self.snapshot_client is None and self.image_topic != self.preview_image_topic:
                 self.image_subscriber = rospy.Subscriber(self.image_topic, CompressedImage,
                     guard(self._image_callback), queue_size=1, buff_size=2**20)
-            for name in sorted(self.tracker_filter):
-                topic = self.pose_prefix + "/" + name + "/pose"
-                self.marker_subscribers[topic] = rospy.Subscriber(topic, PoseStamped,
-                    guard(self._marker_callback(name)), queue_size=1)
+            if self.pose_transport == "zenoh":
+                from xgc_camera_calibration.zenoh_pose import ZenohPoses
+                accept = guard(self._accept_marker)
+                parent_frame = str(self.parameters.get("~parent_frame", "world"))
+                def receive(name, stamp, position):
+                    accept(MarkerObservation(name=name, position=position, frame_id=parent_frame,
+                        observation_id=uuid.uuid4().hex, source_stamp_sec=stamp,
+                        received_at_sec=time.time(), received_monotonic_sec=time.monotonic(), source_clock="vrpn"))
+                self._zenoh_poses = ZenohPoses(self.pose_zenoh_endpoint, self.pose_zenoh_source,
+                    self.tracker_filter, self.pose_sensor, receive)
+            else:
+                for name in sorted(self.tracker_filter):
+                    topic = self.pose_prefix + "/" + name + "/pose"
+                    self.marker_subscribers[topic] = rospy.Subscriber(topic, PoseStamped,
+                        guard(self._marker_callback(name)), queue_size=1)
         except BaseException:
             self._ros_generation += 1
             subscribers = [self.info_subscriber, self.preview_subscriber, self.image_subscriber]
@@ -188,6 +227,9 @@ class RosCalibrationSource:
             for subscriber in subscribers:
                 if subscriber is not None:
                     subscriber.unregister()
+            if self._zenoh_poses is not None:
+                self._zenoh_poses.close()
+                self._zenoh_poses = None
             raise
 
     def retain_source(self):
@@ -220,6 +262,9 @@ class RosCalibrationSource:
                 self.info_subscriber = self.preview_subscriber = self.image_subscriber = None
                 self.marker_subscribers = {}
             try:
+                if self._zenoh_poses is not None:
+                    self._zenoh_poses.close()
+                    self._zenoh_poses = None
                 for subscriber in subscribers:
                     if subscriber is not None:
                         subscriber.unregister()
@@ -303,7 +348,7 @@ class RosCalibrationSource:
             while self._state_clock_retiring and self._state_listeners:
                 self._state_condition.wait()
             now = time.monotonic()
-            if (not self._state_listeners or self._state_clock_subscriber is not None
+            if (self.pose_transport == "zenoh" or not self._state_listeners or self._state_clock_subscriber is not None
                     or not any(now - received <= self.pose_max_age and math.isfinite(stamp) and stamp > 0
                                for received, stamp in self.marker_receipts.values())
                     or not rospy.rostime.is_rostime_initialized() or rospy.rostime.is_wallclock()):
@@ -328,10 +373,11 @@ class RosCalibrationSource:
             ros_now = rospy.Time.now().to_sec() if rospy.rostime.is_rostime_initialized() else 0.0
         preview = self._preview_received is not None and wall_now - self._preview_received <= self.freeze_image_timeout
         names = tuple(sorted(name for name in self.marker_latest
-            if pose_is_fresh(self.marker_receipts.get(name), wall_now, ros_now, self.pose_max_age)))
+            if pose_is_fresh(self.marker_receipts.get(name), wall_now, ros_now, self.pose_max_age,
+                    source_clock=self.marker_latest[name].source_clock)))
         boundaries = [boundary for received, stamped in self.marker_receipts.values()
                       if wall_now - received <= self.pose_max_age and stamped > 0
-                      for boundary in (stamped, float(np.nextafter(stamped + self.pose_max_age, np.inf)))]
+                      for boundary in (() if self.pose_transport == "zenoh" else (stamped, float(np.nextafter(stamped + self.pose_max_age, np.inf))))]
         self._clock_bounds = (max((value for value in boundaries if value <= ros_now), default=float("-inf")),
                               min((value for value in boundaries if value > ros_now), default=float("inf")))
         return preview, names
@@ -376,7 +422,7 @@ class RosCalibrationSource:
                     wall_end = received + self.pose_max_age + 0.001
                     if name in names or (self._state_clock_subscriber is not None and wall_end > now):
                         deadlines.append(wall_end)
-                    if wall_clock and math.isfinite(stamped) and stamped > 0 and now - received <= self.pose_max_age:
+                    if self.pose_transport != "zenoh" and wall_clock and math.isfinite(stamped) and stamped > 0 and now - received <= self.pose_max_age:
                         if name in names:
                             deadlines.append(now + stamped + self.pose_max_age - ros_now + 0.001)
                         elif ros_now < stamped:
@@ -465,27 +511,33 @@ class RosCalibrationSource:
                 received_at_sec=time.time(),
                 received_monotonic_sec=time.monotonic(),
             )
-            with self.lock:
-                previous = self.marker_receipts.get(name)
-                self.marker_latest[name] = observation
-                self.marker_receipts[name] = (observation.received_monotonic_sec, observation.source_stamp_sec)
-                if (previous is None or previous[1] != observation.source_stamp_sec
-                        or observation.received_monotonic_sec - previous[0] > self.pose_max_age):
-                    self._refresh_freshness_locked()
-                deadline = observation.received_monotonic_sec + self.pose_max_age + 0.001
-                if (rospy.rostime.is_rostime_initialized() and rospy.rostime.is_wallclock()
-                        and math.isfinite(observation.source_stamp_sec) and observation.source_stamp_sec > 0):
-                    ros_now = rospy.Time.now().to_sec()
-                    if observation.source_stamp_sec > ros_now:
-                        deadline = min(deadline, observation.received_monotonic_sec
-                                       + observation.source_stamp_sec - ros_now + 0.001)
-                    elif ros_now <= observation.source_stamp_sec + self.pose_max_age:
-                        deadline = min(deadline, observation.received_monotonic_sec
-                                       + observation.source_stamp_sec + self.pose_max_age - ros_now + 0.001)
-                self._wake_for_deadline_locked(deadline)
-            self._retain_state_clock()
-
+            self._accept_marker(observation)
         return callback
+
+    def _accept_marker(self, observation):
+        with self.lock:
+            previous = self.marker_receipts.get(observation.name)
+            # A repeated raw source stamp is not a new measurement. Do not let
+            # repeated deliveries extend liveness across a frozen tracker stream.
+            if observation.source_clock == "vrpn" and previous is not None and previous[1] == observation.source_stamp_sec:
+                return
+            self.marker_latest[observation.name] = observation
+            self.marker_receipts[observation.name] = (observation.received_monotonic_sec, observation.source_stamp_sec)
+            if (previous is None or previous[1] != observation.source_stamp_sec
+                    or observation.received_monotonic_sec - previous[0] > self.pose_max_age):
+                self._refresh_freshness_locked()
+            deadline = observation.received_monotonic_sec + self.pose_max_age + 0.001
+            if (observation.source_clock == "ros" and rospy.rostime.is_rostime_initialized() and rospy.rostime.is_wallclock()
+                    and math.isfinite(observation.source_stamp_sec) and observation.source_stamp_sec > 0):
+                ros_now = rospy.Time.now().to_sec()
+                if observation.source_stamp_sec > ros_now:
+                    deadline = min(deadline, observation.received_monotonic_sec
+                                   + observation.source_stamp_sec - ros_now + 0.001)
+                elif ros_now <= observation.source_stamp_sec + self.pose_max_age:
+                    deadline = min(deadline, observation.received_monotonic_sec
+                                   + observation.source_stamp_sec + self.pose_max_age - ros_now + 0.001)
+            self._wake_for_deadline_locked(deadline)
+        self._retain_state_clock()
 
     @property
     def source_id(self):
@@ -507,7 +559,8 @@ class RosCalibrationSource:
             # init_node marks the node initialized before it initializes time.
             ros_now = rospy.Time.now().to_sec() if rospy.rostime.is_rostime_initialized() else 0.0
             marker_names = sorted(name for name in self.marker_latest
-                if pose_is_fresh(self.marker_receipts.get(name), wall_now, ros_now, self.pose_max_age))
+                if pose_is_fresh(self.marker_receipts.get(name), wall_now, ros_now, self.pose_max_age,
+                    source_clock=self.marker_latest[name].source_clock))
             return {
                 "image_topic": (
                     "media:{}".format(self.snapshot_client.source_id)
@@ -517,7 +570,7 @@ class RosCalibrationSource:
                 "preview_image_topic": self.preview_image_topic,
                 "intrinsic_file": str(self.intrinsic_file),
                 "intrinsic_source": (
-                    "camera-info" if self.use_camera_info else "selected-file"
+                    "camera-info" if self.use_camera_info else self.intrinsic_provenance["intrinsic_source"]
                 ),
                 "pose_prefix": self.pose_prefix,
                 "image_ready": preview_ready,
@@ -654,7 +707,8 @@ class RosCalibrationSource:
             wall_now, ros_now = time.monotonic(), rospy.Time.now().to_sec()
             observations = {name: observation for name, observation in self.marker_latest.items()
                 if (selected_marker is None or name == selected_marker)
-                and pose_is_fresh(self.marker_receipts.get(name), wall_now, ros_now, self.pose_max_age)}
+                and pose_is_fresh(self.marker_receipts.get(name), wall_now, ros_now, self.pose_max_age,
+                    source_clock=self.marker_latest[name].source_clock)}
         provenance = {}
         if self.pose_coordinate_source != "unspecified":
             provenance = coordinate_provenance("experiment-world", parent_frame, self.pose_world_offset)

@@ -192,6 +192,98 @@ class WebCalibrationServiceTest(unittest.TestCase):
                 self.admit(marker, pixel, service)
         return self.current(service)
 
+    def resolve_request(self, mode="sim"):
+        return {"asset": {"camera": {"sourceId": "usb_cam"}, "extrinsics": {
+            "parentFrame": "world", "childFrame": "camera_optical_frame", "calibrationMode": mode,
+            "translation": [1, 2, 3], "rotationRpy": [0, 0, 0],
+            "poseCoordinates": {"schema_version": 1, "kind": "raw-vrpn", "frame": "world", "world_offset": [0, 0, 0]}}},
+            "pin": {"resourceId": "asset-test", "commitId": "commit-test"}}
+
+    def test_resolve_pinned_extrinsic_uses_frozen_context_without_mutating_samples(self):
+        self.service = CalibrationService(FakeSource(self.snapshot), calibration_mode="sim", camera_name="usb_cam",
+            parent_frame="world", child_frame="camera_optical_frame", **self.application_kwargs((4, 5, 6)))
+        self.service.solve(self.point_request())
+        before = self.service.state()
+        candidate = self.service.read_result()
+        frozen = json.loads(json.dumps(self.service.frozen_extrinsic))
+        request = self.resolve_request()
+        original = json.loads(json.dumps(request))
+        resolved = self.service.resolve_extrinsic(request)
+        self.assertEqual(resolved["status"], "calibrated")
+        self.assertEqual(resolved["choiceMode"], "asset")
+        self.assertEqual(resolved["asset"], request["pin"])
+        self.assertEqual(resolved["sourceMode"], "sim")
+        self.assertEqual(resolved["targetCoordinates"], frozen["targetCoordinates"])
+        self.assertEqual(resolved["originalOpticalPose"]["translation"], [1, 2, 3])
+        self.assertEqual(resolved["resolvedOpticalPose"]["translation"], [5, 7, 9])
+        self.assertEqual(self.service.state(), before)
+        self.assertEqual(self.service.read_result(), candidate)
+        self.assertEqual(self.service.frozen_extrinsic, frozen)
+        self.assertEqual(request, original)
+        # Resolution cannot hand mutable aliases to the caller.
+        resolved["asset"]["commitId"] = "changed"
+        self.assertEqual(request, original)
+
+    def test_resolve_first_physical_asset_uses_frozen_physical_optical_role(self):
+        roles = {"parentFrame": "world", "opticalFrames": {"sim": "sim_optical", "phy": "usb_cam_optical_frame"}}
+        frozen = encode_frozen(resolve_selection(str(self.calibration_root), "usb_cam", {"mode": "auto"},
+            {"frame": "world", "worldOffset": [4., 5., 6.]}, roles))
+        service = CalibrationService(FakeSource(self.snapshot), calibration_mode="phy", camera_name="usb_cam",
+            parent_frame="world", child_frame="usb_cam_optical_frame", resolved_extrinsic_json=frozen,
+            frame_roles_json=json.dumps(roles))
+        self.assertEqual(service.frozen_extrinsic["status"], "uncalibrated")
+        request = self.resolve_request("phy")
+        request["asset"]["extrinsics"]["childFrame"] = "usb_cam_optical_frame"
+        resolved = service.resolve_extrinsic(request)
+        self.assertEqual(resolved["sourceMode"], "phy")
+        self.assertEqual(resolved["sourceOpticalFrame"], "usb_cam_optical_frame")
+        self.assertEqual(resolved["resolvedOpticalPose"]["translation"], [5., 7., 9.])
+        self.assertEqual(service.frozen_extrinsic["status"], "uncalibrated")
+
+    def test_resolve_extrinsic_rejects_invalid_scope_pin_transform_and_missing_context(self):
+        bad = [None, {}, {**self.resolve_request(), "targetCoordinates": {}}]
+        for key, value in [("camera", {"sourceId": "other"}), ("extrinsics", None)]:
+            request = self.resolve_request(); request["asset"][key] = value; bad.append(request)
+        for pin in (None, {}, {"resourceId": "asset", "commitId": ""}, {"resourceId": "asset", "commitId": "commit", "extra": 1}):
+            request = self.resolve_request(); request["pin"] = pin; bad.append(request)
+        for field, value in [("parentFrame", "map"), ("childFrame", "other"), ("translation", [True, 2, 3]),
+                             ("rotationRpy", [0, float("nan"), 0]), ("poseCoordinates", {})]:
+            request = self.resolve_request(); request["asset"]["extrinsics"][field] = value; bad.append(request)
+        bad.append(self.resolve_request("phy"))
+        for request in bad:
+            with self.subTest(request=request), self.assertRaises(ApiError) as error:
+                self.service.resolve_extrinsic(request)
+            self.assertEqual(error.exception.status, 400)
+        missing = CalibrationService(FakeSource(self.snapshot), calibration_mode="sim", camera_name="usb_cam",
+            parent_frame="world", child_frame="camera_optical_frame")
+        with self.assertRaises(ApiError) as error:
+            missing.resolve_extrinsic(self.resolve_request())
+        self.assertEqual(error.exception.status, 409)
+
+    def test_resolve_extrinsic_has_public_and_instance_fenced_private_routes(self):
+        from xgc2_xrpc import Client, Fault
+        server = CalibrationHttpServer(("127.0.0.1", 0), self.service,
+            Path(__file__).resolve().parents[1]/"web"/"extrinsic", frame_ancestors="'self'",
+            target_id="local-test", rpc_socket=str(Path(self.temporary.name)/"resolver.sock")).start()
+        self.addCleanup(server.close)
+        base = "http://127.0.0.1:{}".format(server.server_address[1])
+        body = self.resolve_request()
+        before = self.service.state()
+        with Client.from_service(server.service_ref, runtime=server.runtime, local_target="local-test") as client:
+            description = client.json("/v1/describe", method="GET")
+            self.assertIn({"method": "POST", "path": "/api/v1/extrinsic/resolve"}, description["routes"])
+            private = client.json("/api/v1/extrinsic/resolve", body)
+            self.assertEqual(private["asset"], body["pin"])
+            with self.assertRaises(Fault) as error:
+                client.json("/api/v1/extrinsic/resolve", {**body, "offset": [1, 2, 3]})
+            self.assertEqual(error.exception.status, 400)
+        request = urllib.request.Request(base+"/api/v1/extrinsic/resolve", data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(request, timeout=3) as response:
+            public = json.loads(response.read())
+        self.assertEqual(public["resolvedOpticalPose"], private["resolvedOpticalPose"])
+        self.assertEqual(self.service.state(), before)
+
     def test_actual_source_frame_model_matches_camera_info_and_selected_inputs(self):
         import ast
         import threading
@@ -350,6 +442,29 @@ class WebCalibrationServiceTest(unittest.TestCase):
         document = self.service.read_result()["document"]
         self.assertEqual(document["points"][0]["sample_id"], identities[0])
 
+    def test_physical_multi_body_and_repeated_body_produce_commit_ready_documents(self):
+        for repeated in (False, True):
+            with self.subTest(repeated=repeated):
+                source = FakeSource(self.snapshot)
+                service = CalibrationService(source, calibration_mode="phy", camera_name="usb_cam",
+                    parent_frame="world", child_frame="camera_optical_frame",
+                    maximum_inlier_error_px=1., **self.application_kwargs())
+                for index, (world, pixel) in enumerate(zip(self.world, self.pixels)):
+                    name = "one-body" if repeated else "marker_{:02d}".format(index + 1)
+                    source.snapshot = replace(self.snapshot, stamp_sec=10. + index,
+                        markers={name: MarkerObservation(name, tuple(world), "world")},
+                        camera_model={"intrinsic_source":"calibration-asset", "distortion_model":"plumb_bob",
+                                      "frame_id":"camera_optical_frame"})
+                    self.admit(name, pixel, service=service)
+                result = service.solve(self.current(service))
+                document = service.read_result()["document"]
+                self.assertEqual(document["calibration_mode"], "phy")
+                self.assertEqual(document["sample_count"], 6)
+                self.assertEqual(document["inlier_count"], 6)
+                self.assertLess(result["max_reprojection_error_px"], 1e-3)
+                self.assertEqual(document["metadata"]["pose_coordinates"]["kind"], "experiment-world")
+                self.assertEqual(document["metadata"]["camera_model"]["intrinsic_source"], "calibration-asset")
+
     def test_begin_fixes_pose_before_image_upload_and_exact_image_is_reviewable(self):
         request, pending = self.begin("marker_01", self.pixels[0])
         before = self.service.source.snapshot
@@ -484,7 +599,7 @@ class WebCalibrationServiceTest(unittest.TestCase):
         from xgc_camera_calibration.intrinsic_validation import ideal_intrinsic_parameters
         source_path = Path(__file__).resolve().parents[1] / "scripts" / "extrinsic_calibrator_web.py"
         cls = next(node for node in ast.parse(source_path.read_text()).body if isinstance(node, ast.ClassDef) and node.name == "RosCalibrationSource")
-        methods = [node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name in ("_marker_callback", "_observe_marker", "_observation_context")]
+        methods = [node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name in ("_marker_callback", "_accept_marker", "_observe_marker", "_observation_context")]
         clock = SimpleNamespace(monotonic=lambda: 100., time=lambda: 123456.)
         namespace = {"MarkerObservation": MarkerObservation, "ApiError": ApiError, "replace": replace,
             "uuid": uuid, "time": clock, "pose_is_fresh": pose_is_fresh,
@@ -499,6 +614,7 @@ class WebCalibrationServiceTest(unittest.TestCase):
             camera_info_topic="/camera/camera_info",pose_coordinate_source="raw-vrpn",pose_world_offset=(10.,-5.,2.),
             _refresh_freshness_locked=lambda:None, _wake_for_deadline_locked=lambda _deadline:None,
             _retain_state_clock=lambda:None)
+        source._accept_marker=MethodType(namespace["_accept_marker"],source)
         source._observation_context=MethodType(namespace["_observation_context"],source)
         callback=namespace["_marker_callback"](source,"one")
         def message(position):

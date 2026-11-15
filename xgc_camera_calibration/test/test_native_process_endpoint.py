@@ -307,6 +307,93 @@ class NativeProcessEndpointTest(unittest.TestCase):
         source.stop_readiness()
         self.assertFalse(source.wait_ready(0))
 
+    def test_extrinsic_frozen_intrinsics_need_no_prior_extrinsic_or_camera_info(self):
+        path = Path(__file__).parents[1] / 'scripts/extrinsic_calibrator_web.py'
+        spec = importlib.util.spec_from_file_location('frozen_intrinsic_source', path)
+        entry = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(entry)
+        asset = {"camera": {"sourceId": "world"}, "intrinsics": {
+            "width": 640, "height": 480, "model": "plumb_bob",
+            "k": [500, 0, 320, 0, 501, 240, 0, 0, 1], "d": [0, 0, 0, 0, 0]}}
+        source = entry.RosCalibrationSource('', 'phy', 'world',
+            frozen_extrinsic={"targetCoordinates": {"worldOffset": [0, 0, 0]}},
+            parameters={"~child_frame": "usb_cam_optical_frame", "~intrinsic_asset_json": json.dumps(asset)})
+        self.assertFalse(source.use_camera_info)
+        self.assertEqual(source.intrinsic_size, (640, 480))
+        self.assertEqual(source.intrinsic_provenance["intrinsic_source"], "calibration-asset")
+        self.assertIsNone(source.camera_info)
+
+    def test_real_ros_private_argument_keeps_decoded_frozen_intrinsic_asset(self):
+        from rospy.client import load_command_line_node_params
+        from xgc_camera_calibration.ros_lifecycle import NodeParameters
+        path = Path(__file__).parents[1] / 'scripts/extrinsic_calibrator_web.py'
+        spec = importlib.util.spec_from_file_location('ros_decoded_intrinsic_source', path)
+        entry = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(entry)
+        asset = {"camera": {"sourceId": "world"}, "description": "camera's measured matrix", "intrinsics": {
+            "width": 3840, "height": 2160, "model": "plumb_bob",
+            "k": [1913.9836123266568, 0, 1812.0214683851834, 0, 1912.8757136680147, 1164.4294813446236, 0, 0, 1],
+            "d": [0.006524217377352836, -0.028385349899491305, 1.8374511148666126e-05, -0.0011850359015641678, 0.009425811931941568]}}
+        argv = ['extrinsic_calibrator_web.py', '_intrinsic_asset_json:=' + json.dumps(asset),
+                '_child_frame:=usb_cam_optical_frame', '_pose_coordinate_source:=raw-vrpn']
+        with patch.object(sys, 'argv', argv):
+            parameters = NodeParameters('xgc_camera_extrinsic_calibrator_web')
+        self.assertIsInstance(parameters.get('~intrinsic_asset_json'), dict)
+        source = entry.RosCalibrationSource('', 'phy', 'world',
+            frozen_extrinsic={"targetCoordinates": {"worldOffset": [0, 0, 0]}}, parameters=parameters)
+        self.assertEqual(source.intrinsic_asset, asset)
+        self.assertEqual(source.intrinsic_matrix.ravel().tolist(), asset['intrinsics']['k'])
+        self.assertEqual(source.intrinsic_distortion.ravel().tolist(), asset['intrinsics']['d'])
+        self.assertEqual(source.intrinsic_size, (3840, 2160))
+        self.assertFalse(source.use_camera_info)
+        for raw in (None, 'null', load_command_line_node_params(['node', '_intrinsic_asset_json:=null'])['intrinsic_asset_json']):
+            with self.subTest(null=raw):
+                null_source = entry.RosCalibrationSource('', 'phy', 'world',
+                    frozen_extrinsic={"targetCoordinates": {"worldOffset": [0, 0, 0]}},
+                    parameters={"~child_frame": "usb_cam_optical_frame", "~intrinsic_asset_json": raw})
+                self.assertTrue(null_source.use_camera_info)
+        for raw in ([], 1, True, '[]'):
+            with self.subTest(invalid=raw), self.assertRaisesRegex(ValueError, 'asset object or null'):
+                entry.RosCalibrationSource('', 'phy', 'world',
+                    frozen_extrinsic={"targetCoordinates": {"worldOffset": [0, 0, 0]}},
+                    parameters={"~child_frame": "usb_cam_optical_frame", "~intrinsic_asset_json": raw})
+
+    def test_raw_zenoh_clock_offset_and_duplicates_preserve_liveness_evidence(self):
+        from xgc_camera_calibration.web_service import MarkerObservation
+        path = Path(__file__).parents[1] / 'scripts/extrinsic_calibrator_web.py'
+        spec = importlib.util.spec_from_file_location('raw_clock_source', path)
+        entry = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(entry)
+        source = entry.RosCalibrationSource('', 'phy', 'world',
+            frozen_extrinsic={"targetCoordinates": {"worldOffset": [0, 0, 0]}},
+            parameters={"~child_frame":"usb_cam_optical_frame", "~pose_transport":"zenoh",
+                "~pose_zenoh_endpoint":"tcp/127.0.0.1:1", "~pose_zenoh_source":"physical", "~trackers":"wand"})
+        now = time.monotonic()
+        observation = MarkerObservation("wand", (1.,2.,3.), "world", observation_id="first",
+            source_stamp_sec=43200., received_at_sec=86400., received_monotonic_sec=now, source_clock="vrpn")
+        source._accept_marker(observation)
+        self.assertEqual(source._freshness_locked(86400.)[1], ("wand",))
+        source._accept_marker(entry.replace(observation, observation_id="duplicate", received_monotonic_sec=now+1.))
+        self.assertEqual(source.marker_receipts["wand"][0], now)
+        self.assertEqual(source.marker_latest["wand"].source_stamp_sec, 43200.)
+        self.assertEqual(source.marker_latest["wand"].source_clock, "vrpn")
+        with patch.object(entry.time, "monotonic", return_value=now+3.):
+            self.assertEqual(source._freshness_locked(86400.)[1], ())
+
+    def test_raw_zenoh_accepts_automatic_tracker_discovery(self):
+        path = Path(__file__).parents[1] / 'scripts/extrinsic_calibrator_web.py'
+        spec = importlib.util.spec_from_file_location('automatic_tracker_source', path)
+        entry = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(entry)
+        source = entry.RosCalibrationSource('', 'phy', 'world',
+            frozen_extrinsic={"targetCoordinates": {"worldOffset": [0, 0, 0]}},
+            parameters={"~child_frame": "usb_cam_optical_frame", "~pose_transport": "zenoh",
+                "~pose_zenoh_endpoint": "tcp/127.0.0.1:1", "~pose_zenoh_source": "camera-calibration"})
+        self.assertEqual(source.tracker_filter, set())
+        with patch.object(entry.rospy, 'Subscriber'), patch('xgc_camera_calibration.zenoh_pose.ZenohPoses') as poses:
+            source._start_ros_locked()
+        self.assertEqual(poses.call_args.args[:4], ('tcp/127.0.0.1:1', 'camera-calibration', set(), 0))
+
     def test_extrinsic_state_freshness_notifies_on_real_deadline_and_joins(self):
         path = Path(__file__).parents[1] / 'scripts/extrinsic_calibrator_web.py'
         spec = importlib.util.spec_from_file_location('extrinsic_state_expiry_test', path)
@@ -566,7 +653,7 @@ class NativeProcessEndpointTest(unittest.TestCase):
             self.assertFalse(before['facts']['peers']['world']['world_pose_available'])
             entry.rospy.rostime.set_rostime_initialized(True)
             now = entry.rospy.Time.now().to_sec()
-            source.marker_latest['body'] = object()
+            source.marker_latest['body'] = SimpleNamespace(source_clock='ros')
             source.marker_receipts['body'] = (time.monotonic(), now)
             after = client.json('/v1/describe?wait_ready_ms=0', method='GET', timeout=1)
             self.assertTrue(after['ready'])

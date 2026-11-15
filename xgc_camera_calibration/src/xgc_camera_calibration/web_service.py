@@ -33,7 +33,7 @@ from xgc_camera_calibration.solver import (
 
 from xgc_camera_calibration.extrinsic_samples import ApiError, SampleCollection, IMAGE_BYTES, IMAGE_PATH
 from xgc_camera_calibration.extrinsic_application import parse_frame_roles
-from xgc_camera_calibration.extrinsic_resolver import decode_frozen
+from xgc_camera_calibration.extrinsic_resolver import decode_frozen, resolve_pinned_asset
 
 
 @dataclass(frozen=True)
@@ -46,6 +46,7 @@ class MarkerObservation:
     source_stamp_sec: Optional[float] = None
     received_at_sec: Optional[float] = None
     received_monotonic_sec: Optional[float] = None
+    source_clock: str = "ros"
 
 
 @dataclass(frozen=True)
@@ -214,6 +215,28 @@ class CalibrationService:
         self.candidate_metadata = None
         self._state_listeners = set()
         self.samples = SampleCollection(source, parent_frame, self.lock, self._samples_changed)
+
+    def resolve_extrinsic(self, request):
+        """Resolve an exact Core asset against this process's frozen coordinates.
+
+        This read-only calculation never changes the sampling session, saved
+        candidate or live source. Application belongs to the camera owner.
+        """
+        if not isinstance(request, dict) or set(request) != {"asset", "pin"}:
+            raise ApiError(400, "Extrinsic resolution requires only asset and pin")
+        if not isinstance(request["asset"], dict) or not isinstance(request["pin"], dict):
+            raise ApiError(400, "Extrinsic resolution requires an asset and exact pin")
+        if self.frozen_extrinsic is None or self.frame_roles is None:
+            raise ApiError(409, "Extrinsic resolution requires the frozen camera context")
+        try:
+            resolved = resolve_pinned_asset(
+                self.camera_name, request["asset"], request["pin"],
+                self.frozen_extrinsic["targetCoordinates"], self.frame_roles)
+            if resolved["sourceMode"] != self.calibration_mode:
+                raise CalibrationError("calibration asset mode does not match the current camera")
+            return copy.deepcopy(resolved)
+        except (CalibrationError, KeyError, TypeError, ValueError, OverflowError, RecursionError) as error:
+            raise ApiError(400, str(error)) from error
 
     def subscribe_state(self, callback):
         with self.lock:
@@ -546,6 +569,7 @@ class CalibrationHttpServer:
         if self.service is not None:
             routes[("GET", "/api/v1/state")] = adapt(self.service.state, empty)
             routes[("POST", "/api/v1/solve")] = adapt(self.service.solve, lambda value: (value,))
+            routes[("POST", "/api/v1/extrinsic/resolve")] = adapt(lambda value: self.service.resolve_extrinsic(value), lambda value: (value,))
         if self.intrinsic_service is not None:
             routes[("GET", "/api/v1/intrinsic/state")] = adapt(self.intrinsic_service.state, empty)
             routes[("POST", "/api/v1/intrinsic/candidate")] = adapt(self.intrinsic_service.start_candidate, empty, 202)
@@ -988,6 +1012,8 @@ class CalibrationHttpServer:
                                                         path.rsplit("/", 1)[1], value))
         if path == "/api/v1/solve":
             return self._json(request, await self._domain(self._extrinsic().solve, value))
+        if path == "/api/v1/extrinsic/resolve":
+            return self._json(request, await self._domain(self._extrinsic().resolve_extrinsic, value))
         if path == "/api/v1/intrinsic/apply-metadata":
             if not isinstance(value, dict) or set(value) != {"candidate_id"} or not isinstance(value["candidate_id"], str):
                 raise ApiError(400, "Apply requires only candidate_id")

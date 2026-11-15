@@ -153,6 +153,14 @@ roslaunch xgc_camera_calibration extrinsic_calibrator.launch \
   pose_coordinate_source:=experiment-world trackers:=body_01,body_02
 ```
 
+For physical camera calibration, `pose_transport:=zenoh` consumes raw poses
+from its selected `pose_zenoh_source` and `pose_sensor`. An empty `trackers`
+list discovers all active rigid bodies published by that source, including
+bodies that appear after the panel opens. The workflow supplies a dedicated
+VRPN bridge with automatic tracker discovery; the robot localization bridge
+keeps its explicit robot roster. Camera candidates expire when measurements
+stop and never include poses from another source or sensor.
+
 Intrinsic evidence and observation checkpoints use a temporary directory
 under the private socket's runtime directory and are removed at process
 shutdown. They support progress, candidate analysis, and evidence downloads;
