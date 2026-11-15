@@ -21,6 +21,8 @@ apt:
     - amd64
     - arm64
   depends:
+  - python3-protobuf
+  - xgc2-zenoh (>= 1.10.2-1~focal)
   - python3-numpy
   - python3-opencv
   - python3-rospkg

@@ -48,6 +48,8 @@ copy_path() {
 copy_path "${INSTALL_ROOT}${PREFIX}/share/xgc_camera_calibration"
 copy_path "${INSTALL_ROOT}${PREFIX}/lib/xgc_camera_calibration"
 copy_path "${INSTALL_ROOT}${PREFIX}/lib/python3/dist-packages/xgc_camera_calibration"
+copy_path "${INSTALL_ROOT}${PREFIX}/lib/python3/dist-packages/xgc"
+copy_path "${INSTALL_ROOT}${PREFIX}/lib/python3/dist-packages/xgc2"
 mkdir -p "${PACKAGE_ROOT}/usr/share/xgc2"
 mv "${PACKAGE_ROOT}${PREFIX}/share/xgc_camera_calibration/process-definitions" "${PACKAGE_ROOT}/usr/share/xgc2/"
 for definition in xgc2-camera-extrinsic-calibrator-ros1 xgc2-camera-extrinsic-tf-ros1 xgc2-camera-intrinsic-calibrator-ros1; do
@@ -62,7 +64,7 @@ Section: misc
 Priority: optional
 Architecture: ${ARCH}
 Maintainer: XGC2 <dev@xiaokang.ink>
-Depends: python3 (>= 3.8), python3-numpy, python3-opencv, python3-rospkg, python3-yaml, python3-xgc2-xrpc (>= 0.2.1), ros-noetic-gazebo-msgs, ros-noetic-geometry-msgs, ros-noetic-rosbash, ros-noetic-roslaunch, ros-noetic-rospy, ros-noetic-sensor-msgs, ros-noetic-tf, ros-noetic-tf2-ros
+Depends: python3 (>= 3.8), python3-protobuf, xgc2-zenoh (>= 1.10.2-1~focal), python3-numpy, python3-opencv, python3-rospkg, python3-yaml, python3-xgc2-xrpc (>= 0.2.1), ros-noetic-gazebo-msgs, ros-noetic-geometry-msgs, ros-noetic-rosbash, ros-noetic-roslaunch, ros-noetic-rospy, ros-noetic-sensor-msgs, ros-noetic-tf, ros-noetic-tf2-ros
 Conflicts: ros-noetic-xgc-camera-calibration
 Description: Independent intrinsic and fixed-world-camera extrinsic calibration for ROS Noetic
 EOF

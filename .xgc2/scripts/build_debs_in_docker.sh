@@ -62,7 +62,7 @@ docker run "${docker_args[@]}" \
       curl -fsSL --retry 5 https://xgc2.apt.xiaokang.ink/xgc2-archive-keyring.gpg -o /etc/apt/keyrings/xgc2-archive-keyring.gpg
       echo "deb [signed-by=/etc/apt/keyrings/xgc2-archive-keyring.gpg] ${XGC2_APT_OVERLAY_URL:-https://xgc2.apt.xiaokang.ink} focal main" > /etc/apt/sources.list.d/xgc2.list
       apt-get update
-      apt-get install -y --no-install-recommends python3-xgc2-xrpc
+      apt-get install -y --no-install-recommends python3-xgc2-xrpc python3-protobuf xgc2-zenoh xgc2-protobuf-dev xgc2-vrpn-zenoh-dev
     fi
     /usr/lib/xgc2/xrpc/python/bin/python3 /workspace/repo/.xgc2/scripts/check_python_xrpc.py
     python3 /workspace/repo/.xgc2/scripts/check_python_opencv.py
