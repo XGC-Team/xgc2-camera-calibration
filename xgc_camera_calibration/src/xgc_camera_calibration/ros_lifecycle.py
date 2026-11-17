@@ -123,7 +123,7 @@ class RosMasterBinding:
         else:
             self._suppressed += 1
 
-    def initialize(self):
+    def initialize(self, *, argv=None):
         ceiling = .25
         while not self._stop.is_set():
             try:
@@ -135,7 +135,7 @@ class RosMasterBinding:
                 continue
             self._identity = identity
             try:
-                rospy.init_node(self.node_name, disable_signals=True)
+                rospy.init_node(self.node_name, argv=argv, disable_signals=True)
             except rospy.exceptions.ROSInitException:
                 if self._stop.is_set():
                     return False

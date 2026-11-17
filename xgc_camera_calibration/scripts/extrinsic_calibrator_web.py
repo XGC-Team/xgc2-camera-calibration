@@ -827,7 +827,14 @@ def main():
             peer_status_for_state=lambda state: peer_status_from_source(state["source"]),
         )
         server.start()
-        if not binding.initialize():
+        ros_argv = None
+        if parameters.get("~intrinsic_asset_json", "null") is None:
+            # The source has consumed the absent asset. ROS XML-RPC cannot upload None.
+            ros_argv = [sys.argv[0]] + [
+                arg for arg in sys.argv[1:]
+                if ":=" not in arg or arg.split(":=", 1)[0].strip() != "_intrinsic_asset_json"
+            ]
+        if not binding.initialize(argv=ros_argv):
             return 0
         source.start_ros()
         binding.mark_ready()

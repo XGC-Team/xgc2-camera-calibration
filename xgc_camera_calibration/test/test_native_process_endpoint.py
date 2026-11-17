@@ -754,7 +754,7 @@ class NativeEntrypointTest(unittest.TestCase):
     def start_master(self):
         return self.launch(['roscore', '-p', str(self.master_port)], 'master')
 
-    def start_helper(self, kind, camera=False):
+    def start_helper(self, kind, camera=False, **private_parameters):
         port = self.port()
         socket_path = str(self.root / (kind + '.sock'))
         parameters = {'target_id': 'test-target', 'socket_path': socket_path,
@@ -765,6 +765,7 @@ class NativeEntrypointTest(unittest.TestCase):
             'camera_link_frame': 'camera_link', 'trackers': ['body'], 'camera_control': camera,
             'simulation_endpoint': str(self.root / 'world.sock'), 'camera_model_name': 'camera',
             'camera_control_timeout': .5}
+        parameters.update(private_parameters)
         script = 'extrinsic_tf_publisher.py' if kind == 'tf' else kind + '_calibrator_web.py'
         command = [sys.executable, str(self.package / 'scripts' / script)]
         if kind == 'extrinsic':
@@ -917,6 +918,21 @@ finally:
             self.assertEqual(process.wait(), 0)
             exit_seconds[kind] = round(time.monotonic() - replaced_at, 3)
         print(json.dumps({"bound_master":first_master, "replacement_exit_seconds":exit_seconds}))
+
+    def test_extrinsic_camera_info_survives_explicit_null_asset_at_ros_startup(self):
+        self.start_master()
+        process, client, port = self.start_helper('extrinsic', intrinsic_asset_json=None)
+        self.until(lambda: self.describe(client)['facts']['peers']['ros_master']['available'],
+                   process=process)
+        self.viewer('extrinsic', port)
+        self.publishers()
+
+        def received_camera_info():
+            source = self.state('extrinsic', port)['source']
+            return source if source['camera_info_received'] and source['intrinsic_ready'] else None
+
+        source = self.until(received_camera_info, process=process)
+        self.assertEqual(source['intrinsic_source'], 'camera-info')
 
     def test_calibrators_start_before_media_camera_info_and_pose_and_recover(self):
         self.start_master()
