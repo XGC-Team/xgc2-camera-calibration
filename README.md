@@ -13,18 +13,19 @@ process. Appearance preferences in the standalone pages live in memory.
 ## Result and readiness contract
 
 An unbound `GET /v1/describe?wait_ready_ms=N` accepts `N` from 0 through 30000.
-The SDK matches discovery by method and path. The service holds the request
-on a condition until its own socket/state and ROS master binding are ready,
-or the wait expires. CameraInfo, images, Media Edge and the world never gate
-startup or readiness. The response contains `service`, `api_version`,
-`instance_id`, `ready`, and `facts`. Marker selection and calibration quality
-remain separate solve state.
+The SDK matches discovery by method and path. The response contains
+`service`, `api_version`, `instance_id`, `ready`, and `facts`. The intrinsic
+and extrinsic Web calibrators report `ready:true` as soon as their HTTP
+service can serve requests. Read `facts.peers.ros_master.available` to see
+whether the process has bound to ROS. The TF publisher holds the request
+until it has bound to ROS and published its transform, or the wait expires.
+CameraInfo, images, Media Edge and world pose have independent status.
 
 All three entrypoints bind their own sockets before waiting for ROS master.
-They wait without a startup deadline, report `ready:false` while the master
-is absent, and exit when its PID/run ID changes after binding. Core supplies
-private command parameters before the master exists; roslaunch uses its
-already running master's parameter namespace.
+They wait for the master without a startup deadline and exit when its PID or
+run ID changes after binding. Core supplies private command parameters before
+the master exists. roslaunch uses its already running master's parameter
+namespace.
 
 `facts.peers` and web state report ROS master, media, CameraInfo and world
 pose independently. Pages render immediately and consume one SSE connection
@@ -125,7 +126,7 @@ segments of the parent/link/optical chain. It reports applied transform facts
 on ROS. Core supplies a new resolved pose when it starts the camera fragment
 with a new calibration; the TF node does not update a selection file.
 Its private service is `xgc2.calibration.v1.ExtrinsicTf`, API version `1`,
-with the same unbound held readiness contract. TF uses its supplied frozen
+with the unbound readiness query described above. TF uses its supplied frozen
 resolution and reports media/CameraInfo as unconsumed peers.
 
 ## Launch inputs

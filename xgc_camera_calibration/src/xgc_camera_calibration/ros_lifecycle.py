@@ -106,8 +106,11 @@ class RosMasterBinding:
         with self._condition:
             self._update_status_locked(connect_attempts=self._status["connect_attempts"] + 1)
         with ServerProxy(self.uri, transport=_DeadlineTransport()) as master:
-            code, _message, pid = master.getPid("/" + self.node_name)
-            run_code, _message, run_id = master.getParam("/" + self.node_name, "/run_id")
+            return self._master_identity(master)
+
+    def _master_identity(self, master):
+        code, _message, pid = master.getPid("/" + self.node_name)
+        run_code, _message, run_id = master.getParam("/" + self.node_name, "/run_id")
         if code != 1 or run_code != 1 or not run_id:
             raise RuntimeError("ROS master identity is not available")
         return pid, run_id
@@ -196,5 +199,16 @@ class RosMasterBinding:
         if self._thread is not None:
             self._thread.join()
             self._thread = None
+        identity, self._identity = self._identity, None
+        node_uri = rospy.get_node_uri()
+        if identity is not None and node_uri:
+            # Noetic rosout subscribes to this cached parameter on its first log.
+            # rospy tears down topics and services but leaves that callback registered.
+            try:
+                with ServerProxy(self.uri, transport=_DeadlineTransport()) as master:
+                    if self._master_identity(master) == identity:
+                        master.unsubscribeParam(rospy.get_name(), node_uri, "/rosout_disable_topics_generation")
+            except Exception as error:
+                logging.getLogger(__name__).debug("ROS parameter cleanup unavailable: %s", error)
         for signum, handler in self._previous_signals.items():
             signal.signal(signum, handler)

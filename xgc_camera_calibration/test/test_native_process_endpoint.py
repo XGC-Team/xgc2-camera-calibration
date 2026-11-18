@@ -11,7 +11,7 @@ import subprocess
 import sys
 import urllib.error
 import urllib.request
-from xmlrpc.client import ServerProxy
+from xmlrpc.client import ServerProxy, Transport
 from pathlib import Path
 import tempfile
 import threading
@@ -684,8 +684,20 @@ class NativeProcessEndpointTest(unittest.TestCase):
                 binding.close()
 
 
+class MasterProbeTransport(Transport):
+    timeout = 1.0
+
+    def make_connection(self, host):
+        connection = super().make_connection(host)
+        connection.timeout = self.timeout
+        return connection
+
+
 class NativeEntrypointTest(unittest.TestCase):
     """Real rospy processes, released SDK hosts, and isolated ROS masters."""
+
+    master_retry_cap = 30.0  # RosMasterBinding.initialize caps its existing full jitter here.
+    master_observation_interval = .25
 
     def setUp(self):
         from xgc2_xrpc import Runtime
@@ -727,6 +739,7 @@ class NativeEntrypointTest(unittest.TestCase):
         self.streams.append(stream)
         process = subprocess.Popen(['nice', '-n', '19'] + command, env=self.env,
             stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)
+        process.test_log = log
         self.processes.append(process)
         return process
 
@@ -753,6 +766,50 @@ class NativeEntrypointTest(unittest.TestCase):
 
     def start_master(self):
         return self.launch(['roscore', '-p', str(self.master_port)], 'master')
+
+    def await_master(self, launcher):
+        def answering():
+            with ServerProxy(self.env['ROS_MASTER_URI'], transport=MasterProbeTransport()) as master:
+                pid_code, _, pid = master.getPid('/camera_native_test')
+                run_code, _, run_id = master.getParam('/camera_native_test', '/run_id')
+            if pid_code != 1 or run_code != 1 or not run_id:
+                return None
+            self.assertIs(type(pid), int)
+            self.assertGreater(pid, 1)
+            self.assertIsInstance(run_id, str)
+            return pid, run_id
+
+        identity = self.until(answering, process=launcher, interval=self.master_observation_interval,
+                              diagnostic=lambda: launcher.test_log.read_text()[-2000:])
+        return identity, time.monotonic()
+
+    def await_ros_binding(self, process, client, identity, master_ready_at):
+        # One possible in-flight probe (two XML-RPC calls), one existing
+        # backoff ceiling, and the original initialization allowance.
+        deadline = master_ready_at + 2 * MasterProbeTransport.timeout + self.master_retry_cap + 12
+        observed = {}
+
+        def bound():
+            document = self.describe(client)
+            facts = document['facts']['peers']['ros_master']
+            observed.update(ready=document['ready'], master=facts)
+            if not facts['available']:
+                return None
+            self.assertEqual((facts['pid'], facts['run_id']), identity)
+            return document if document['ready'] else None
+
+        return self.until(bound, timeout=deadline - time.monotonic(), process=process,
+                          interval=self.master_observation_interval,
+                          diagnostic=lambda: {'phase': 'ROS binding and initialization', 'expected': identity,
+                                              'observed': observed, 'log_tail': process.test_log.read_text()[-2000:]})
+
+    def assert_helper_stopped(self, kind, process, port=None):
+        self.assertEqual(process.wait(), 0)
+        self.assertFalse((self.root / (kind + '.sock')).exists())
+        if port is not None:
+            with self.assertRaises(ConnectionRefusedError):
+                with socket.create_connection(('127.0.0.1', port), timeout=1):
+                    pass
 
     def start_helper(self, kind, camera=False, **private_parameters):
         port = self.port()
@@ -782,19 +839,21 @@ class NativeEntrypointTest(unittest.TestCase):
         self.until(lambda: Path(socket_path).exists(), process=process)
         return process, client, port
 
-    def until(self, predicate, timeout=12, process=None, diagnostic=None):
+    def until(self, predicate, timeout=12, process=None, diagnostic=None, interval=.025):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if process is not None and process.poll() is not None:
-                self.fail('entrypoint exited: ' + (self.root / ('tf.log' if 'extrinsic_tf' in str(process.args) else
-                    'intrinsic.log' if 'intrinsic_calibrator' in str(process.args) else 'extrinsic.log')).read_text())
+                self.fail('entrypoint exited: ' + process.test_log.read_text())
             try:
                 value = predicate()
                 if value:
                     return value
             except (TransportError, OSError):
                 pass
-            time.sleep(.025)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(interval, remaining))
         self.fail('native condition did not become true: ' + repr(diagnostic() if diagnostic else None))
 
     def describe(self, client, wait=0):
@@ -818,11 +877,16 @@ class NativeEntrypointTest(unittest.TestCase):
         self.addCleanup(stream.close)
         return stream
 
-    def start_media(self, instance):
+    def start_media(self, instance, gray=None):
         sys.path.insert(0, str(Path(__file__).parent))
         from test_media_snapshot import FakeMediaEdge
-        peer = FakeMediaEdge(str(self.root / 'media.sock'), instance).__enter__()
-        self.peers.append(peer)
+        peer = FakeMediaEdge(str(self.root / 'media.sock'), instance)
+        if gray is not None:
+            import cv2
+            peer.image.fill(gray)
+            peer.jpeg = cv2.imencode('.jpg', peer.image)[1].tobytes()
+            peer.raw = peer.image.tobytes()
+        self.peers.append(peer.__enter__())
         return peer
 
     def stop_peer(self, peer):
@@ -888,36 +952,29 @@ finally:
                 with urllib.request.urlopen('http://127.0.0.1:%d/' % port, timeout=1) as page:
                     self.assertIn(b'<html', page.read().lower())
         master = self.start_master()
-        first_master = None
-        bound_identities = {}
-        def bound_master(client):
-            observed = self.describe(client)['facts']['peers']['ros_master']
-            return observed if observed['available'] else None
-        for kind, process, client, port in clients:
-            # Local HTTP readiness does not prove that this process has bound
-            # the first master. Establish that identity before replacing it.
-            bound = self.until(lambda: bound_master(client), process=process)
-            identity = (bound['pid'], bound['run_id'])
-            if first_master is None:
-                first_master = identity
-            self.assertEqual(identity, first_master)
-            bound_identities[kind] = identity
-            self.assertTrue(bound['run_id'])
-            self.assertIsInstance(bound['pid'], int)
-            self.assertTrue(self.describe(client)['ready'])
-            if kind != 'tf':
-                self.assertFalse(self.describe(client)['facts']['peers']['camera_info']['received'])
+        first_master, first_ready_at = self.await_master(master)
+        for kind, process, client, _ in clients:
+            document = self.await_ros_binding(process, client, first_master, first_ready_at)
+            if kind == 'tf':
+                self.assertTrue(document['facts']['publication']['published'])
+            else:
+                self.assertFalse(document['facts']['peers']['camera_info']['received'])
         self.stop(master)
-        self.start_master()
+        self.assertTrue(all(process.poll() is None for _, process, _, _ in clients))
         replaced_at = time.monotonic()
+        replacement, _ = self.await_master(self.start_master())
+        self.assertNotEqual(replacement[0], first_master[0])
+        self.assertNotEqual(replacement[1], first_master[1])
         exit_seconds = {}
-        for kind, process, _client, _port in clients:
-            self.until(lambda: process.poll() is not None, timeout=20,
-                diagnostic=lambda: {"kind":kind, "bound_master":bound_identities[kind],
-                    "log_tail":(self.root / (kind + '.log')).read_text()[-2000:]})
-            self.assertEqual(process.wait(), 0)
+        for kind, process, _, port in clients:
+            self.until(lambda: process.poll() is not None, timeout=max(0, replaced_at + 20 - time.monotonic()),
+                       interval=self.master_observation_interval,
+                       diagnostic=lambda: {'kind': kind, 'old_master': first_master, 'new_master': replacement,
+                                           'log_tail': process.test_log.read_text()[-2000:]})
+            self.assert_helper_stopped(kind, process, None if kind == 'tf' else port)
             exit_seconds[kind] = round(time.monotonic() - replaced_at, 3)
-        print(json.dumps({"bound_master":first_master, "replacement_exit_seconds":exit_seconds}))
+        print(json.dumps({'bound_master': first_master, 'replacement_master': replacement,
+                          'replacement_exit_seconds': exit_seconds}))
 
     def test_extrinsic_camera_info_survives_explicit_null_asset_at_ros_startup(self):
         self.start_master()
@@ -1120,68 +1177,175 @@ finally:
         cpu = (int(fields[11]) + int(fields[12])) / os.sysconf('SC_CLK_TCK')
         return cpu, len(list((root / 'task').iterdir())), len(list((root / 'fd').iterdir()))
 
+    def steady_resources(self, process):
+        # Use the sustained count in a short window so a single accepted
+        # XML-RPC request does not stand in for a retained ROS worker or FD.
+        samples = [self.resources(process)[1:]]
+        for _ in range(4):
+            time.sleep(self.master_observation_interval)
+            samples.append(self.resources(process)[1:])
+        return tuple(min(counts) for counts in zip(*samples))
+
     @unittest.skipUnless(os.environ.get('XGC_CALIBRATION_LONG_TESTS') == '1', '60-second F11 peer outage')
     def test_media_and_world_down_for_sixty_seconds_stay_idle_and_replay_once(self):
+        import cv2
+        import numpy as np
+
         self.board_assets()
-        self.start_master()
+        master = self.start_master()
+        identity, master_ready_at = self.await_master(master)
         process, client, port = self.start_helper('intrinsic', camera=True)
-        self.until(lambda: self.describe(client)['ready'], process=process)
-        self.viewer('intrinsic', port)
+        self.await_ros_binding(process, client, identity, master_ready_at)
+        viewer = self.viewer('intrinsic', port)
         media = self.start_media('edge-before-outage')
         world = self.start_world('world-before-outage')
-        self.until(lambda: self.describe(client)['facts']['peers']['world']['pose_available'])
-        self.until(lambda: self.state('intrinsic', port)['image_ready'])
+
+        def healthy(media_id, world_id):
+            document = self.describe(client)
+            facts = document['facts']['peers']
+            self.assertTrue(document['ready'])
+            ros = facts['ros_master']
+            self.assertTrue(ros['available'])
+            self.assertEqual((ros['pid'], ros['run_id']), identity)
+            if (facts['media']['instance_id'] == media_id and facts['media']['source_available']
+                    and facts['world']['pose_available'] and facts['world']['applied_instance'] == world_id):
+                return facts
+            return None
+
+        def image_matches(bright):
+            if not self.state('intrinsic', port)['image_ready']:
+                return False
+            url = 'http://127.0.0.1:%d/api/v1/intrinsic/image.jpg' % port
+            with urllib.request.urlopen(url, timeout=2) as response:
+                encoded = np.frombuffer(response.read(), dtype=np.uint8)
+            image = cv2.imdecode(encoded, cv2.IMREAD_GRAYSCALE)
+            return image is not None and (image.mean() > 128) == bright
+
+        self.until(lambda: healthy('edge-before-outage', 'world-before-outage'), process=process)
+        self.until(lambda: image_matches(False), process=process)
         self.request(port, '/api/v1/intrinsic/goto', {'index': 0})
         desired = copy.deepcopy(world.pose)
+        revision = self.describe(client)['facts']['peers']['world']['applied_revision']
+        healthy_before = self.steady_resources(process)
         self.stop_peer(media)
         self.stop_peer(world)
-        self.until(lambda: not self.describe(client)['facts']['peers']['media']['ready']
-            and not self.describe(client)['facts']['peers']['world']['ready'])
-        before = self.resources(process)
-        start_facts = self.describe(client)['facts']['peers']
-        before_lines = len((self.root / 'intrinsic.log').read_text().splitlines())
+
+        def absent():
+            document = self.describe(client)
+            facts = document['facts']['peers']
+            if facts['media']['ready'] or facts['world']['ready']:
+                return None
+            self.assertTrue(document['ready'])
+            ros = facts['ros_master']
+            self.assertTrue(ros['available'])
+            self.assertEqual((ros['pid'], ros['run_id']), identity)
+            self.assertFalse(facts['world']['pose_available'])
+            return facts
+
+        self.until(absent, process=process)
+        outage_before = self.steady_resources(process)
+        start_facts = absent()
+        before_cpu = self.resources(process)[0]
+        before_lines = len(process.test_log.read_text().splitlines())
         time.sleep(60)
-        after = self.resources(process)
-        end_facts = self.describe(client)['facts']['peers']
-        for name in ('media', 'world'):
-            self.assertLessEqual(end_facts[name]['connect_attempts'] - start_facts[name]['connect_attempts'], 15)
-        log_lines = len((self.root / 'intrinsic.log').read_text().splitlines()) - before_lines
-        self.assertLessEqual(log_lines, 14)
-        self.assertLess(after[0] - before[0], 1.2)
-        self.assertLessEqual(after[1], before[1])
-        self.assertLessEqual(after[2], before[2])
-        replacement_media = self.start_media('edge-after-outage')
+        cpu = self.resources(process)[0] - before_cpu
+        end_facts = absent()
+        self.assertIsNotNone(end_facts, 'media/world must remain absent through the 60-second sample')
+        outage_after = self.steady_resources(process)
+        attempts = {name: end_facts[name]['connect_attempts'] - start_facts[name]['connect_attempts']
+                    for name in ('media', 'world')}
+        log_lines = len(process.test_log.read_text().splitlines()) - before_lines
+
+        replacement_media = self.start_media('edge-after-outage', gray=220)
         replacement_world = self.start_world('world-after-outage')
-        self.until(lambda: self.describe(client)['facts']['peers']['world']['ready'])
-        self.until(lambda: len(replacement_media.requests) >= 1)
+        recovered = self.until(lambda: healthy('edge-after-outage', 'world-after-outage'), process=process)
+        self.until(lambda: replacement_media.requests and image_matches(True), process=process,
+                   diagnostic=lambda: {'replacement_captures': len(replacement_media.requests),
+                                       'state': self.state('intrinsic', port)})
+        self.assertEqual(recovered['world']['applied_revision'], revision)
         self.assertEqual(replacement_world.pose, desired)
-        self.assertEqual([c[0] for c in replacement_world.calls].count('pose'), 1)
-        self.assertEqual([c[0] for c in replacement_world.calls].count('create'), 1)
-        print('F11 media/world: cpu=%.3fs threads=%d/%d fds=%d/%d log_lines=%d attempts=%s' %
-            (after[0]-before[0], before[1], after[1], before[2], after[2], log_lines,
-             {name: end_facts[name]['connect_attempts']-start_facts[name]['connect_attempts'] for name in ('media','world')}))
+        healthy_after = self.steady_resources(process)
+        self.assertEqual([call[0] for call in replacement_world.calls].count('pose'), 1)
+        self.assertEqual([call[0] for call in replacement_world.calls].count('create'), 1)
+        viewer.close()
+        self.until(lambda: self.describe(client)['facts']['peers']['media']['reason'] == 'not_requested',
+                   process=process)
+        self.stop(process)
+        self.assert_helper_stopped('intrinsic', process, port)
+        self.assertCountEqual(replacement_media.deleted, replacement_media.snapshot_ids)
+        self.stop_peer(replacement_media)
+        self.stop_peer(replacement_world)
+        self.stop(master)
+        print('F11 media/world: ' + json.dumps({
+            'cpu': cpu, 'healthy_threads_fds': [healthy_before, healthy_after],
+            'outage_threads_fds': [outage_before, outage_after], 'log_lines': log_lines,
+            'attempts': attempts, 'restored_revision': revision, 'retired': True}))
+
+        for value in attempts.values():
+            self.assertLessEqual(value, 15)
+        self.assertLessEqual(log_lines, 14)
+        self.assertLess(cpu, 1.2)
+        for label, before, after in (('outage', outage_before, outage_after),
+                                     ('recovered viewer', healthy_before, healthy_after)):
+            self.assertLessEqual(after[0], before[0], label + ' retained threads')
+            self.assertLessEqual(after[1], before[1], label + ' retained FDs')
 
     @unittest.skipUnless(os.environ.get('XGC_CALIBRATION_LONG_TESTS') == '1', '60-second F11 master outage')
     def test_master_down_for_sixty_seconds_stays_idle_then_becomes_ready(self):
+        self.env['ROS_NAMESPACE'] = '/'
         process, client, port = self.start_helper('intrinsic')
-        start = self.describe(client)['facts']['peers']['ros_master']['connect_attempts']
+        node_name = '/xgc_camera_intrinsic_calibrator_web'
+        caller = '/camera_native_test'
+
+        def web_without_ros():
+            with urllib.request.urlopen('http://127.0.0.1:%d/' % port, timeout=1) as page:
+                self.assertIn(b'<html', page.read().lower())
+            document = self.describe(client)
+            self.assertTrue(document['ready'])
+            facts = document['facts']['peers']['ros_master']
+            self.assertFalse(facts['available'])
+            self.assertIsNone(facts['pid'])
+            self.assertIsNone(facts['run_id'])
+            return facts
+
+        start = self.until(web_without_ros, process=process)['connect_attempts']
         before = self.resources(process)
-        before_lines = len((self.root / 'intrinsic.log').read_text().splitlines())
+        before_lines = len(process.test_log.read_text().splitlines())
         time.sleep(60)
         after = self.resources(process)
-        facts = self.describe(client)['facts']['peers']['ros_master']
-        attempts = facts['connect_attempts'] - start
-        lines = len((self.root / 'intrinsic.log').read_text().splitlines()) - before_lines
-        self.assertLess(after[0]-before[0], 1.2)
+        attempts = web_without_ros()['connect_attempts'] - start
+        lines = len(process.test_log.read_text().splitlines()) - before_lines
+
+        master = self.start_master()
+        identity, master_ready_at = self.await_master(master)
+        self.await_ros_binding(process, client, identity, master_ready_at)
+        self.assertFalse(self.state('intrinsic', port)['image_ready'])
+        with ServerProxy(self.env['ROS_MASTER_URI'], transport=MasterProbeTransport()) as api:
+            registered = api.lookupNode(caller, node_name)
+        self.assertEqual(registered[0], 1, registered)
+        with ServerProxy(registered[2], transport=MasterProbeTransport()) as node:
+            node_pid = node.getPid(caller)
+        self.assertEqual((node_pid[0], node_pid[2]), (1, process.pid), node_pid)
+
+        self.stop(process)
+        self.assert_helper_stopped('intrinsic', process, port)
+        surviving_master, _ = self.await_master(master)
+        self.assertEqual(surviving_master, identity)
+        with ServerProxy(self.env['ROS_MASTER_URI'], transport=MasterProbeTransport()) as api:
+            retired = api.lookupNode(caller, node_name)
+        print('F11 ROS node: ' + json.dumps({'name': node_name, 'pid': process.pid, 'master': identity,
+                                            'registered': registered, 'after_stop': retired}))
+        self.assertEqual((retired[0], retired[2]), (-1, ''), retired)
+        self.stop(master)
+        print('F11 master: ' + json.dumps({'cpu': after[0] - before[0],
+            'threads_fds': [before[1:], after[1:]], 'log_lines': lines, 'attempts': attempts,
+            'bound_master': identity, 'retired': True}))
+
+        self.assertLess(after[0] - before[0], 1.2)
         self.assertLessEqual(attempts, 20)
         self.assertLessEqual(lines, 7)
         self.assertLessEqual(after[1], before[1])
         self.assertLessEqual(after[2], before[2])
-        self.assertFalse(self.describe(client)['ready'])
-        self.start_master()
-        self.until(lambda: self.describe(client)['ready'], timeout=35, process=process)
-        print('F11 master: cpu=%.3fs threads=%d/%d fds=%d/%d log_lines=%d attempts=%d' %
-              (after[0]-before[0], before[1], after[1], before[2], after[2], lines, attempts))
 
 
 if __name__ == '__main__':
